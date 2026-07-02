@@ -1,0 +1,198 @@
+#!/usr/bin/env node
+import { readFileSync, writeFileSync, existsSync } from "node:fs";
+import path from "node:path";
+import { fileURLToPath } from "node:url";
+
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
+const ROOT = path.resolve(__dirname, "..");
+const SERVER_FILE = path.join(ROOT, "server.mjs");
+const PUBLIC_APP_FILE = path.join(ROOT, "public", "app.js");
+const OUTPUT_FILE = path.join(ROOT, "docs", "CODEBASE_ROUTE_INVENTORY.md");
+
+function lineNumberForOffset(text, offset) {
+  return text.slice(0, offset).split(/\r?\n/).length;
+}
+
+function routePath(pathname, startsWith) {
+  return startsWith ? `${pathname.replace(/\/$/, "")}/*` : pathname;
+}
+
+function parseServerRoutes(text) {
+  const routes = [];
+  let cursor = 0;
+  while (cursor < text.length) {
+    const ifIndex = text.indexOf("if", cursor);
+    if (ifIndex < 0) break;
+    const before = text[ifIndex - 1] || "";
+    const after = text[ifIndex + 2] || "";
+    if (/[A-Za-z0-9_$]/.test(before) || /[A-Za-z0-9_$]/.test(after)) {
+      cursor = ifIndex + 2;
+      continue;
+    }
+    const parenIndex = text.indexOf("(", ifIndex + 2);
+    if (parenIndex < 0 || parenIndex - ifIndex > 12) {
+      cursor = ifIndex + 2;
+      continue;
+    }
+    let depth = 0;
+    let end = -1;
+    let quote = "";
+    for (let i = parenIndex; i < text.length; i += 1) {
+      const ch = text[i];
+      const prev = text[i - 1];
+      if (quote) {
+        if (ch === quote && prev !== "\\") quote = "";
+        continue;
+      }
+      if (ch === "\"" || ch === "'" || ch === "`") {
+        quote = ch;
+        continue;
+      }
+      if (ch === "(") depth += 1;
+      if (ch === ")") {
+        depth -= 1;
+        if (depth === 0) {
+          end = i;
+          break;
+        }
+      }
+    }
+    if (end < 0) {
+      cursor = ifIndex + 2;
+      continue;
+    }
+    const condition = text.slice(parenIndex + 1, end);
+    cursor = end + 1;
+    if (!condition.includes("url.pathname")) continue;
+    const pathMatch =
+      condition.match(/url\.pathname\.startsWith\(\s*["']([^"']+)["']\s*\)/) ||
+      condition.match(/url\.pathname\s*===\s*["']([^"']+)["']/);
+    if (!pathMatch) continue;
+    const rawPath = pathMatch[1];
+    if (!rawPath.startsWith("/api/")) continue;
+    const startsWith = /url\.pathname\.startsWith/.test(condition);
+    const methods = [...condition.matchAll(/req\.method\s*===\s*["']([A-Z]+)["']/g)].map((item) => item[1]);
+    routes.push({
+      method: methods.length ? [...new Set(methods)].join("|") : "ANY",
+      path: routePath(rawPath, startsWith),
+      kind: startsWith ? "prefix" : "exact",
+      line: lineNumberForOffset(text, ifIndex),
+      condition: condition.replace(/\s+/g, " ").trim(),
+    });
+  }
+  return routes.sort((a, b) => a.path.localeCompare(b.path) || a.method.localeCompare(b.method));
+}
+
+function parseUiFetches(text) {
+  const rows = [];
+  const patterns = [
+    /\bapi\(\s*["'`]([^"'`]+)["'`]/g,
+    /\bfetch\(\s*["'`]([^"'`]+)["'`]/g,
+  ];
+  for (const re of patterns) {
+    let match;
+    while ((match = re.exec(text))) {
+      const url = match[1];
+      if (!url.startsWith("/api/")) continue;
+      rows.push({
+        path: url,
+        line: lineNumberForOffset(text, match.index),
+      });
+    }
+  }
+  const seen = new Set();
+  return rows
+    .filter((row) => {
+      const key = `${row.path}:${row.line}`;
+      if (seen.has(key)) return false;
+      seen.add(key);
+      return true;
+    })
+    .sort((a, b) => a.path.localeCompare(b.path) || a.line - b.line);
+}
+
+function parseStoreKeys(text) {
+  const block = text.match(/const normalized = \{([\s\S]*?)\n\s+\};\n\s+storeCache/s)?.[1] || "";
+  const keys = [...block.matchAll(/^\s{6}([A-Za-z0-9_]+):/gm)].map((item) => item[1]);
+  return [...new Set(keys)].sort();
+}
+
+function duplicateRoutes(routes) {
+  const seen = new Map();
+  const duplicates = [];
+  for (const route of routes) {
+    if (route.kind !== "exact") continue;
+    for (const method of route.method.split("|")) {
+      const key = `${method} ${route.path}`;
+      const prev = seen.get(key);
+      if (prev) duplicates.push({ key, firstLine: prev.line, secondLine: route.line });
+      seen.set(key, route);
+    }
+  }
+  return duplicates;
+}
+
+function renderMarkdown({ routes, uiFetches, storeKeys, duplicates }) {
+  const routeRows = routes
+    .map((route) => `| \`${route.method}\` | \`${route.path}\` | ${route.kind} | [server.mjs](/Users/a/Desktop/codes/market-pulse-ai/server.mjs:${route.line}) |`)
+    .join("\n");
+  const uiRows = uiFetches
+    .map((row) => `| \`${row.path}\` | [public/app.js](/Users/a/Desktop/codes/market-pulse-ai/public/app.js:${row.line}) |`)
+    .join("\n");
+  const duplicateRows = duplicates.length
+    ? duplicates.map((row) => `- \`${row.key}\`: first line ${row.firstLine}, duplicate line ${row.secondLine}`).join("\n")
+    : "- None.";
+  return `# Codebase Route Inventory
+
+Generated by \`scripts/generate_route_inventory.mjs\`.
+
+## Duplicate Route Check
+
+${duplicateRows}
+
+## API Routes
+
+| Method | Path | Match | Handler Location |
+|---|---|---|---|
+${routeRows || "| - | - | - | - |"}
+
+## Frontend API Calls
+
+| Path | Caller |
+|---|---|
+${uiRows || "| - | - |"}
+
+## Primary Store Keys
+
+${storeKeys.map((key) => `- \`${key}\``).join("\n") || "- None detected."}
+`;
+}
+
+function main() {
+  if (!existsSync(SERVER_FILE)) throw new Error(`Missing ${SERVER_FILE}`);
+  const serverText = readFileSync(SERVER_FILE, "utf8");
+  const appText = existsSync(PUBLIC_APP_FILE) ? readFileSync(PUBLIC_APP_FILE, "utf8") : "";
+  const routes = parseServerRoutes(serverText);
+  const uiFetches = parseUiFetches(appText);
+  const storeKeys = parseStoreKeys(serverText);
+  const duplicates = duplicateRoutes(routes);
+  if (duplicates.length) {
+    console.error(renderMarkdown({ routes, uiFetches, storeKeys, duplicates }));
+    process.exitCode = 1;
+    return;
+  }
+  const markdown = renderMarkdown({ routes, uiFetches, storeKeys, duplicates });
+  if (process.argv.includes("--check")) {
+    const existing = existsSync(OUTPUT_FILE) ? readFileSync(OUTPUT_FILE, "utf8") : "";
+    if (existing !== markdown) {
+      console.error(`Route inventory is stale. Run: node scripts/generate_route_inventory.mjs`);
+      process.exitCode = 1;
+      return;
+    }
+  } else {
+    writeFileSync(OUTPUT_FILE, markdown, "utf8");
+  }
+  console.log(JSON.stringify({ status: "ok", routes: routes.length, uiFetches: uiFetches.length, storeKeys: storeKeys.length }));
+}
+
+main();

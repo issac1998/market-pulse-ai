@@ -1360,6 +1360,11 @@ body.stock-detail-mode .stock-report-panel {
   padding: 14px;
 }
 
+.all-stock-agent-section.roadmap {
+  border-color: rgba(59, 130, 246, 0.28);
+  background: rgba(239, 246, 255, 0.56);
+}
+
 .all-stock-agent-grid {
   display: grid;
   grid-template-columns: repeat(auto-fit, minmax(320px, 1fr));

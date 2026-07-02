@@ -1,5 +1,6 @@
 import http from "node:http";
 import net from "node:net";
+import crypto from "node:crypto";
 import { spawn } from "node:child_process";
 import { mkdir, readFile, rename, stat, unlink, writeFile } from "node:fs/promises";
 import { existsSync, mkdirSync, readFileSync } from "node:fs";
@@ -1080,6 +1081,8 @@ const ALL_STOCK_AGENT_BACKTEST_DAYS = Math.max(3, Number(process.env.ALL_STOCK_A
 const ALL_STOCK_AGENT_BACKTEST_MAX_DATES = Math.max(3, Number(process.env.ALL_STOCK_AGENT_BACKTEST_MAX_DATES || 20));
 const RECOMMENDER_FACTOR_WEIGHTS = Object.freeze({ ...DEFAULT_RECOMMENDER_FACTOR_WEIGHTS });
 const RECOMMENDER_PRIMARY_HORIZON_DAYS = Math.max(1, Number(process.env.RECOMMENDER_PRIMARY_HORIZON_DAYS || 20));
+const ALL_STOCK_AGENT_ACTIONABLE_BUY_LIMIT = Math.max(1, Number(process.env.ALL_STOCK_AGENT_ACTIONABLE_BUY_LIMIT || 3));
+const ALL_STOCK_AGENT_MIN_ACTIONABLE_DQ = Math.max(0, Math.min(100, Number(process.env.ALL_STOCK_AGENT_MIN_ACTIONABLE_DQ || 60)));
 const ALL_STOCK_AGENT_PREFETCH_ENABLED = parseBoolean(process.env.ALL_STOCK_AGENT_PREFETCH_ENABLED, true);
 const ALL_STOCK_AGENT_TECHNICAL_PREFETCH_LIMIT = Math.max(
   0,
@@ -1119,6 +1122,25 @@ let gdeltNextRequestAt = 0;
 
 function nowIso() {
   return new Date().toISOString();
+}
+
+function stableJson(value) {
+  if (Array.isArray(value)) return `[${value.map(stableJson).join(",")}]`;
+  if (value && typeof value === "object") {
+    return `{${Object.keys(value)
+      .sort()
+      .map((key) => `${JSON.stringify(key)}:${stableJson(value[key])}`)
+      .join(",")}}`;
+  }
+  return JSON.stringify(value);
+}
+
+function sha256Text(value = "") {
+  return crypto.createHash("sha256").update(String(value || ""), "utf8").digest("hex");
+}
+
+function hashObject(value) {
+  return sha256Text(stableJson(value));
 }
 
 function collectorTimeoutForSource(source) {
@@ -3074,12 +3096,60 @@ function buildOptionsCacheFromRuns(runs = []) {
   return pruneOptionsCache(cache);
 }
 
+function normalizeAuditEvents(rows = []) {
+  return (Array.isArray(rows) ? rows : [])
+    .filter((row) => row && typeof row === "object")
+    .map((row) => ({
+      id: row.id || compactId("audit"),
+      eventType: normalizeDisplayText(row.eventType || row.type || "unknown"),
+      actor: normalizeDisplayText(row.actor || "system"),
+      status: normalizeDisplayText(row.status || "ok"),
+      createdAt: row.createdAt || row.generatedAt || nowIso(),
+      payload: row.payload && typeof row.payload === "object" ? row.payload : {},
+    }))
+    .sort((a, b) => new Date(b.createdAt || 0) - new Date(a.createdAt || 0))
+    .slice(0, 1000);
+}
+
+function appendAuditEvent(db = {}, eventType = "", payload = {}, status = "ok", actor = "system") {
+  const event = {
+    id: compactId("audit"),
+    eventType: normalizeDisplayText(eventType || "unknown"),
+    actor: normalizeDisplayText(actor || "system"),
+    status: normalizeDisplayText(status || "ok"),
+    createdAt: nowIso(),
+    payload: payload && typeof payload === "object" ? payload : {},
+  };
+  db.auditEvents = normalizeAuditEvents([event, ...(db.auditEvents || [])]);
+  return event;
+}
+
+function normalizeStrategyVersions(rows = []) {
+  return (Array.isArray(rows) ? rows : [])
+    .filter((row) => row && typeof row === "object" && row.id)
+    .map((row) => ({
+      schemaVersion: "strategy-version-v1",
+      id: String(row.id),
+      strategyType: row.strategyType || "all-stock-agent",
+      configHash: row.configHash || "",
+      activeFrom: row.activeFrom || row.createdAt || row.generatedAt || "",
+      activeTo: row.activeTo || "",
+      changeReason: row.changeReason || "",
+      evaluationSummary: row.evaluationSummary || null,
+      sourceFile: row.sourceFile || "",
+      status: row.status || "active",
+      json: row.json && typeof row.json === "object" ? row.json : null,
+    }))
+    .slice(0, 200);
+}
+
 function normalizeAllStockAgentState(value = {}) {
   const state = value && typeof value === "object" ? value : {};
   const runs = Array.isArray(state.runs) ? state.runs : [];
   const decisions = Array.isArray(state.decisions) ? state.decisions : [];
   const outcomeSnapshots = Array.isArray(state.outcomeSnapshots) ? state.outcomeSnapshots : [];
   const skillRevisions = Array.isArray(state.skillRevisions) ? state.skillRevisions : [];
+  const strategyVersions = normalizeStrategyVersions(state.strategyVersions);
   const factorWeights = state.factorWeights && typeof state.factorWeights === "object"
     ? {
         ...state.factorWeights,
@@ -3098,8 +3168,15 @@ function normalizeAllStockAgentState(value = {}) {
     ruleStats: state.ruleStats && typeof state.ruleStats === "object" ? state.ruleStats : {},
     paperBook: state.paperBook && typeof state.paperBook === "object" ? state.paperBook : null,
     persistentMemory: state.persistentMemory && typeof state.persistentMemory === "object" ? state.persistentMemory : null,
+    userPaperPortfolio: state.userPaperPortfolio && typeof state.userPaperPortfolio === "object"
+      ? {
+          ...state.userPaperPortfolio,
+          acceptances: Array.isArray(state.userPaperPortfolio.acceptances) ? state.userPaperPortfolio.acceptances.slice(0, 500) : [],
+        }
+      : { schemaVersion: "user-paper-portfolio-v1", acceptances: [] },
     factorWeights,
     factorWeightLearning: state.factorWeightLearning && typeof state.factorWeightLearning === "object" ? state.factorWeightLearning : null,
+    strategyVersions,
     skillRevisions: skillRevisions.slice(0, 200),
     lastRunAt: state.lastRunAt || "",
     lastSkillAutoUpdateDate: state.lastSkillAutoUpdateDate || "",
@@ -3240,6 +3317,7 @@ function compactStoreForSave(db = {}) {
     chat: Array.isArray(db.chat) ? db.chat.slice(-80) : [],
     alerts: Array.isArray(db.alerts) ? db.alerts.slice(0, 200) : [],
     signalHistory: Array.isArray(db.signalHistory) ? db.signalHistory.slice(0, 1000) : [],
+    auditEvents: normalizeAuditEvents(db.auditEvents),
     ibkrPortalFeed: normalizeIbkrPortalFeed(db.ibkrPortalFeed),
     allStockAgent: normalizeAllStockAgentState(db.allStockAgent),
   };
@@ -3492,6 +3570,7 @@ async function ensureStore() {
           : {},
       ibkrSyncLog: Array.isArray(db.ibkrSyncLog) ? db.ibkrSyncLog : [],
       akshareGlobalNewsLog: Array.isArray(db.akshareGlobalNewsLog) ? db.akshareGlobalNewsLog : [],
+      auditEvents: normalizeAuditEvents(db.auditEvents),
       scheduleLog: db.scheduleLog || {},
       sourceControls: normalizeSourceControls(db.sourceControls),
       sourceDiagnostics: normalizeSourceDiagnostics(db.sourceDiagnostics),
@@ -3527,6 +3606,7 @@ async function ensureStore() {
       tradeReviewActionState: {},
       ibkrSyncLog: [],
       akshareGlobalNewsLog: [],
+      auditEvents: [],
       scheduleLog: {},
       sourceControls: { disabled: [], updatedAt: "" },
       sourceDiagnostics: null,
@@ -19942,11 +20022,18 @@ function defaultAllStockAgentSkill() {
     settings: {
       maxCandidates: ALL_STOCK_AGENT_UNIVERSE_LIMIT,
       buyLimit: ALL_STOCK_AGENT_BUY_LIMIT,
+      actionableBuyLimit: ALL_STOCK_AGENT_ACTIONABLE_BUY_LIMIT,
       buyThreshold: 64,
       sellThreshold: 58,
       minDataQuality: 42,
+      minActionableDataQuality: ALL_STOCK_AGENT_MIN_ACTIONABLE_DQ,
       minBuyPrice: 1,
-      reviewAfterDays: [1, 3, 5, 10],
+      reviewAfterDays: [1, 3, 5, 10, 20, 60],
+      cooldownTradingDays: 5,
+      failedThesisCooldownTradingDays: 20,
+      earningsBlackoutDays: 2,
+      maxPortfolioExposurePct: 100,
+      exposureThresholdStepPct: 5,
       autoUpdate: true,
       minSamplesForWeightUpdate: 20,
       maxDailyWeightStep: 1,
@@ -20008,13 +20095,29 @@ function normalizeAllStockAgentSkill(value = {}) {
   };
   settings.maxCandidates = Math.max(20, Math.min(1000, Number(settings.maxCandidates) || ALL_STOCK_AGENT_UNIVERSE_LIMIT));
   settings.buyLimit = Math.max(1, Math.min(50, Number(settings.buyLimit) || ALL_STOCK_AGENT_BUY_LIMIT));
+  settings.actionableBuyLimit = Math.max(1, Math.min(10, Number(settings.actionableBuyLimit) || ALL_STOCK_AGENT_ACTIONABLE_BUY_LIMIT));
   settings.buyThreshold = Math.max(1, Math.min(100, Number(settings.buyThreshold) || fallback.settings.buyThreshold));
   settings.sellThreshold = Math.max(1, Math.min(100, Number(settings.sellThreshold) || fallback.settings.sellThreshold));
   settings.minDataQuality = Math.max(0, Math.min(100, Number(settings.minDataQuality) || fallback.settings.minDataQuality));
+  settings.minActionableDataQuality = Math.max(
+    0,
+    Math.min(100, Number(settings.minActionableDataQuality) || fallback.settings.minActionableDataQuality || ALL_STOCK_AGENT_MIN_ACTIONABLE_DQ),
+  );
   settings.minBuyPrice = Math.max(0, Number(settings.minBuyPrice) || fallback.settings.minBuyPrice);
   settings.reviewAfterDays = Array.isArray(settings.reviewAfterDays)
     ? settings.reviewAfterDays.map((item) => Number(item)).filter((item) => Number.isFinite(item) && item >= 0).slice(0, 8)
     : fallback.settings.reviewAfterDays;
+  if (!settings.reviewAfterDays.includes(20)) settings.reviewAfterDays.push(20);
+  if (!settings.reviewAfterDays.includes(60)) settings.reviewAfterDays.push(60);
+  settings.reviewAfterDays = [...new Set(settings.reviewAfterDays)].sort((a, b) => a - b).slice(0, 8);
+  settings.cooldownTradingDays = Math.max(0, Math.min(30, Number(settings.cooldownTradingDays) || fallback.settings.cooldownTradingDays || 5));
+  settings.failedThesisCooldownTradingDays = Math.max(
+    settings.cooldownTradingDays,
+    Math.min(90, Number(settings.failedThesisCooldownTradingDays) || fallback.settings.failedThesisCooldownTradingDays || 20),
+  );
+  settings.earningsBlackoutDays = Math.max(0, Math.min(10, Number(settings.earningsBlackoutDays) || fallback.settings.earningsBlackoutDays || 2));
+  settings.maxPortfolioExposurePct = Math.max(0, Math.min(250, Number(settings.maxPortfolioExposurePct) || fallback.settings.maxPortfolioExposurePct || 100));
+  settings.exposureThresholdStepPct = Math.max(0, Math.min(20, Number(settings.exposureThresholdStepPct) || fallback.settings.exposureThresholdStepPct || 5));
   settings.autoUpdate = Boolean(settings.autoUpdate);
   settings.minSamplesForWeightUpdate = Math.max(20, Number(settings.minSamplesForWeightUpdate) || fallback.settings.minSamplesForWeightUpdate);
   settings.maxDailyWeightStep = Math.max(0, Math.min(3, Number(settings.maxDailyWeightStep) || 1));
@@ -20063,6 +20166,96 @@ function loadAllStockAgentSkill() {
       errors: [{ source: "All Stock Agent Skill", error: error.message }],
     };
   }
+}
+
+function allStockAgentStrategyVersion(skillBundle = {}, skill = null, options = {}) {
+  const normalizedSkill = normalizeAllStockAgentSkill(skill || skillBundle.skill || defaultAllStockAgentSkill());
+  const configHash = hashObject({
+    schemaVersion: normalizedSkill.schemaVersion,
+    name: normalizedSkill.name,
+    settings: normalizedSkill.settings,
+    buyRules: normalizedSkill.buyRules,
+    sellRules: normalizedSkill.sellRules,
+    riskGates: normalizedSkill.riskGates,
+  });
+  return {
+    schemaVersion: "strategy-version-v1",
+    id: `all-stock-${configHash.slice(0, 12)}`,
+    strategyType: "all-stock-agent",
+    configHash,
+    activeFrom: options.activeFrom || nowIso(),
+    activeTo: "",
+    changeReason: options.changeReason || "skill-json-hash",
+    evaluationSummary: options.evaluationSummary || null,
+    sourceFile: skillBundle.path || path.relative(__dirname, ALL_STOCK_AGENT_SKILL_FILE),
+    status: "active",
+    json: normalizedSkill,
+  };
+}
+
+function strategyVersionId(value = null) {
+  if (!value) return "";
+  if (typeof value === "string") return value;
+  if (typeof value === "object") return value.id || value.strategyVersion || "";
+  return String(value);
+}
+
+function strategyVersionHash(value = null) {
+  if (!value || typeof value !== "object") return "";
+  return value.configHash || value.strategyConfigHash || "";
+}
+
+function upsertStrategyVersion(rows = [], version = null) {
+  if (!version?.id) return normalizeStrategyVersions(rows);
+  const normalized = normalizeStrategyVersions(rows);
+  const existing = normalized.find((item) => item.id === version.id);
+  if (existing) {
+    return normalized.map((item) => (item.id === version.id ? { ...item, ...version, activeFrom: item.activeFrom || version.activeFrom } : item));
+  }
+  return normalizeStrategyVersions([version, ...normalized]);
+}
+
+function regimeTagFromRiskScore(riskScore, label = "") {
+  const score = numberOrNull(riskScore);
+  const bucket = Number.isFinite(score)
+    ? score < 45
+      ? "risk_on"
+      : score < 65
+        ? "neutral"
+        : score < 80
+          ? "risk_off"
+          : "high_risk"
+    : "unknown";
+  return {
+    schemaVersion: "regime-tag-v1",
+    bucket,
+    label: normalizeDisplayText(label) || bucket,
+    riskScore: Number.isFinite(score) ? score : null,
+  };
+}
+
+function allStockAgentRegimeTagFromRun(run = {}) {
+  const overview = run.marketOverview || {};
+  return regimeTagFromRiskScore(overview.riskScore, overview.regime || overview.fredMacroRegime?.regime || "");
+}
+
+function allStockAgentRegimeTagFromSnapshot(snapshot = {}) {
+  const macro = snapshot.factors?.macroRegime || {};
+  return regimeTagFromRiskScore(macro.raw?.marketRisk, macro.raw?.regime || "");
+}
+
+function tagFactorStatsWithRegime(factorStats = {}, regimeTag = null) {
+  const regime = regimeTag?.bucket || "unknown";
+  return Object.fromEntries(
+    Object.entries(factorStats || {}).map(([key, row]) => [
+      key,
+      {
+        ...row,
+        regime,
+        regimeTag: regimeTag || null,
+      },
+    ]),
+  );
 }
 
 function renderAllStockAgentSkillMarkdown(skill, revision = null, previousRaw = "") {
@@ -20996,6 +21189,159 @@ function recommendationInvalidations(evaluation = {}) {
   return [...new Set(items)].slice(0, 5);
 }
 
+function allStockAgentTradingDayCooldownStatus(fromAt = "", toAt = "", days = 0) {
+  const count = Math.max(0, Number(days) || 0);
+  if (!count || !fromAt) return null;
+  const untilDate = addBusinessDays(fromAt, count);
+  const untilMs = untilDate ? untilDate.getTime() : NaN;
+  const toMs = new Date(toAt || nowIso()).getTime();
+  if (!Number.isFinite(untilMs) || !Number.isFinite(toMs) || toMs >= untilMs) return null;
+  return { untilAt: untilDate.toISOString(), days: count };
+}
+
+function allStockAgentLatestLossForTicker(state = {}, ticker = "") {
+  const symbol = safeTicker(ticker);
+  return (state.outcomeSnapshots || [])
+    .filter((item) => safeTicker(item.ticker) === symbol && item.outcome === "loss")
+    .sort((a, b) => new Date(b.evaluatedAt || 0) - new Date(a.evaluatedAt || 0))[0] || null;
+}
+
+function allStockAgentCooldownGate(state = {}, ticker = "", run = {}, skill = {}) {
+  const symbol = safeTicker(ticker);
+  const runAt = run.completedAt || run.generatedAt || nowIso();
+  const settings = skill.settings || {};
+  const recentDecision = (state.decisions || [])
+    .filter((item) => safeTicker(item.ticker) === symbol && allStockAgentDecisionTracksOutcome(item))
+    .sort((a, b) => new Date(b.generatedAt || 0) - new Date(a.generatedAt || 0))[0] || null;
+  const normal = recentDecision
+    ? allStockAgentTradingDayCooldownStatus(recentDecision.generatedAt, runAt, settings.cooldownTradingDays)
+    : null;
+  if (normal) {
+    return {
+      blocked: true,
+      gate: {
+        id: "ticker_cooldown",
+        label: "单票冷却期",
+        action: "downgrade_research",
+        evidence: `${symbol} 最近已有建议，冷却到 ${normal.untilAt.slice(0, 10)}。`,
+      },
+      untilAt: normal.untilAt,
+    };
+  }
+  const latestLoss = allStockAgentLatestLossForTicker(state, symbol);
+  const failed = latestLoss
+    ? allStockAgentTradingDayCooldownStatus(latestLoss.evaluatedAt || latestLoss.dueAt, runAt, settings.failedThesisCooldownTradingDays)
+    : null;
+  if (failed) {
+    return {
+      blocked: true,
+      gate: {
+        id: "failed_thesis_cooldown",
+        label: "失败 thesis 冷却",
+        action: "downgrade_research",
+        evidence: `${symbol} 上次 thesis 跑输基准，冷却到 ${failed.untilAt.slice(0, 10)}。`,
+      },
+      untilAt: failed.untilAt,
+    };
+  }
+  return { blocked: false };
+}
+
+function allStockAgentEarningsDate(run = {}, ticker = "") {
+  const symbol = safeTicker(ticker);
+  const events = run.eventCalendar?.earnings || [];
+  const event = events.find((item) => safeTicker(item.ticker) === symbol && item.date);
+  if (event?.date) return event.date;
+  const fundamental = (run.fundamentals || []).find((item) => safeTicker(item.ticker) === symbol) || {};
+  return fundamental.nextEarnings || fundamental.earningsDate || "";
+}
+
+function allStockAgentEarningsBlackoutGate(run = {}, ticker = "", skill = {}) {
+  const days = Math.max(0, Number(skill.settings?.earningsBlackoutDays) || 0);
+  if (!days) return { blocked: false };
+  const dateText = allStockAgentEarningsDate(run, ticker);
+  if (!dateText) return { blocked: false };
+  const eventMs = new Date(`${String(dateText).slice(0, 10)}T16:00:00Z`).getTime();
+  const runMs = new Date(run.completedAt || run.generatedAt || nowIso()).getTime();
+  if (!Number.isFinite(eventMs) || !Number.isFinite(runMs)) return { blocked: false };
+  const distanceDays = Math.abs(eventMs - runMs) / (24 * 60 * 60 * 1000);
+  if (distanceDays > days) return { blocked: false };
+  return {
+    blocked: true,
+    gate: {
+      id: "earnings_blackout",
+      label: "财报黑窗",
+      action: "downgrade_research",
+      evidence: `${safeTicker(ticker)} 财报日 ${String(dateText).slice(0, 10)}，距当前约 ${formatReportNumber(distanceDays, 1)} 天。`,
+    },
+  };
+}
+
+function allStockAgentPortfolioExposurePct(state = {}, run = {}) {
+  const paperSummary = state.paperBook?.summary || {};
+  const paperNotional = (state.paperBook?.openPositions || []).reduce((sum, item) => sum + Number(item.notional || 0), 0);
+  const realPositions = sanitizePortfolio(run.portfolio || []);
+  const realGross = firstFiniteNumber(
+    run.portfolioRisk?.summary?.grossMarketValue,
+    run.portfolioRisk?.summary?.totalMarketValue,
+    realPositions.reduce((sum, item) => sum + Number(item.marketValue || 0), 0),
+  );
+  const realTotal = firstFiniteNumber(run.portfolioRisk?.summary?.totalMarketValue, realGross);
+  if (Number.isFinite(realGross) && Number.isFinite(realTotal) && realTotal > 0) return Math.max(0, (realGross / realTotal) * 100);
+  const positionSize = Number(paperSummary.positionSize || ALL_STOCK_AGENT_PAPER_POSITION_SIZE);
+  const denominator = Math.max(positionSize * 10, paperNotional);
+  return denominator > 0 ? (paperNotional / denominator) * 100 : 0;
+}
+
+function allStockAgentDynamicBuyThreshold(skill = {}, state = {}, run = {}) {
+  const base = numberOrNull(skill.settings?.buyThreshold) ?? 64;
+  const exposurePct = allStockAgentPortfolioExposurePct(state, run);
+  const maxExposure = numberOrNull(skill.settings?.maxPortfolioExposurePct) ?? 100;
+  const step = numberOrNull(skill.settings?.exposureThresholdStepPct) ?? 5;
+  const exposurePenalty = exposurePct > maxExposure ? Math.min(18, Math.ceil((exposurePct - maxExposure) / 10) * step) : 0;
+  return {
+    threshold: Math.min(95, base + exposurePenalty),
+    baseThreshold: base,
+    exposurePct,
+    exposurePenalty,
+  };
+}
+
+function allStockAgentActionability(evaluation = {}, state = {}, run = {}, skill = {}) {
+  const minDq = numberOrNull(skill.settings?.minActionableDataQuality) ?? ALL_STOCK_AGENT_MIN_ACTIONABLE_DQ;
+  const dynamic = allStockAgentDynamicBuyThreshold(skill, state, run);
+  const gates = [];
+  if ((evaluation.dataQualityScore || 0) < minDq) {
+    gates.push({
+      id: "low_data_quality",
+      label: "数据质量不足",
+      action: "downgrade_research",
+      evidence: `DQ ${formatReportNumber(evaluation.dataQualityScore || 0, 0)} 低于 actionable 阈值 ${formatReportNumber(minDq, 0)}。`,
+    });
+  }
+  if ((evaluation.buyScore || 0) < dynamic.threshold) {
+    gates.push({
+      id: "dynamic_threshold",
+      label: "组合暴露动态阈值",
+      action: "downgrade_research",
+      evidence: `买入分 ${formatReportNumber(evaluation.buyScore || 0, 0)}，动态阈值 ${formatReportNumber(dynamic.threshold, 0)}。`,
+    });
+  }
+  const cooldown = allStockAgentCooldownGate(state, evaluation.ticker, run, skill);
+  if (cooldown.blocked) gates.push(cooldown.gate);
+  const blackout = allStockAgentEarningsBlackoutGate(run, evaluation.ticker, skill);
+  if (blackout.blocked) gates.push(blackout.gate);
+  const eligible = Boolean(evaluation.buyEligible) && gates.length === 0;
+  return {
+    schemaVersion: "actionability-v1",
+    eligible,
+    status: eligible ? "actionable" : "research",
+    minDataQuality: minDq,
+    dynamicThreshold: dynamic,
+    gates,
+  };
+}
+
 function evaluateAllStockAgentCondition(condition, ctx = {}, skill = {}) {
   const row = ctx.row || {};
   const quote = ctx.quote || {};
@@ -21297,7 +21643,7 @@ function buildAllStockAgentEvaluation(run = {}, tickerPoolItem = {}, state = {},
   const adjustedBuy = applyAllStockAgentShadowGates(buy.score, shadowGates, buyThreshold);
   const buyEligible = adjustedBuy.score >= buyThreshold && !vetoBuy && (allowAddToExisting || !hasPosition);
   const sellEligible = hasPosition && sell.score >= sellThreshold;
-  return {
+  const evaluation = {
     schemaVersion: "all-stock-agent-evaluation-v1",
     ticker,
     name: ctx.fundamental?.name || knownEquityProfile(ticker)?.name || ticker,
@@ -21321,6 +21667,11 @@ function buildAllStockAgentEvaluation(run = {}, tickerPoolItem = {}, state = {},
     matchedFactors: factorScore.matchedFactors,
     benchmarkBasket,
     primaryHorizon: RECOMMENDER_PRIMARY_HORIZON_DAYS,
+    strategyVersion: strategyVersionId(options.strategyVersion) || "all-stock-agent-skill-current",
+    strategyVersionRecord: options.strategyVersion || null,
+    skillVersion: strategyVersionId(options.strategyVersion) || "all-stock-agent-skill-current",
+    regime: options.regimeTag?.bucket || allStockAgentRegimeTagFromSnapshot(factorSnapshot).bucket,
+    regimeTag: options.regimeTag || allStockAgentRegimeTagFromSnapshot(factorSnapshot),
     buyScore: adjustedBuy.score,
     rawBuyScore: buy.score,
     shadowPenalties: adjustedBuy.penalties,
@@ -21350,6 +21701,16 @@ function buildAllStockAgentEvaluation(run = {}, tickerPoolItem = {}, state = {},
     technicalLine: actionSuggestionTechnicalLine(ctx.technical || {}, ctx.quote || {}),
     generatedAt: nowIso(),
   };
+  evaluation.actionability = allStockAgentActionability(evaluation, state, run, skill);
+  evaluation.actionableEligible = evaluation.actionability.eligible;
+  if (evaluation.actionability.gates?.length) {
+    evaluation.gates = [...evaluation.gates, ...evaluation.actionability.gates];
+    evaluation.risks = [
+      ...evaluation.risks,
+      ...evaluation.actionability.gates.map((gate) => `${gate.label}：${gate.evidence}`),
+    ].slice(0, 7);
+  }
+  return evaluation;
 }
 
 function allStockAgentDecisionFromEvaluation(evaluation, action, runId, trigger) {
@@ -21383,6 +21744,25 @@ function allStockAgentDecisionFromEvaluation(evaluation, action, runId, trigger)
     primaryHorizon: evaluation.primaryHorizon || RECOMMENDER_PRIMARY_HORIZON_DAYS,
     invalidations: evaluation.invalidations || [],
     modelVersion: evaluation.skillVersion || "all-stock-agent-skill-current",
+    strategyVersion: strategyVersionId(evaluation.strategyVersion) || evaluation.skillVersion || "all-stock-agent-skill-current",
+    strategyConfigHash: strategyVersionHash(evaluation.strategyVersionRecord) || strategyVersionHash(evaluation.strategyVersion),
+    regime: evaluation.regime || evaluation.regimeTag?.bucket || "unknown",
+    regimeTag: evaluation.regimeTag || null,
+    actionability: evaluation.actionability || null,
+    actionable: action === "买入" ? evaluation.actionableEligible === true && !isFallbackBuy : action === "卖出",
+    evidenceRefs: [
+      ...(evaluation.newsStorylines || []).map((item) => item.id || item.url || item.title).filter(Boolean),
+      ...(evaluation.matchedFactors || []).map((item) => item.id || item.label).filter(Boolean),
+    ].slice(0, 12),
+    llmGovernance: {
+      schemaVersion: "llm-governance-v1",
+      llmWritesScores: false,
+      llmWritesGates: false,
+      llmWritesWeights: false,
+      promptTemplateId: "",
+      modelProvider: "",
+      schemaValidationStatus: "deterministic_record",
+    },
     matchedFactors: evaluation.matchedFactors || [],
     confidence: evaluation.confidence,
     advisorAction: evaluation.advisorAction,
@@ -21473,6 +21853,25 @@ function allStockAgentWatchCandidateFromEvaluation(evaluation = {}, runId = "", 
     benchmarkBasket: evaluation.benchmarkBasket || [],
     primaryHorizon: evaluation.primaryHorizon || RECOMMENDER_PRIMARY_HORIZON_DAYS,
     invalidations: evaluation.invalidations || [],
+    strategyVersion: strategyVersionId(evaluation.strategyVersion) || evaluation.skillVersion || "all-stock-agent-skill-current",
+    strategyConfigHash: strategyVersionHash(evaluation.strategyVersionRecord) || strategyVersionHash(evaluation.strategyVersion),
+    regime: evaluation.regime || evaluation.regimeTag?.bucket || "unknown",
+    regimeTag: evaluation.regimeTag || null,
+    actionability: evaluation.actionability || null,
+    actionable: false,
+    evidenceRefs: [
+      ...(evaluation.newsStorylines || []).map((item) => item.id || item.url || item.title).filter(Boolean),
+      ...(evaluation.matchedFactors || []).map((item) => item.id || item.label).filter(Boolean),
+    ].slice(0, 12),
+    llmGovernance: {
+      schemaVersion: "llm-governance-v1",
+      llmWritesScores: false,
+      llmWritesGates: false,
+      llmWritesWeights: false,
+      promptTemplateId: "",
+      modelProvider: "",
+      schemaValidationStatus: "deterministic_record",
+    },
     matchedFactors: evaluation.matchedFactors || [],
     confidence: evaluation.confidence,
     advisorAction: evaluation.advisorAction,
@@ -21482,7 +21881,9 @@ function allStockAgentWatchCandidateFromEvaluation(evaluation = {}, runId = "", 
     gates: evaluation.gates,
     thesis: evaluation.thesis,
     risks: [
-      "未达到正式买入门槛，不进入纸面组合；等待 gate 消失、价格确认或基本面证据补齐后再升级为买入。",
+      evaluation.buyEligible && evaluation.actionability?.status === "research"
+        ? "已满足基础买入规则，但因数据质量、冷却期、财报黑窗或组合暴露闸门被降级为研究，不进入纸面组合。"
+        : "未达到正式买入门槛，不进入纸面组合；等待 gate 消失、价格确认或基本面证据补齐后再升级为买入。",
       ...(evaluation.risks || []),
     ].slice(0, 7),
     positionReturnPct: evaluation.positionReturnPct,
@@ -21703,7 +22104,7 @@ function buildAllStockAgentSwarmReview(outcome = {}) {
 function buildAllStockAgentOutcomeSnapshots(state = {}, run = {}, db = {}, skill = {}) {
   const existing = Array.isArray(state.outcomeSnapshots) ? state.outcomeSnapshots : [];
   const existingKeys = new Set(existing.map((item) => `${item.decisionId}:${item.horizonDays}`));
-  const horizons = (skill.settings?.reviewAfterDays || [1, 3, 5, 10])
+  const horizons = (skill.settings?.reviewAfterDays || [1, 3, 5, 10, 20, 60])
     .map((item) => Number(item))
     .filter((item) => Number.isFinite(item) && item > 0)
     .slice(0, 8);
@@ -21747,6 +22148,10 @@ function buildAllStockAgentOutcomeSnapshots(state = {}, run = {}, db = {}, skill
         ticker,
         action: decision.action,
         decisionAt,
+        strategyVersion: decision.strategyVersion || decision.modelVersion || "",
+        strategyConfigHash: decision.strategyConfigHash || "",
+        regime: decision.regime || allStockAgentRegimeTagFromSnapshot(decision.factorSnapshot || {}).bucket,
+        regimeTag: decision.regimeTag || allStockAgentRegimeTagFromSnapshot(decision.factorSnapshot || {}),
         horizonDays,
         dueAt,
         evaluatedAt: run.completedAt || run.generatedAt || nowIso(),
@@ -22341,6 +22746,8 @@ async function runAllStockAgentForRun(db, sourceRun, trigger = "manual", options
   let source = runWithDerivedAnalysisLayers(sourceRun);
   const skillBundle = loadAllStockAgentSkill();
   let skill = skillBundle.skill;
+  let strategyVersion = allStockAgentStrategyVersion(skillBundle, skill);
+  const regimeTag = allStockAgentRegimeTagFromRun(source);
   let securityMaster = cachedNasdaqSecurityMasterSync();
   const securityMasterErrors = [];
   try {
@@ -22374,6 +22781,7 @@ async function runAllStockAgentForRun(db, sourceRun, trigger = "manual", options
       factorStatsSource = "stockHistory-backtest";
     }
   }
+  factorStats = tagFactorStatsWithRegime(factorStats, regimeTag);
   const persistentMemory = buildAllStockAgentPersistentMemory(stateWithOutcomes.outcomeSnapshots || []);
   const factorWeightLearning = buildAllStockAgentFactorWeightLearning(factorStats, currentFactorWeights, skill, factorStatsSource);
   const activeFactorWeights = factorWeightLearning.learnedWeights || currentFactorWeights;
@@ -22388,24 +22796,36 @@ async function runAllStockAgentForRun(db, sourceRun, trigger = "manual", options
   );
   const skillUpdate = await maybeUpdateAllStockAgentSkill(skillBundle, state, ruleStats);
   skill = skillUpdate.skill;
+  strategyVersion = allStockAgentStrategyVersion(skillBundle, skill, {
+    changeReason: skillUpdate.revision ? skillUpdate.revision.summary : "skill-json-hash",
+    evaluationSummary: skillUpdate.revision || null,
+  });
   const evaluations = universe
-    .map((item) => buildAllStockAgentEvaluation(source, item, state, skill, { factorWeights: activeFactorWeights }))
+    .map((item) => buildAllStockAgentEvaluation(source, item, state, skill, {
+      factorWeights: activeFactorWeights,
+      strategyVersion,
+      regimeTag,
+    }))
     .filter(Boolean)
     .sort((a, b) => {
       const buyDiff = Number(b.buyEligible) - Number(a.buyEligible);
       if (buyDiff) return buyDiff;
       return (b.buyScore || 0) - (a.buyScore || 0) || (b.actionScore || 0) - (a.actionScore || 0) || (b.confidence || 0) - (a.confidence || 0);
     });
-  const buyLimit = Math.min(ALL_STOCK_AGENT_BUY_LIMIT, Number(skill.settings?.buyLimit) || ALL_STOCK_AGENT_BUY_LIMIT);
+  const buyLimit = Math.min(
+    ALL_STOCK_AGENT_ACTIONABLE_BUY_LIMIT,
+    Number(skill.settings?.actionableBuyLimit) || ALL_STOCK_AGENT_ACTIONABLE_BUY_LIMIT,
+    Number(skill.settings?.buyLimit) || ALL_STOCK_AGENT_BUY_LIMIT,
+  );
   const agentRunId = `${Date.now()}-all-stock-agent`;
-  const primaryBuyPool = evaluations.filter((item) => item.buyEligible);
+  const primaryBuyPool = evaluations.filter((item) => item.actionableEligible);
   const buyDecisions = primaryBuyPool
     .slice(0, buyLimit)
     .map((item) => allStockAgentDecisionFromEvaluation(item, "买入", agentRunId, trigger));
   const buyDecisionTickers = new Set(buyDecisions.map((item) => item.ticker));
   const watchBuyCandidates = evaluations
     .filter((item) => !buyDecisionTickers.has(item.ticker))
-    .filter((item) => allStockAgentSupplementalBuyAllowed(item, skill) || allStockAgentWatchBuyAllowed(item, skill))
+    .filter((item) => item.buyEligible || allStockAgentSupplementalBuyAllowed(item, skill) || allStockAgentWatchBuyAllowed(item, skill))
     .sort((a, b) => (b.buyScore || 0) - (a.buyScore || 0) || (b.actionScore || 0) - (a.actionScore || 0) || (b.confidence || 0) - (a.confidence || 0))
     .slice(0, buyLimit)
     .map((item) => allStockAgentWatchCandidateFromEvaluation(item, agentRunId, trigger));
@@ -22454,6 +22874,7 @@ async function runAllStockAgentForRun(db, sourceRun, trigger = "manual", options
       name: skill.name,
       schemaVersion: skill.schemaVersion,
       settings: skill.settings,
+      strategyVersion,
       errors: skillBundle.errors || [],
     },
     summary: {
@@ -22467,6 +22888,21 @@ async function runAllStockAgentForRun(db, sourceRun, trigger = "manual", options
       outcomes: stateWithOutcomes.outcomeSnapshots.length,
       newOutcomes: outcomeUpdate.added,
       skillChanges: skillUpdate.revision?.changes?.length || 0,
+      actionableBuyLimit: buyLimit,
+      researchDowngraded: evaluations.filter((item) => item.buyEligible && !item.actionableEligible).length,
+    },
+    roadmap: {
+      schemaVersion: "investment-assistant-roadmap-status-v1",
+      strategyVersion: strategyVersion.id,
+      strategyConfigHash: strategyVersion.configHash,
+      regime: regimeTag,
+      antiOvertrading: {
+        actionableBuyLimit: buyLimit,
+        cooldownTradingDays: skill.settings?.cooldownTradingDays,
+        failedThesisCooldownTradingDays: skill.settings?.failedThesisCooldownTradingDays,
+        earningsBlackoutDays: skill.settings?.earningsBlackoutDays,
+        minActionableDataQuality: skill.settings?.minActionableDataQuality,
+      },
     },
     universeCoverage: {
       labels: [...new Set(universe.flatMap((item) => item.labels || []))],
@@ -22533,11 +22969,22 @@ async function runAllStockAgentForRun(db, sourceRun, trigger = "manual", options
       lastLearning: factorWeightLearning,
     },
     factorWeightLearning,
+    strategyVersions: upsertStrategyVersion(state.strategyVersions || [], strategyVersion),
     skillRevisions: skillUpdate.revision ? [skillUpdate.revision, ...(state.skillRevisions || [])] : state.skillRevisions || [],
     lastRunAt: agentRun.completedAt,
     lastSkillAutoUpdateDate: skillUpdate.reviewDate || state.lastSkillAutoUpdateDate,
   });
   db.allStockAgent = nextState;
+  appendAuditEvent(db, "all_stock_agent.run", {
+    runId: agentRun.id,
+    sourceRunId: source.id,
+    trigger,
+    strategyVersion: strategyVersion.id,
+    regime: regimeTag.bucket,
+    buy: buyDecisions.length,
+    watchBuy: watchBuyCandidates.length,
+    sell: sellDecisions.length,
+  });
   if (options.scheduleKey) db.scheduleLog[options.scheduleKey] = agentRun.id;
   await saveStore(db);
   return agentRun;
@@ -22552,6 +22999,378 @@ function allStockAgentForClient(state = {}) {
     outcomeSnapshots: normalized.outcomeSnapshots.slice(0, 300),
     paperBook: normalized.paperBook,
     latest: normalized.runs[0] || null,
+  };
+}
+
+function recommendationStoryRows(run = {}, limit = 8) {
+  const rows = (value) => (Array.isArray(value) ? value : []);
+  const candidates = [
+    ...rows(run.hotNews?.items || run.hotNews?.ranked || run.hotNews?.stories).map((item) => ({ ...item, sourceBlock: "hotNews" })),
+    ...rows(run.moversWithReasons?.items).map((item) => ({ ...item, sourceBlock: "movers" })),
+    ...rows(run.news).map((item) => ({ ...item, sourceBlock: "news" })),
+  ].filter((item) => item && (item.title || item.titleZh || item.summaryZh || item.summary || item.ticker));
+  const seen = new Set();
+  return candidates
+    .filter((item) => {
+      const key = newsDedupeKey(item);
+      if (!key || seen.has(key)) return false;
+      seen.add(key);
+      return true;
+    })
+    .sort((a, b) => {
+      const scoreDiff =
+        Number(b.importanceScore || b.score || b.catalyst?.materiality || 0) -
+        Number(a.importanceScore || a.score || a.catalyst?.materiality || 0);
+      if (scoreDiff) return scoreDiff;
+      return newsPublishedTimeValue(b) - newsPublishedTimeValue(a);
+    })
+    .slice(0, limit)
+    .map((item) => ({
+      id: item.id || item.url || compactId("story"),
+      ticker: safeTicker(item.ticker) || "",
+      category: item.newsCategory || item.category || item.relevance?.category || "市场",
+      title: item.titleZh || item.title || item.summaryZh || item.summary || item.ticker || "未命名新闻",
+      summary: item.article?.investmentView || item.article?.summaryZh || item.catalyst?.summary || item.summaryZh || item.summary || "",
+      source: item.publisher || item.source || item.provider || item.sourceBlock || "",
+      url: item.url || item.link || "",
+      publishedAt: item.publishedAt || item.createdAt || "",
+      importanceScore: numberOrNull(item.importanceScore || item.score || item.catalyst?.materiality),
+    }));
+}
+
+function buildRecommendationTrackRecordPayload(db = {}, filters = {}) {
+  const state = normalizeAllStockAgentState(db.allStockAgent);
+  const horizonFilter = Number(filters.horizon || 0);
+  const regimeFilter = normalizeDisplayText(filters.regime || "");
+  const completed = (state.outcomeSnapshots || [])
+    .filter((item) => item?.outcome && item.outcome !== "pending")
+    .filter((item) => !horizonFilter || Number(item.horizonDays) === horizonFilter)
+    .filter((item) => !regimeFilter || item.regime === regimeFilter || item.regimeTag?.bucket === regimeFilter);
+  const byKey = new Map();
+  for (const item of completed) {
+    const horizon = Number(item.horizonDays) || 0;
+    const regime = item.regime || item.regimeTag?.bucket || allStockAgentRegimeTagFromSnapshot(item.factorSnapshot || {}).bucket;
+    const key = `${horizon}:${regime}`;
+    const row = byKey.get(key) || {
+      horizonDays: horizon,
+      regime,
+      samples: 0,
+      wins: 0,
+      losses: 0,
+      flats: 0,
+      totalExcessPct: 0,
+      totalMaePct: 0,
+      totalMfePct: 0,
+    };
+    const excess = numberOrNull(item.excessPct);
+    if (Number.isFinite(excess)) {
+      row.samples += 1;
+      row.wins += item.outcome === "win" ? 1 : 0;
+      row.losses += item.outcome === "loss" ? 1 : 0;
+      row.flats += item.outcome === "flat" ? 1 : 0;
+      row.totalExcessPct += excess;
+      row.totalMaePct += numberOrNull(item.maePct) || 0;
+      row.totalMfePct += numberOrNull(item.mfePct) || 0;
+    }
+    byKey.set(key, row);
+  }
+  const buckets = [...byKey.values()]
+    .filter((row) => row.samples > 0)
+    .map((row) => ({
+      ...row,
+      avgExcessPct: row.totalExcessPct / row.samples,
+      hitRate: row.wins / row.samples,
+      avgMaePct: row.totalMaePct / row.samples,
+      avgMfePct: row.totalMfePct / row.samples,
+    }))
+    .sort((a, b) => a.horizonDays - b.horizonDays || String(a.regime).localeCompare(String(b.regime)));
+  return {
+    schemaVersion: "recommendation-track-record-v1",
+    generatedAt: nowIso(),
+    filters: {
+      horizon: horizonFilter || null,
+      regime: regimeFilter || "",
+    },
+    sampleCount: completed.length,
+    buckets,
+    factorStats: state.runs[0]?.factorStats || {},
+    factorWeightLearning: state.factorWeightLearning || null,
+    paperBook: state.paperBook || null,
+    strategyVersions: state.strategyVersions || [],
+    note: "所有指标按冻结 outcome 计算；样本数不足时只展示样本，不自动采纳权重。",
+  };
+}
+
+function buildTodayRecommendationsPayload(db = {}) {
+  const state = normalizeAllStockAgentState(db.allStockAgent);
+  const latestAgent = state.runs[0] || null;
+  const run = latestRun(db) || {};
+  const actionable = (latestAgent?.buyCandidates || [])
+    .filter((item) => item.actionable !== false && item.actionability?.status !== "research")
+    .slice(0, 3);
+  const research = [
+    ...(latestAgent?.watchBuyCandidates || []),
+    ...(latestAgent?.evaluations || []).filter((item) => item.buyEligible && !item.actionableEligible),
+  ].slice(0, 20);
+  return {
+    schemaVersion: "recommendations-today-v1",
+    generatedAt: nowIso(),
+    freshness: {
+      runId: run.id || "",
+      runCompletedAt: run.completedAt || "",
+      agentRunId: latestAgent?.id || "",
+      agentCompletedAt: latestAgent?.completedAt || "",
+    },
+    regime: latestAgent?.roadmap?.regime || allStockAgentRegimeTagFromRun(run),
+    editorial: run.marketOverview?.summary || run.analysis?.headline || "",
+    stories: recommendationStoryRows(run, 8),
+    movers: (run.moversWithReasons?.items || []).slice(0, 8),
+    earningsCountdown: (run.eventCalendar?.earnings || []).slice(0, 8),
+    calls: {
+      actionable,
+      research,
+      actionableLimit: 3,
+      downgraded: latestAgent?.summary?.researchDowngraded || research.length,
+    },
+    trackRecord: buildRecommendationTrackRecordPayload(db),
+    health: {
+      dataQuality: run.dataQuality || null,
+      sourceDiagnostics: normalizeSourceDiagnostics(db.sourceDiagnostics),
+      missingData: latestAgent?.missingData || [],
+    },
+  };
+}
+
+function buildStockDeepDivePayload(db = {}, ticker = "") {
+  const symbol = safeTicker(ticker);
+  const run = latestRun(db) || {};
+  const state = normalizeAllStockAgentState(db.allStockAgent);
+  const latestAgent = state.runs[0] || {};
+  const record = [
+    ...(latestAgent.evaluations || []),
+    ...(latestAgent.buyCandidates || []),
+    ...(latestAgent.watchBuyCandidates || []),
+    ...(latestAgent.sellCandidates || []),
+    ...(latestAgent.holdReviews || []),
+    ...(state.decisions || []),
+  ].find((item) => safeTicker(item?.ticker) === symbol && (item.factorSnapshot || item.recommendationScore)) || null;
+  const snapshot = record?.factorSnapshot || buildFactorSnapshot(run, symbol);
+  const weights = latestAgent.factorWeights || allStockAgentCurrentFactorWeights(state);
+  const factors = snapshot?.factors || {};
+  const waterfall = Object.entries(factors).map(([id, factor]) => {
+    const weight = numberOrNull(weights[id]) ?? 0;
+    const score = numberOrNull(factor.score) ?? 50;
+    const contribution = ((score - 50) / 50) * weight * 100;
+    return {
+      id,
+      label: factor.label || id,
+      raw: factor.raw || {},
+      score,
+      quality: numberOrNull(factor.quality),
+      weight,
+      contribution,
+      source: factor.source || [],
+      missingReason: factor.missingReason || "",
+      normalization: factor.normalization || null,
+    };
+  }).sort((a, b) => Math.abs(b.contribution) - Math.abs(a.contribution));
+  const tradeHistory = (state.decisions || []).filter((item) => safeTicker(item.ticker) === symbol).slice(0, 20);
+  const chainPack = (run.industryChainPacks || []).find((item) => safeTicker(item.ticker) === symbol) || null;
+  const chainRows = [
+    ...(Array.isArray(chainPack?.upstream) ? chainPack.upstream : []),
+    ...(Array.isArray(chainPack?.downstream) ? chainPack.downstream : []),
+    ...(Array.isArray(chainPack?.peers) ? chainPack.peers : []),
+    ...(Array.isArray(chainPack?.competitors) ? chainPack.competitors : []),
+  ].map((item) => ({
+    ...item,
+    evidenceLevel: item.url || item.source || item.provider ? "verified" : "inferred",
+    confidence: numberOrNull(item.confidence) ?? (item.url || item.source || item.provider ? 80 : 45),
+  }));
+  return {
+    schemaVersion: "stock-deep-dive-v1",
+    generatedAt: nowIso(),
+    ticker: symbol,
+    sourceRunId: run.id || "",
+    header: {
+      name: record?.name || (run.fundamentals || []).find((item) => safeTicker(item.ticker) === symbol)?.name || knownEquityProfile(symbol)?.name || symbol,
+      quote: (run.quotes || []).find((item) => safeTicker(item.ticker) === symbol) || null,
+      action: record?.action || record?.actionability?.status || "",
+      score: record?.actionScore ?? record?.score ?? null,
+      strategyVersion: strategyVersionId(record?.strategyVersion) || strategyVersionId(latestAgent.skill?.strategyVersion) || latestAgent.roadmap?.strategyVersion || "",
+      regime: record?.regime || latestAgent.roadmap?.regime?.bucket || "",
+    },
+    factorSnapshot: snapshot,
+    factorWaterfall: {
+      rows: waterfall,
+      totalContribution: waterfall.reduce((sum, item) => sum + (Number(item.contribution) || 0), 0),
+      note: "贡献值按冻结因子分数与当前策略权重重建，用于解释分数来源；正式评分仍以 recommendationScore 为准。",
+    },
+    dataQualityAudit: record?.dataQualityAudit || buildDataQualityAudit(snapshot),
+    business: (run.fundamentals || []).find((item) => safeTicker(item.ticker) === symbol) || knownEquityProfile(symbol) || null,
+    valueChain: chainPack
+      ? {
+          ...chainPack,
+          relationships: chainRows,
+          note: "verified 表示该关系带有来源字段；inferred 表示来自模型或本地行业模板，需要继续用公告、10-K 或官网核验。",
+        }
+      : null,
+    expectations: (run.researchPacks || []).find((item) => safeTicker(item.ticker) === symbol) || record?.expectationGap || null,
+    options: (run.options || []).find((item) => safeTicker(item.ticker) === symbol) || null,
+    newsTimeline: (run.news || []).filter((item) => safeTicker(item.ticker) === symbol || (item.relatedTickers || []).map(safeTicker).includes(symbol)).slice(0, 20),
+    decisionHistory: tradeHistory,
+    lessons: (state.persistentMemory?.memories || []).filter((item) => safeTicker(item.ticker) === symbol).slice(0, 8),
+    invalidations: record?.invalidations || recommendationInvalidations(record || {}),
+  };
+}
+
+function sameYmd(a = "", b = "") {
+  const ay = String(a || "").slice(0, 10);
+  const by = String(b || "").slice(0, 10);
+  return ay && by && ay === by;
+}
+
+function buildTradeRecommendationReconciliation(db = {}) {
+  const trades = sanitizeTrades(db.trades || []);
+  const state = normalizeAllStockAgentState(db.allStockAgent);
+  const decisions = state.decisions || [];
+  const rows = trades.map((trade) => {
+    const ticker = safeTicker(trade.ticker);
+    const sameDay = decisions
+      .filter((decision) => safeTicker(decision.ticker) === ticker && sameYmd(decision.generatedAt, trade.executedAt))
+      .sort((a, b) => Math.abs(Number(b.actionScore || b.score || 0)) - Math.abs(Number(a.actionScore || a.score || 0)));
+    const decision = sameDay[0] || null;
+    const side = normalizeTradeSide(trade.side);
+    const aligned =
+      decision &&
+      ((side === "buy" && decision.action === "买入") || (side === "sell" && decision.action === "卖出"));
+    const classification = decision ? (aligned ? "aligned" : "contrarian") : "uncovered";
+    const hasPlan = Boolean(normalizeDisplayText(trade.thesis || trade.notes || trade.strategy));
+    return {
+      id: `${trade.id || compactId("trade")}:${decision?.id || "uncovered"}`,
+      tradeId: trade.id || "",
+      decisionId: decision?.id || "",
+      ticker,
+      executedAt: trade.executedAt,
+      tradeSide: side,
+      decisionAction: decision?.action || "",
+      classification,
+      thesisAlignment: classification === "aligned" ? "same_direction" : classification === "contrarian" ? "opposite_direction" : "no_same_day_call",
+      processQuality: hasPlan ? "has_plan" : "no_plan",
+      trade,
+      decision,
+    };
+  });
+  return {
+    schemaVersion: "trade-recommendation-reconciliation-v1",
+    generatedAt: nowIso(),
+    summary: {
+      trades: rows.length,
+      aligned: rows.filter((item) => item.classification === "aligned").length,
+      contrarian: rows.filter((item) => item.classification === "contrarian").length,
+      uncovered: rows.filter((item) => item.classification === "uncovered").length,
+    },
+    rows,
+  };
+}
+
+function buildStrategyValidationPayload(db = {}) {
+  const state = normalizeAllStockAgentState(db.allStockAgent);
+  const latest = state.runs[0] || {};
+  const learning = state.factorWeightLearning || latest.factorWeightLearning || null;
+  const factorStats = latest.factorStats || {};
+  const eligibleFactors = Object.values(factorStats).filter((row) => Number(row.samples || 0) >= 50);
+  return {
+    schemaVersion: "strategy-validation-v1",
+    generatedAt: nowIso(),
+    activeVersion: state.strategyVersions?.[0] || latest.skill?.strategyVersion || null,
+    candidate: learning?.learnedWeights ? {
+      sourceRunId: latest.id || "",
+      learnedWeights: learning.learnedWeights,
+      changes: learning.changes || [],
+      status: learning.status || "",
+    } : null,
+    validation: {
+      status: eligibleFactors.length ? "ready_for_walk_forward" : "shadow_only",
+      eligibleFactorCount: eligibleFactors.length,
+      minSamplesPerFactor: 50,
+      rule: "候选权重只在 walk-forward 同时不弱于 active 的超额收益与 MaxDD 后才可人工采纳；本接口不自动修改 skill。",
+    },
+  };
+}
+
+function buildRelevantLessonsPayload(db = {}, ticker = "") {
+  const symbol = safeTicker(ticker);
+  const state = normalizeAllStockAgentState(db.allStockAgent);
+  const rows = (state.persistentMemory?.memories || [])
+    .filter((item) => !symbol || safeTicker(item.ticker) === symbol)
+    .slice(0, 20);
+  return {
+    schemaVersion: "relevant-lessons-v1",
+    generatedAt: nowIso(),
+    ticker: symbol || "",
+    rows,
+    note: "Lessons 只作为观察上下文，不会直接修改因子权重或 hard gates。",
+  };
+}
+
+function buildChatToolResults(message = "", db = {}, run = {}, tradeJournal = null) {
+  const tools = [];
+  const textValue = String(message || "");
+  const tickers = chatTickersFromMessage(textValue, run).slice(0, 2);
+  const add = (name, args, result) => {
+    if (tools.length >= 4) return;
+    tools.push({ name, args, result });
+  };
+  if (/大盘|市场|REGIME|FRED|VIX|收益率|宏观/i.test(textValue)) {
+    add("get_macro_regime", {}, {
+      marketOverview: run?.marketOverview || null,
+      fred: run?.marketOverview?.macroRegime || run?.marketOverview?.fredMacroRegime || null,
+    });
+  }
+  if (/推荐|买入|卖出|操作|今天|候选|ACTION/i.test(textValue)) {
+    add("get_recommendations_today", {}, buildTodayRecommendationsPayload(db));
+  }
+  for (const ticker of tickers) {
+    add("get_stock_deep_dive", { ticker }, buildStockDeepDivePayload(db, ticker));
+  }
+  if (/历史|追责|胜率|回测|TRACK|样本|命中/i.test(textValue)) {
+    add("get_recommendation_track_record", {}, buildRecommendationTrackRecordPayload(db));
+  }
+  if (/交易|复盘|持仓|IBKR|盈亏|JOURNAL/i.test(textValue)) {
+    add("get_trade_journal", {}, summarizeTradeJournalForChat(tradeJournal));
+  }
+  if (/经验|教训|lesson|上次|复盘/i.test(textValue)) {
+    add("get_lessons", { ticker: tickers[0] || "" }, buildRelevantLessonsPayload(db, tickers[0] || ""));
+  }
+  return tools;
+}
+
+function createOrderDraftPayload(db = {}, body = {}) {
+  const ticker = safeTicker(body.ticker);
+  const action = normalizeDisplayText(body.action || body.side || "");
+  const quantity = numberOrNull(body.quantity);
+  const decisionId = normalizeDisplayText(body.decisionId || "");
+  const liveFlag = parseBoolean(process.env.IBKR_TRADING_ENABLED, false);
+  const markerFile = path.join(DATA_DIR, "ALLOW_LIVE_TRADING");
+  const marker = existsSync(markerFile);
+  const allowed = liveFlag && marker;
+  return {
+    schemaVersion: "order-draft-v1",
+    id: compactId("order-draft"),
+    createdAt: nowIso(),
+    ticker,
+    action,
+    quantity,
+    decisionId,
+    status: allowed ? "draft_ready_for_human_review" : "blocked",
+    locks: {
+      IBKR_TRADING_ENABLED: liveFlag,
+      markerFile: path.relative(__dirname, markerFile),
+      markerFileExists: marker,
+    },
+    note: allowed
+      ? "仅生成订单草稿，不调用 broker 下单 API；仍需要人工复核。"
+      : "订单草稿被双锁拦截：必须同时设置 IBKR_TRADING_ENABLED=true 且存在 data/ALLOW_LIVE_TRADING。",
   };
 }
 
@@ -22999,6 +23818,7 @@ function runAllStockAgentBacktest(db = {}, options = {}) {
       minDataQuality: Math.min(numberOrNull(skillBundle.skill?.settings?.minDataQuality) ?? 42, 20),
     },
   });
+  const strategyVersion = allStockAgentStrategyVersion(skillBundle, skill, { changeReason: "backtest" });
   const grouped = stockHistoryRowsByDate(stockHistory);
   const lookbackDays = Math.max(3, Number(options.days || ALL_STOCK_AGENT_BACKTEST_DAYS));
   const maxDates = Math.max(3, Number(options.maxDates || ALL_STOCK_AGENT_BACKTEST_MAX_DATES));
@@ -23017,9 +23837,10 @@ function runAllStockAgentBacktest(db = {}, options = {}) {
   const daily = [];
   for (const group of candidateDates) {
     const run = runFromStockHistoryRows(group.rows, group.date);
+    const regimeTag = allStockAgentRegimeTagFromRun(run);
     const universe = allStockAgentTickerPool(run, db, state, skill, null);
     const evaluations = universe
-      .map((item) => buildAllStockAgentEvaluation(run, item, state, skill, { factorWeights }))
+      .map((item) => buildAllStockAgentEvaluation(run, item, state, skill, { factorWeights, strategyVersion, regimeTag }))
       .filter(Boolean)
       .sort((a, b) => Number(b.buyEligible) - Number(a.buyEligible) || (b.buyScore || 0) - (a.buyScore || 0) || (b.actionScore || 0) - (a.actionScore || 0));
     const buyLimit = Math.min(ALL_STOCK_AGENT_BUY_LIMIT, Number(skill.settings?.buyLimit) || ALL_STOCK_AGENT_BUY_LIMIT);
@@ -23062,6 +23883,10 @@ function runAllStockAgentBacktest(db = {}, options = {}) {
           ticker: decision.ticker,
           action: "买入",
           decisionAt: decision.generatedAt,
+          strategyVersion: decision.strategyVersion || strategyVersion.id,
+          strategyConfigHash: decision.strategyConfigHash || strategyVersion.configHash,
+          regime: decision.regime || regimeTag.bucket,
+          regimeTag: decision.regimeTag || regimeTag,
           horizonDays: horizonDaysValue,
           entryPrice,
           exitPrice: exit.price,
@@ -35008,6 +35833,15 @@ async function runCollection(session = "manual", trigger = "manual", options = {
       ].slice(0, STOCK_HISTORY_LIMIT);
       db.alerts = [...run.alerts, ...(db.alerts || [])].slice(0, 200);
       db.runs = [run, ...db.runs].slice(0, 30);
+      appendAuditEvent(db, "collection.run", {
+        runId: run.id,
+        session,
+        trigger,
+        news: (run.news || []).length,
+        socialPosts: (run.socialPosts || []).length,
+        options: (run.options || []).length,
+        errors: (run.errors || []).length,
+      });
       if (trigger === "schedule") {
         const p = getNewYorkParts(new Date());
         db.scheduleLog[`${p.ymd}:${session}`] = run.id;
@@ -35035,6 +35869,13 @@ async function runCollection(session = "manual", trigger = "manual", options = {
       };
       return run;
     } catch (error) {
+      try {
+        const db = await ensureStore();
+        appendAuditEvent(db, "collection.run", { session, trigger, error: error.message }, "failed");
+        await saveStore(db);
+      } catch {
+        // Preserve the original collection failure path.
+      }
       runStatus = {
         ...runStatus,
         state: "failed",
@@ -36250,6 +37091,102 @@ async function handleApi(req, res, url) {
     });
   }
 
+  if (req.method === "GET" && url.pathname === "/api/recommendations/today") {
+    const db = await ensureStore();
+    return sendJson(res, { today: buildTodayRecommendationsPayload(db) });
+  }
+
+  if (req.method === "GET" && url.pathname === "/api/recommendations/track-record") {
+    const db = await ensureStore();
+    return sendJson(res, {
+      trackRecord: buildRecommendationTrackRecordPayload(db, {
+        horizon: url.searchParams.get("horizon"),
+        regime: url.searchParams.get("regime"),
+      }),
+    });
+  }
+
+  if ((req.method === "GET" || req.method === "POST") && url.pathname === "/api/stocks/deep-dive") {
+    const body = req.method === "POST" ? await readBody(req).catch(() => ({})) : {};
+    const ticker = safeTicker(body.ticker || url.searchParams.get("ticker"));
+    if (!ticker) return sendJson(res, { error: "请输入 ticker。" }, 400);
+    const db = await ensureStore();
+    return sendJson(res, { deepDive: buildStockDeepDivePayload(db, ticker) });
+  }
+
+  if (req.method === "GET" && url.pathname === "/api/trade-recommendation-reconciliation") {
+    const db = await ensureStore();
+    const reconciliation = buildTradeRecommendationReconciliation(db);
+    return sendJson(res, { reconciliation });
+  }
+
+  if (req.method === "GET" && url.pathname === "/api/strategy-versions") {
+    const db = await ensureStore();
+    const state = normalizeAllStockAgentState(db.allStockAgent);
+    return sendJson(res, {
+      strategyVersions: state.strategyVersions,
+      active: state.strategyVersions?.[0] || state.runs?.[0]?.skill?.strategyVersion || null,
+    });
+  }
+
+  if ((req.method === "GET" || req.method === "POST") && url.pathname === "/api/strategy-versions/validate") {
+    const db = await ensureStore();
+    return sendJson(res, { validation: buildStrategyValidationPayload(db) });
+  }
+
+  if (req.method === "GET" && url.pathname === "/api/lessons/relevant") {
+    const db = await ensureStore();
+    return sendJson(res, { lessons: buildRelevantLessonsPayload(db, url.searchParams.get("ticker")) });
+  }
+
+  if (req.method === "POST" && url.pathname === "/api/paper-portfolio/accept") {
+    const body = await readBody(req);
+    const decisionId = normalizeDisplayText(body.decisionId || "");
+    const db = await ensureStore();
+    const state = normalizeAllStockAgentState(db.allStockAgent);
+    const decision = (state.decisions || []).find((item) => item.id === decisionId);
+    if (!decision) return sendJson(res, { error: "没有找到该 recommendation decision。" }, 404);
+    const acceptance = {
+      schemaVersion: "user-paper-acceptance-v1",
+      id: compactId("paper-accept"),
+      decisionId,
+      ticker: decision.ticker,
+      acceptedAt: nowIso(),
+      status: "accepted",
+      entryPrice: numberOrNull(body.entryPrice ?? decision.price),
+      slippageBps: numberOrNull(body.slippageBps) ?? 0,
+      costBps: numberOrNull(body.costBps) ?? 0,
+      decision,
+    };
+    state.userPaperPortfolio = {
+      ...(state.userPaperPortfolio || {}),
+      schemaVersion: "user-paper-portfolio-v1",
+      acceptances: [acceptance, ...(state.userPaperPortfolio?.acceptances || [])].slice(0, 500),
+    };
+    db.allStockAgent = normalizeAllStockAgentState(state);
+    appendAuditEvent(db, "paper_portfolio.accept", {
+      decisionId,
+      ticker: decision.ticker,
+      entryPrice: acceptance.entryPrice,
+    });
+    await saveStore(db);
+    return sendJson(res, { acceptance, allStockAgent: allStockAgentForClient(db.allStockAgent) });
+  }
+
+  if (req.method === "POST" && url.pathname === "/api/order-drafts") {
+    const body = await readBody(req);
+    const db = await ensureStore();
+    const draft = createOrderDraftPayload(db, body);
+    appendAuditEvent(db, "order_draft.create", {
+      draftId: draft.id,
+      ticker: draft.ticker,
+      status: draft.status,
+      locks: draft.locks,
+    }, draft.status === "blocked" ? "blocked" : "ok");
+    await saveStore(db);
+    return sendJson(res, { draft }, draft.status === "blocked" ? 202 : 200);
+  }
+
   if (req.method === "GET" && url.pathname === "/api/run/status") {
     return sendJson(res, { runStatus: runStatusForClient() });
   }
@@ -36335,6 +37272,11 @@ async function handleApi(req, res, url) {
     if (result.updatedKeys.length || result.clearedKeys.length) {
       const enabledText = enabledSources.length ? `；已自动启用 ${enabledSources.join("、")}` : "";
       markSourceDiagnosticsStale(db, `配置中心已更新 .env${enabledText}，请重新运行相关诊断。`);
+      appendAuditEvent(db, "config.env.update", {
+        updatedKeys: result.updatedKeys,
+        clearedKeys: result.clearedKeys,
+        enabledSources,
+      });
       await saveStore(db);
     }
     return sendJson(res, {
@@ -37146,6 +38088,7 @@ async function handleApi(req, res, url) {
     const db = await ensureStore();
     const context = latestRun(db);
     const tradeJournal = buildTradeJournalForDb(db);
+    const toolResults = buildChatToolResults(message, db, context, tradeJournal);
     const userItem = { role: "user", content: message, createdAt: nowIso() };
     const llmProvider = normalizeLlmProvider(body.llmProvider);
     const missingMessage = missingLlmMessage(llmProvider);
@@ -37163,6 +38106,7 @@ async function handleApi(req, res, url) {
             tradeJournal: isMarketOnlyChatQuestion(message, context)
               ? null
               : summarizeTradeJournalForChat(tradeJournal),
+            toolResults,
           },
           null,
           2,
@@ -37180,6 +38124,7 @@ async function handleApi(req, res, url) {
       role: "assistant",
       content: answer,
       provider,
+      toolResults,
       createdAt: nowIso(),
     };
     db.chat = [...db.chat, userItem, assistantItem].slice(-80);

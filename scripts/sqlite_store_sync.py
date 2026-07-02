@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 import argparse
+import hashlib
 import json
 import sqlite3
 from pathlib import Path
@@ -14,6 +15,10 @@ def text(value: Any) -> str:
 
 def dump(value: Any) -> str:
     return clean_surrogates(json.dumps(value, ensure_ascii=False, separators=(",", ":")))
+
+
+def sha256_text(value: str) -> str:
+    return hashlib.sha256(clean_surrogates(value).encode("utf-8", "replace")).hexdigest()
 
 
 def clean_surrogates(value: str) -> str:
@@ -42,6 +47,60 @@ def run_summary(run: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def run_slim_json(run: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "id": run.get("id", ""),
+        "session": run.get("session", ""),
+        "trigger": run.get("trigger", ""),
+        "startedAt": run.get("startedAt", ""),
+        "completedAt": run.get("completedAt", ""),
+        "counts": {
+            "news": len(run.get("news") or []) if isinstance(run.get("news"), list) else 0,
+            "filings": len(run.get("filings") or []) if isinstance(run.get("filings"), list) else 0,
+            "socialPosts": len(run.get("socialPosts") or []) if isinstance(run.get("socialPosts"), list) else 0,
+            "options": len(run.get("options") or []) if isinstance(run.get("options"), list) else 0,
+            "errors": len(run.get("errors") or []) if isinstance(run.get("errors"), list) else 0,
+        },
+        "marketOverview": run.get("marketOverview") or None,
+        "dataQuality": run.get("dataQuality") or None,
+    }
+
+
+def ensure_column(conn: sqlite3.Connection, table: str, column: str, ddl: str) -> None:
+    columns = {row[1] for row in conn.execute(f"PRAGMA table_info({table})").fetchall()}
+    if column not in columns:
+        conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {ddl}")
+
+
+def row_regime(row: dict[str, Any]) -> str:
+    if not isinstance(row, dict):
+        return ""
+    value = row.get("regime")
+    if value:
+        return text(value)
+    tag = row.get("regimeTag")
+    if isinstance(tag, dict) and tag.get("bucket"):
+        return text(tag.get("bucket"))
+    factor = ((row.get("factorSnapshot") or {}).get("factors") or {}).get("macroRegime") or {}
+    raw = factor.get("raw") or {}
+    risk = raw.get("marketRisk")
+    try:
+        risk_num = float(risk)
+    except (TypeError, ValueError):
+        return text(raw.get("regime") or "unknown")
+    if risk_num < 45:
+        return "risk_on"
+    if risk_num < 65:
+        return "neutral"
+    if risk_num < 80:
+        return "risk_off"
+    return "high_risk"
+
+
+def news_checksum(row: dict[str, Any]) -> str:
+    return sha256_text("|".join([text(row.get("ticker")), text(row.get("url") or row.get("link")), text(row.get("title") or row.get("titleZh")), text(row.get("publishedAt"))]))
+
+
 def init_schema(conn: sqlite3.Connection) -> None:
     conn.executescript(
         """
@@ -60,7 +119,10 @@ def init_schema(conn: sqlite3.Connection) -> None:
           options_count INTEGER DEFAULT 0,
           error_count INTEGER DEFAULT 0,
           summary_json TEXT NOT NULL,
-          full_json TEXT NOT NULL
+          full_json TEXT NOT NULL,
+          slim_json TEXT,
+          row_count_checksum TEXT,
+          spot_hash TEXT
         );
 
         CREATE TABLE IF NOT EXISTS article_cache (
@@ -100,6 +162,9 @@ def init_schema(conn: sqlite3.Connection) -> None:
           alpha_score REAL,
           data_quality_score REAL,
           factor_snapshot_id TEXT,
+          strategy_version TEXT,
+          regime TEXT,
+          evidence_refs TEXT,
           json TEXT NOT NULL
         );
 
@@ -114,6 +179,7 @@ def init_schema(conn: sqlite3.Connection) -> None:
           excess_pct REAL,
           mae_pct REAL,
           mfe_pct REAL,
+          regime TEXT,
           json TEXT NOT NULL
         );
 
@@ -126,6 +192,101 @@ def init_schema(conn: sqlite3.Connection) -> None:
           rank_ic REAL,
           avg_excess_pct REAL,
           hit_rate REAL,
+          regime TEXT,
+          json TEXT NOT NULL
+        );
+
+        CREATE TABLE IF NOT EXISTS strategy_versions (
+          id TEXT PRIMARY KEY,
+          strategy_type TEXT,
+          config_hash TEXT,
+          active_from TEXT,
+          active_to TEXT,
+          change_reason TEXT,
+          evaluation_summary TEXT,
+          status TEXT,
+          json TEXT NOT NULL
+        );
+
+        CREATE TABLE IF NOT EXISTS news_items (
+          id TEXT PRIMARY KEY,
+          run_id TEXT,
+          ticker TEXT,
+          category TEXT,
+          source TEXT,
+          publisher TEXT,
+          published_at TEXT,
+          url TEXT,
+          title TEXT,
+          summary TEXT,
+          checksum TEXT,
+          json TEXT NOT NULL
+        );
+
+        CREATE TABLE IF NOT EXISTS data_quality_audits (
+          id TEXT PRIMARY KEY,
+          decision_id TEXT,
+          run_id TEXT,
+          ticker TEXT,
+          score REAL,
+          status TEXT,
+          missing_count INTEGER DEFAULT 0,
+          stale_count INTEGER DEFAULT 0,
+          fallback_count INTEGER DEFAULT 0,
+          json TEXT NOT NULL
+        );
+
+        CREATE TABLE IF NOT EXISTS options_snapshots (
+          id TEXT PRIMARY KEY,
+          run_id TEXT,
+          ticker TEXT,
+          as_of TEXT,
+          provider TEXT,
+          iv_atm REAL,
+          chain_quality TEXT,
+          contracts_count INTEGER DEFAULT 0,
+          json TEXT NOT NULL
+        );
+
+        CREATE TABLE IF NOT EXISTS pit_universe_snapshots (
+          id TEXT PRIMARY KEY,
+          run_id TEXT,
+          as_of TEXT,
+          ticker TEXT,
+          labels TEXT,
+          source TEXT,
+          json TEXT NOT NULL
+        );
+
+        CREATE TABLE IF NOT EXISTS audit_events (
+          id TEXT PRIMARY KEY,
+          event_type TEXT,
+          actor TEXT,
+          status TEXT,
+          created_at TEXT,
+          payload_json TEXT NOT NULL
+        );
+
+        CREATE TABLE IF NOT EXISTS trade_recommendation_reconciliation (
+          id TEXT PRIMARY KEY,
+          trade_id TEXT,
+          decision_id TEXT,
+          ticker TEXT,
+          executed_at TEXT,
+          classification TEXT,
+          thesis_alignment TEXT,
+          json TEXT NOT NULL
+        );
+
+        CREATE TABLE IF NOT EXISTS user_paper_acceptances (
+          id TEXT PRIMARY KEY,
+          decision_id TEXT,
+          ticker TEXT,
+          accepted_at TEXT,
+          status TEXT,
+          entry_price REAL,
+          slippage_bps REAL,
+          cost_bps REAL,
           json TEXT NOT NULL
         );
 
@@ -141,8 +302,22 @@ def init_schema(conn: sqlite3.Connection) -> None:
         CREATE INDEX IF NOT EXISTS idx_recommendation_decisions_ticker_time ON recommendation_decisions(ticker, generated_at DESC);
         CREATE INDEX IF NOT EXISTS idx_recommendation_outcomes_decision ON recommendation_outcomes(decision_id, horizon_days);
         CREATE INDEX IF NOT EXISTS idx_factor_stats_factor ON factor_stats(factor_id, samples DESC);
+        CREATE INDEX IF NOT EXISTS idx_news_items_ticker_time ON news_items(ticker, published_at DESC);
+        CREATE INDEX IF NOT EXISTS idx_news_items_run ON news_items(run_id);
+        CREATE INDEX IF NOT EXISTS idx_dq_audits_decision ON data_quality_audits(decision_id);
+        CREATE INDEX IF NOT EXISTS idx_options_snapshots_ticker_time ON options_snapshots(ticker, as_of DESC);
+        CREATE INDEX IF NOT EXISTS idx_pit_universe_time ON pit_universe_snapshots(as_of DESC, ticker);
+        CREATE INDEX IF NOT EXISTS idx_audit_events_time ON audit_events(created_at DESC);
         """
     )
+    ensure_column(conn, "runs", "slim_json", "TEXT")
+    ensure_column(conn, "runs", "row_count_checksum", "TEXT")
+    ensure_column(conn, "runs", "spot_hash", "TEXT")
+    ensure_column(conn, "recommendation_decisions", "strategy_version", "TEXT")
+    ensure_column(conn, "recommendation_decisions", "regime", "TEXT")
+    ensure_column(conn, "recommendation_decisions", "evidence_refs", "TEXT")
+    ensure_column(conn, "recommendation_outcomes", "regime", "TEXT")
+    ensure_column(conn, "factor_stats", "regime", "TEXT")
 
 
 def sync_store(conn: sqlite3.Connection, store: dict[str, Any]) -> dict[str, int]:
@@ -155,19 +330,30 @@ def sync_store(conn: sqlite3.Connection, store: dict[str, Any]) -> dict[str, int
         "recommendationDecisions": 0,
         "recommendationOutcomes": 0,
         "factorStats": 0,
+        "strategyVersions": 0,
+        "newsItems": 0,
+        "dataQualityAudits": 0,
+        "optionsSnapshots": 0,
+        "pitUniverseSnapshots": 0,
+        "auditEvents": 0,
+        "tradeRecommendationReconciliation": 0,
+        "userPaperAcceptances": 0,
     }
     with conn:
         for run in store.get("runs") or []:
             if not isinstance(run, dict) or not run.get("id"):
                 continue
             summary = run_summary(run)
+            slim = run_slim_json(run)
+            row_count_checksum = sha256_text(dump(slim.get("counts") or {}))
+            spot_hash = sha256_text("|".join([text(run.get("id")), text(run.get("completedAt")), dump((run.get("news") or [])[:3]), dump((run.get("options") or [])[:2])]))
             conn.execute(
                 """
                 INSERT INTO runs (
                   id, session, trigger, started_at, completed_at, summary_only,
                   news_count, social_posts_count, options_count, error_count,
-                  summary_json, full_json
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                  summary_json, full_json, slim_json, row_count_checksum, spot_hash
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(id) DO UPDATE SET
                   session=excluded.session,
                   trigger=excluded.trigger,
@@ -179,7 +365,10 @@ def sync_store(conn: sqlite3.Connection, store: dict[str, Any]) -> dict[str, int
                   options_count=excluded.options_count,
                   error_count=excluded.error_count,
                   summary_json=excluded.summary_json,
-                  full_json=excluded.full_json
+                  full_json=excluded.full_json,
+                  slim_json=excluded.slim_json,
+                  row_count_checksum=excluded.row_count_checksum,
+                  spot_hash=excluded.spot_hash
                 """,
                 (
                     text(run.get("id")),
@@ -194,9 +383,143 @@ def sync_store(conn: sqlite3.Connection, store: dict[str, Any]) -> dict[str, int
                     int(summary.get("errorCount") or 0),
                     dump(summary),
                     dump(run),
+                    dump(slim),
+                    row_count_checksum,
+                    spot_hash,
                 ),
             )
             counts["runs"] += 1
+
+            news_rows: dict[str, dict[str, Any]] = {}
+            for source_key in ["news", "filings"]:
+                for news in run.get(source_key) or []:
+                    if not isinstance(news, dict):
+                        continue
+                    checksum = news_checksum(news)
+                    news_id = text(news.get("id") or news.get("url") or f"{run.get('id')}:{source_key}:{checksum[:16]}")
+                    news_rows[news_id] = {
+                        **news,
+                        "_sourceKey": source_key,
+                        "_checksum": checksum,
+                    }
+            for news_id, news in news_rows.items():
+                conn.execute(
+                    """
+                    INSERT INTO news_items(
+                      id, run_id, ticker, category, source, publisher, published_at,
+                      url, title, summary, checksum, json
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(id) DO UPDATE SET
+                      run_id=excluded.run_id,
+                      ticker=excluded.ticker,
+                      category=excluded.category,
+                      source=excluded.source,
+                      publisher=excluded.publisher,
+                      published_at=excluded.published_at,
+                      url=excluded.url,
+                      title=excluded.title,
+                      summary=excluded.summary,
+                      checksum=excluded.checksum,
+                      json=excluded.json
+                    """,
+                    (
+                        news_id,
+                        text(run.get("id")),
+                        text(news.get("ticker")),
+                        text(news.get("newsCategory") or news.get("category") or news.get("_sourceKey")),
+                        text(news.get("source") or news.get("provider")),
+                        text(news.get("publisher")),
+                        text(news.get("publishedAt") or news.get("createdAt")),
+                        text(news.get("url") or news.get("link")),
+                        text(news.get("titleZh") or news.get("title")),
+                        text(((news.get("article") or {}).get("summaryZh")) or news.get("summaryZh") or news.get("summary")),
+                        text(news.get("_checksum")),
+                        dump(news),
+                    ),
+                )
+                counts["newsItems"] += 1
+
+            for option in run.get("options") or []:
+                if not isinstance(option, dict):
+                    continue
+                ticker = text(option.get("ticker"))
+                if not ticker:
+                    continue
+                contracts = option.get("contracts") if isinstance(option.get("contracts"), list) else []
+                expirations = option.get("expirations") if isinstance(option.get("expirations"), list) else []
+                contract_count = int(option.get("contractCount") or len(contracts) or sum(len((exp or {}).get("options") or []) for exp in expirations if isinstance(exp, dict)) or 0)
+                iv_atm = option.get("ivAtm") or (option.get("summary") or {}).get("ivAtm")
+                snap_id = text(f"{run.get('id')}:{ticker}:{option.get('provider','options')}")
+                conn.execute(
+                    """
+                    INSERT INTO options_snapshots(id, run_id, ticker, as_of, provider, iv_atm, chain_quality, contracts_count, json)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(id) DO UPDATE SET
+                      run_id=excluded.run_id,
+                      ticker=excluded.ticker,
+                      as_of=excluded.as_of,
+                      provider=excluded.provider,
+                      iv_atm=excluded.iv_atm,
+                      chain_quality=excluded.chain_quality,
+                      contracts_count=excluded.contracts_count,
+                      json=excluded.json
+                    """,
+                    (
+                        snap_id,
+                        text(run.get("id")),
+                        ticker,
+                        text(run.get("completedAt") or run.get("generatedAt")),
+                        text(option.get("provider")),
+                        iv_atm,
+                        text(option.get("status") or option.get("quality") or ("ok" if contract_count else "empty")),
+                        contract_count,
+                        dump(option),
+                    ),
+                )
+                counts["optionsSnapshots"] += 1
+
+            universe: dict[str, set[str]] = {}
+            def add_universe(ticker: Any, label: str) -> None:
+                symbol = text(ticker).upper().replace("$", "").strip()
+                if not symbol or len(symbol) > 12:
+                    return
+                universe.setdefault(symbol, set()).add(label)
+            for ticker in run.get("watchlist") or []:
+                add_universe(ticker, "watchlist")
+            for ticker in run.get("researchTickers") or []:
+                add_universe(ticker, "research")
+            for key in ["quotes", "technicals", "fundamentals", "news", "socialPosts"]:
+                for row in run.get(key) or []:
+                    if isinstance(row, dict):
+                        add_universe(row.get("ticker") or row.get("symbol"), key)
+                        for related in row.get("relatedTickers") or []:
+                            add_universe(related, f"{key}:related")
+            for ticker, labels in universe.items():
+                pit_id = text(f"{run.get('id')}:{ticker}")
+                payload = {"ticker": ticker, "labels": sorted(labels), "runId": run.get("id")}
+                conn.execute(
+                    """
+                    INSERT INTO pit_universe_snapshots(id, run_id, as_of, ticker, labels, source, json)
+                    VALUES (?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(id) DO UPDATE SET
+                      run_id=excluded.run_id,
+                      as_of=excluded.as_of,
+                      ticker=excluded.ticker,
+                      labels=excluded.labels,
+                      source=excluded.source,
+                      json=excluded.json
+                    """,
+                    (
+                        pit_id,
+                        text(run.get("id")),
+                        text(run.get("completedAt") or run.get("generatedAt")),
+                        ticker,
+                        ",".join(sorted(labels)),
+                        "run-universe",
+                        dump(payload),
+                    ),
+                )
+                counts["pitUniverseSnapshots"] += 1
 
         article_cache = store.get("articleCache") or {}
         if isinstance(article_cache, dict):
@@ -270,6 +593,45 @@ def sync_store(conn: sqlite3.Connection, store: dict[str, Any]) -> dict[str, int
 
         agent = store.get("allStockAgent") or {}
         if isinstance(agent, dict):
+            strategy_rows: dict[str, dict[str, Any]] = {}
+            for row in agent.get("strategyVersions") or []:
+                if isinstance(row, dict) and row.get("id"):
+                    strategy_rows[text(row.get("id"))] = row
+            for run in agent.get("runs") or []:
+                if isinstance(run, dict):
+                    version = ((run.get("skill") or {}).get("strategyVersion") or (run.get("roadmap") or {}))
+                    version_id = text((version.get("id") or version.get("strategyVersion")) if isinstance(version, dict) else version)
+                    if version_id:
+                        strategy_rows[version_id] = version if isinstance(version, dict) else {"id": version_id}
+            for version_id, row in strategy_rows.items():
+                conn.execute(
+                    """
+                    INSERT INTO strategy_versions(id, strategy_type, config_hash, active_from, active_to, change_reason, evaluation_summary, status, json)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(id) DO UPDATE SET
+                      strategy_type=excluded.strategy_type,
+                      config_hash=excluded.config_hash,
+                      active_from=excluded.active_from,
+                      active_to=excluded.active_to,
+                      change_reason=excluded.change_reason,
+                      evaluation_summary=excluded.evaluation_summary,
+                      status=excluded.status,
+                      json=excluded.json
+                    """,
+                    (
+                        version_id,
+                        text(row.get("strategyType") or "all-stock-agent"),
+                        text(row.get("configHash") or row.get("strategyConfigHash")),
+                        text(row.get("activeFrom") or row.get("generatedAt")),
+                        text(row.get("activeTo")),
+                        text(row.get("changeReason")),
+                        dump(row.get("evaluationSummary")) if row.get("evaluationSummary") is not None else "",
+                        text(row.get("status") or "active"),
+                        dump(row),
+                    ),
+                )
+                counts["strategyVersions"] += 1
+
             decision_rows: dict[str, dict[str, Any]] = {}
             for decision in agent.get("decisions") or []:
                 if isinstance(decision, dict) and decision.get("id"):
@@ -286,8 +648,9 @@ def sync_store(conn: sqlite3.Connection, store: dict[str, Any]) -> dict[str, int
                     """
                     INSERT INTO recommendation_decisions(
                       id, run_id, ticker, action, status, generated_at, price,
-                      action_score, alpha_score, data_quality_score, factor_snapshot_id, json
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                      action_score, alpha_score, data_quality_score, factor_snapshot_id,
+                      strategy_version, regime, evidence_refs, json
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     ON CONFLICT(id) DO UPDATE SET
                       run_id=excluded.run_id,
                       ticker=excluded.ticker,
@@ -299,6 +662,9 @@ def sync_store(conn: sqlite3.Connection, store: dict[str, Any]) -> dict[str, int
                       alpha_score=excluded.alpha_score,
                       data_quality_score=excluded.data_quality_score,
                       factor_snapshot_id=excluded.factor_snapshot_id,
+                      strategy_version=excluded.strategy_version,
+                      regime=excluded.regime,
+                      evidence_refs=excluded.evidence_refs,
                       json=excluded.json
                     """,
                     (
@@ -313,10 +679,50 @@ def sync_store(conn: sqlite3.Connection, store: dict[str, Any]) -> dict[str, int
                         row.get("alphaScore"),
                         row.get("dataQualityScore"),
                         text(row.get("factorSnapshotId")),
+                        text(row.get("strategyVersion") or row.get("modelVersion")),
+                        row_regime(row),
+                        dump(row.get("evidenceRefs") or []),
                         dump(row),
                     ),
                 )
                 counts["recommendationDecisions"] += 1
+                audit = row.get("dataQualityAudit")
+                if isinstance(audit, dict):
+                    audit_id = text(audit.get("id") or f"{decision_id}:data-quality")
+                    blocks = audit.get("blocks") if isinstance(audit.get("blocks"), list) else []
+                    stale_count = len([block for block in blocks if isinstance(block, dict) and block.get("status") == "stale"])
+                    fallback_count = len([block for block in blocks if isinstance(block, dict) and block.get("status") == "fallback"])
+                    conn.execute(
+                        """
+                        INSERT INTO data_quality_audits(
+                          id, decision_id, run_id, ticker, score, status,
+                          missing_count, stale_count, fallback_count, json
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        ON CONFLICT(id) DO UPDATE SET
+                          decision_id=excluded.decision_id,
+                          run_id=excluded.run_id,
+                          ticker=excluded.ticker,
+                          score=excluded.score,
+                          status=excluded.status,
+                          missing_count=excluded.missing_count,
+                          stale_count=excluded.stale_count,
+                          fallback_count=excluded.fallback_count,
+                          json=excluded.json
+                        """,
+                        (
+                            audit_id,
+                            decision_id,
+                            text(row.get("runId")),
+                            text(row.get("ticker")),
+                            audit.get("score"),
+                            text(audit.get("status")),
+                            int(audit.get("missingBlocks") or 0),
+                            stale_count,
+                            fallback_count,
+                            dump(audit),
+                        ),
+                    )
+                    counts["dataQualityAudits"] += 1
 
             outcome_rows: dict[str, dict[str, Any]] = {}
             for outcome in agent.get("outcomeSnapshots") or []:
@@ -336,8 +742,8 @@ def sync_store(conn: sqlite3.Connection, store: dict[str, Any]) -> dict[str, int
                     """
                     INSERT INTO recommendation_outcomes(
                       id, decision_id, ticker, action, horizon_days, evaluated_at,
-                      outcome, excess_pct, mae_pct, mfe_pct, json
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                      outcome, excess_pct, mae_pct, mfe_pct, regime, json
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     ON CONFLICT(id) DO UPDATE SET
                       decision_id=excluded.decision_id,
                       ticker=excluded.ticker,
@@ -348,6 +754,7 @@ def sync_store(conn: sqlite3.Connection, store: dict[str, Any]) -> dict[str, int
                       excess_pct=excluded.excess_pct,
                       mae_pct=excluded.mae_pct,
                       mfe_pct=excluded.mfe_pct,
+                      regime=excluded.regime,
                       json=excluded.json
                     """,
                     (
@@ -361,6 +768,7 @@ def sync_store(conn: sqlite3.Connection, store: dict[str, Any]) -> dict[str, int
                         row.get("excessPct"),
                         row.get("maePct"),
                         row.get("mfePct"),
+                        row_regime(row),
                         dump(row),
                     ),
                 )
@@ -378,8 +786,8 @@ def sync_store(conn: sqlite3.Connection, store: dict[str, Any]) -> dict[str, int
                         stat_id = text(f"{run_id}:{factor_id}")
                         conn.execute(
                             """
-                            INSERT INTO factor_stats(id, run_id, factor_id, label, samples, rank_ic, avg_excess_pct, hit_rate, json)
-                            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                            INSERT INTO factor_stats(id, run_id, factor_id, label, samples, rank_ic, avg_excess_pct, hit_rate, regime, json)
+                            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                             ON CONFLICT(id) DO UPDATE SET
                               run_id=excluded.run_id,
                               factor_id=excluded.factor_id,
@@ -388,6 +796,7 @@ def sync_store(conn: sqlite3.Connection, store: dict[str, Any]) -> dict[str, int
                               rank_ic=excluded.rank_ic,
                               avg_excess_pct=excluded.avg_excess_pct,
                               hit_rate=excluded.hit_rate,
+                              regime=excluded.regime,
                               json=excluded.json
                             """,
                             (
@@ -399,10 +808,75 @@ def sync_store(conn: sqlite3.Connection, store: dict[str, Any]) -> dict[str, int
                                 row.get("rankIC"),
                                 row.get("avgExcessPct"),
                                 row.get("hitRate"),
+                                text(row.get("regime") or ((row.get("regimeTag") or {}).get("bucket") if isinstance(row.get("regimeTag"), dict) else "")),
                                 dump(row),
                             ),
                         )
                         counts["factorStats"] += 1
+
+            portfolio = agent.get("userPaperPortfolio") or {}
+            if isinstance(portfolio, dict):
+                for row in portfolio.get("acceptances") or []:
+                    if not isinstance(row, dict):
+                        continue
+                    row_id = text(row.get("id") or f"{row.get('decisionId','')}:{row.get('acceptedAt','')}")
+                    if not row_id:
+                        continue
+                    conn.execute(
+                        """
+                        INSERT INTO user_paper_acceptances(id, decision_id, ticker, accepted_at, status, entry_price, slippage_bps, cost_bps, json)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        ON CONFLICT(id) DO UPDATE SET
+                          decision_id=excluded.decision_id,
+                          ticker=excluded.ticker,
+                          accepted_at=excluded.accepted_at,
+                          status=excluded.status,
+                          entry_price=excluded.entry_price,
+                          slippage_bps=excluded.slippage_bps,
+                          cost_bps=excluded.cost_bps,
+                          json=excluded.json
+                        """,
+                        (
+                            row_id,
+                            text(row.get("decisionId")),
+                            text(row.get("ticker")),
+                            text(row.get("acceptedAt")),
+                            text(row.get("status")),
+                            row.get("entryPrice"),
+                            row.get("slippageBps"),
+                            row.get("costBps"),
+                            dump(row),
+                        ),
+                    )
+                    counts["userPaperAcceptances"] += 1
+
+        for row in store.get("auditEvents") or []:
+            if not isinstance(row, dict):
+                continue
+            row_id = text(row.get("id") or f"{row.get('eventType','')}:{row.get('createdAt','')}")
+            if not row_id:
+                continue
+            conn.execute(
+                """
+                INSERT INTO audit_events(id, event_type, actor, status, created_at, payload_json)
+                VALUES (?, ?, ?, ?, ?, ?)
+                ON CONFLICT(id) DO UPDATE SET
+                  event_type=excluded.event_type,
+                  actor=excluded.actor,
+                  status=excluded.status,
+                  created_at=excluded.created_at,
+                  payload_json=excluded.payload_json
+                """,
+                (
+                    row_id,
+                    text(row.get("eventType") or row.get("type")),
+                    text(row.get("actor")),
+                    text(row.get("status")),
+                    text(row.get("createdAt")),
+                    dump(row.get("payload") or row),
+                ),
+            )
+            counts["auditEvents"] += 1
 
         conn.execute("INSERT OR REPLACE INTO metadata(key, value) VALUES (?, ?)", ("last_sync", dump(counts)))
     return counts
@@ -419,6 +893,14 @@ def status(conn: sqlite3.Connection) -> dict[str, Any]:
         "recommendation_decisions",
         "recommendation_outcomes",
         "factor_stats",
+        "strategy_versions",
+        "news_items",
+        "data_quality_audits",
+        "options_snapshots",
+        "pit_universe_snapshots",
+        "audit_events",
+        "trade_recommendation_reconciliation",
+        "user_paper_acceptances",
     ]:
         count = conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
         tables[table] = count

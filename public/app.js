@@ -226,6 +226,13 @@ function fmtTime(value) {
   }).format(date);
 }
 
+function strategyVersionText(value) {
+  if (!value) return "";
+  if (typeof value === "string") return value;
+  if (typeof value === "object") return value.id || value.strategyVersion || "";
+  return String(value);
+}
+
 function timeValue(value) {
   if (!value) return 0;
   const time = new Date(value).getTime();
@@ -2418,6 +2425,8 @@ function stockReportFactorSnapshotBlock(ticker) {
       ${indicator("数据质量", Number.isFinite(Number(record.dataQualityScore)) ? fmtNumber(Number(record.dataQualityScore), 0) : "-")}
       ${indicator("组合适配", Number.isFinite(Number(record.portfolioFitScore)) ? fmtNumber(Number(record.portfolioFitScore), 0) : "-")}
       ${indicator("主 Horizon", record.primaryHorizon ? `T+${record.primaryHorizon}` : "-")}
+      ${indicator("策略版本", strategyVersionText(record.strategyVersion) || "-")}
+      ${indicator("Regime", record.regime || record.regimeTag?.bucket || "-")}
     </div>
     ${renderRecommendationFactorStrip(record)}
     <div class="factor-grid">
@@ -5231,6 +5240,34 @@ function renderAllStockAgentSection(title, subtitle, rows, renderer) {
   </section>`;
 }
 
+function renderAllStockAgentRoadmapBlock(latest = {}) {
+  const roadmap = latest.roadmap || {};
+  const regime = roadmap.regime || {};
+  const gates = roadmap.antiOvertrading || {};
+  const downgraded = latest.summary?.researchDowngraded || 0;
+  const version = strategyVersionText(roadmap.strategyVersion || latest.skill?.strategyVersion) || "-";
+  return `<section class="all-stock-agent-section roadmap">
+    <div class="social-source-head">
+      <div>
+        <p class="section-label">Governance</p>
+        <h3>策略版本与风控闸门</h3>
+      </div>
+      <span class="tag">${escapeHtml(version)}</span>
+    </div>
+    <div class="all-stock-agent-track">
+      ${allStockAgentMetric(gates.actionableBuyLimit, "每日正式买入上限")}
+      ${allStockAgentMetric(gates.minActionableDataQuality, "Actionable DQ阈值")}
+      ${allStockAgentMetric(gates.cooldownTradingDays, "普通冷却T+")}
+      ${allStockAgentMetric(gates.failedThesisCooldownTradingDays, "失败冷却T+")}
+      ${allStockAgentMetric(downgraded, "降级研究")}
+    </div>
+    <div class="all-stock-agent-note">
+      <strong>Regime</strong>
+      <span>${escapeHtml(regime.label || regime.bucket || "unknown")} · 风险分 ${escapeHtml(Number.isFinite(Number(regime.riskScore)) ? fmtNumber(Number(regime.riskScore), 0) : "-")}。低数据质量、冷却期、财报黑窗或组合暴露过高时，买入会降级到研究列表。</span>
+    </div>
+  </section>`;
+}
+
 function renderAllStockAgent(agentState) {
   if (!els.allStockAgentBox) return;
   const latest = agentState?.latest;
@@ -5270,6 +5307,7 @@ function renderAllStockAgent(agentState) {
       <span>${escapeHtml(latest.universeCoverage?.note || "当前扫描可获取候选池。")}</span>
     </div>
     ${revision?.changes?.length ? `<div class="all-stock-agent-note success"><strong>Skill 已自更新</strong><span>${escapeHtml(revision.summary || "")}</span></div>` : ""}
+    ${renderAllStockAgentRoadmapBlock(latest)}
     ${renderAllStockAgentTrackRecord(latest)}
     ${renderAllStockAgentBacktestBlock(allStockAgentBacktest)}
     ${renderAllStockAgentSection("正式买入", "Buy List", buyRows, (item) => renderAllStockAgentDecision(item, "buy", run))}
