@@ -1,0 +1,15 @@
+.DS_Store
+.env
+node_modules/
+.tools/
+.venv-openbb/
+.ruff_cache/
+data/*.log
+data/
+data/*-wal
+data/*-shm
+data/agent_memory.sqlite*
+harness/artifacts/
+logs/
+__pycache__/
+*.pyc

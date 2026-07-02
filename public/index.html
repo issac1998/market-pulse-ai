@@ -1,0 +1,515 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Market Pulse AI</title>
+    <link rel="stylesheet" href="/styles.css" />
+  </head>
+  <body>
+    <div class="app-shell">
+      <header class="topbar">
+        <div>
+          <p class="eyebrow">美股智能信息台</p>
+          <h1>Market Pulse AI</h1>
+        </div>
+        <div class="top-controls">
+          <div class="llm-picker" role="radiogroup" aria-label="LLM 提供方">
+            <span class="llm-label">LLM</span>
+            <label class="provider-segment">
+              <input type="radio" name="llmProvider" value="local" />
+              <span>本地规则</span>
+            </label>
+            <label class="provider-segment">
+              <input type="radio" name="llmProvider" value="codex-cli" />
+              <span>Codex CLI</span>
+            </label>
+            <label class="provider-segment">
+              <input type="radio" name="llmProvider" value="gemini" />
+              <span>Gemini 接口</span>
+            </label>
+            <label class="provider-segment">
+              <input type="radio" name="llmProvider" value="antigravity-cli" />
+              <span>Antigravity CLI</span>
+            </label>
+            <label class="provider-segment">
+              <input type="radio" name="llmProvider" value="gemini-cli" />
+              <span>Gemini CLI</span>
+            </label>
+            <label class="provider-segment">
+              <input type="radio" name="llmProvider" value="openai" />
+              <span>GPT</span>
+            </label>
+          </div>
+          <div class="top-actions">
+            <button id="runPre" class="btn primary" type="button">盘前采集</button>
+            <button id="runPost" class="btn" type="button">盘后采集</button>
+            <button id="runManual" class="btn ghost" type="button">手动刷新</button>
+          </div>
+        </div>
+      </header>
+      <nav class="page-nav" aria-label="页面导航">
+        <a href="#/home" data-page-link="home">首页</a>
+        <a href="#/actions" data-page-link="actions">操作建议</a>
+        <a href="#/stocks" data-page-link="stocks">个股分析</a>
+        <a href="#/social" data-page-link="social">社交热议</a>
+        <a href="#/research" data-page-link="research">研究材料</a>
+        <a href="#/portfolio" data-page-link="portfolio">持仓复盘</a>
+        <a href="#/ops" data-page-link="ops">自动化配置</a>
+      </nav>
+
+      <main class="layout">
+        <section class="main-column">
+          <section class="panel status-panel" data-page-panel="ops">
+            <div>
+              <p class="section-label">最新简报</p>
+              <h2 id="briefTitle">等待采集</h2>
+              <p id="briefMeta" class="muted">启动后点击“手动刷新”生成第一份简报。</p>
+            </div>
+            <div class="status-grid" id="statusGrid"></div>
+          </section>
+
+          <section class="panel page-gateway-panel" data-page-panel="home">
+            <div class="panel-head">
+              <div>
+                <p class="section-label">工作台入口</p>
+                <h2>二级页面</h2>
+              </div>
+            </div>
+            <div class="page-gateway-grid">
+              <a class="page-gateway-card" href="#/actions">
+                <span>01</span>
+                <strong>操作建议</strong>
+                <small>从自选股和重点股票池筛出候选买入、等待触发和风险处理</small>
+              </a>
+              <a class="page-gateway-card" href="#/stocks">
+                <span>02</span>
+                <strong>个股分析</strong>
+                <small>自选池、K线、基本面、期权和单股日报</small>
+              </a>
+              <a class="page-gateway-card" href="#/social">
+                <span>03</span>
+                <strong>社交热议</strong>
+                <small>全市场热度上升股票和异动理由</small>
+              </a>
+              <a class="page-gateway-card" href="#/research">
+                <span>04</span>
+                <strong>研究材料</strong>
+                <small>新闻、SEC、OpenBB、回测和开源能力</small>
+              </a>
+              <a class="page-gateway-card" href="#/portfolio">
+                <span>05</span>
+                <strong>持仓复盘</strong>
+                <small>持仓风险、交易日志和提醒</small>
+              </a>
+              <a class="page-gateway-card" href="#/ops">
+                <span>06</span>
+                <strong>自动化与配置</strong>
+                <small>聊天、定时任务、IBKR Portal 和数据源状态</small>
+              </a>
+            </div>
+          </section>
+
+          <section class="panel market-panel" data-page-panel="home">
+            <div class="panel-head">
+              <div>
+                <p class="section-label">Market Regime</p>
+                <h2>大盘整体情况</h2>
+              </div>
+            </div>
+            <div id="marketOverview" class="market-overview empty-state">
+              运行采集后显示纳指、标普、VIX、长债、美元等市场状态。
+            </div>
+          </section>
+
+          <section class="panel movers-panel" data-page-panel="home">
+            <div class="panel-head">
+              <div>
+                <p class="section-label">Movers</p>
+                <h2>异动榜（带原因）</h2>
+              </div>
+            </div>
+            <div id="moversWithReasonsBox" class="movers-box empty-state">
+              运行采集后显示今日异动股、涨跌幅与对应催化原因。
+            </div>
+          </section>
+
+          <section class="panel hot-news-panel" data-page-panel="home">
+            <div class="panel-head">
+              <div>
+                <p class="section-label">Hot News</p>
+                <h2>市场热闻</h2>
+              </div>
+            </div>
+            <div id="hotNewsList" class="hot-news-list empty-state">
+              运行采集后显示市场热闻。
+            </div>
+          </section>
+
+          <section class="panel" data-page-panel="home">
+            <div class="panel-head">
+              <div>
+                <p class="section-label">Calendar</p>
+                <h2>关键日历</h2>
+              </div>
+            </div>
+            <div id="eventCalendarBox" class="event-calendar-box empty-state">
+              运行采集后显示重要财报、非农、美联储讲话和宏观发布时间。
+            </div>
+          </section>
+
+          <section class="panel action-suggestions-panel" data-page-panel="actions">
+            <div class="panel-head">
+              <div>
+                <p class="section-label">Action Desk</p>
+                <h2>操作建议</h2>
+              </div>
+              <div class="top-actions">
+                <button id="runAllStockAgentBacktest" class="btn ghost" type="button">规则回测</button>
+                <button id="runAllStockAgent" class="btn secondary" type="button">运行候选池 Agent</button>
+              </div>
+            </div>
+            <div id="actionSuggestionsBox" class="action-suggestions-box empty-state">
+              运行采集后，从自选股和重点股票池筛选值得操作的股票。
+            </div>
+            <div id="allStockAgentBox" class="all-stock-agent-box empty-state">
+              候选池 Skill Agent 尚未运行。
+            </div>
+          </section>
+
+          <section class="panel stock-report-panel" data-page-panel="stocks">
+            <div class="panel-head">
+              <div>
+                <p class="section-label">个股日报</p>
+                <h2>单股分析</h2>
+              </div>
+              <form id="stockReportForm" class="ticker-search-form">
+                <label class="ticker-search-wrap">
+                  <span>标的</span>
+                  <input
+                    id="stockReportInput"
+                    list="stockReportOptions"
+                    autocomplete="off"
+                    spellcheck="false"
+                    placeholder="输入 ticker，如 MRVL"
+                    aria-label="输入个股 ticker"
+                  />
+                </label>
+                <datalist id="stockReportOptions"></datalist>
+                <button id="stockReportFetch" class="btn compact" type="submit">拉取 Longbridge</button>
+              </form>
+            </div>
+            <div id="stockReportBox" class="stock-report-box empty-state">
+              运行采集后生成个股日报。
+            </div>
+          </section>
+
+          <section class="panel" data-page-panel="stocks">
+            <div class="panel-head">
+              <div>
+                <p class="section-label">股票发现</p>
+                <h2>股票发现器</h2>
+              </div>
+            </div>
+            <div id="discoveryGrid" class="discovery-grid"></div>
+          </section>
+
+          <section class="panel" data-page-panel="social">
+            <div class="panel-head">
+              <div>
+                <p class="section-label">社交热议</p>
+                <h2>社交热议股票</h2>
+              </div>
+            </div>
+            <div id="socialGrid" class="social-grid"></div>
+          </section>
+
+          <section class="panel" data-page-panel="research">
+            <div class="panel-head">
+              <div>
+                <p class="section-label">AI 分析</p>
+                <h2>摘要与风险</h2>
+              </div>
+              <span id="analysisProvider" class="pill">local</span>
+            </div>
+            <div id="analysisBody" class="analysis-body empty-state">
+              暂无分析。先运行一次采集。
+            </div>
+          </section>
+
+          <section class="panel" data-page-panel="stocks">
+            <div class="panel-head">
+              <div>
+                <p class="section-label">关注列表雷达</p>
+                <h2>关注列表</h2>
+              </div>
+              <form id="watchlistForm" class="watchlist-form">
+                <input id="watchlistAddInput" aria-label="新增自选 ticker" placeholder="输入 ticker" />
+                <button id="watchlistAddButton" class="btn compact primary" type="button">加入</button>
+                <input id="watchlistInput" aria-label="完整关注列表 ticker" />
+                <button class="btn compact" type="submit">保存全部</button>
+              </form>
+            </div>
+            <div id="tickerGrid" class="ticker-grid"></div>
+          </section>
+
+          <section class="panel" data-page-panel="stocks">
+            <div class="panel-head">
+              <div>
+                <p class="section-label">技术图表</p>
+                <h2>技术指标</h2>
+              </div>
+            </div>
+            <div id="technicalGrid" class="technical-grid"></div>
+          </section>
+
+          <section class="panel" data-page-panel="stocks">
+            <div class="panel-head">
+              <div>
+                <p class="section-label">基本面</p>
+                <h2>基本面</h2>
+              </div>
+            </div>
+            <div id="fundamentalGrid" class="fundamental-grid"></div>
+          </section>
+
+          <section class="panel" data-page-panel="research">
+            <div class="panel-head">
+              <div>
+                <p class="section-label">OpenBB Platform</p>
+                <h2>OpenBB 开源数据平台</h2>
+              </div>
+            </div>
+            <form id="openbbRouteForm" class="openbb-route-form">
+              <input id="openbbRouteInput" placeholder="OpenBB route，例如 equity.price.quote" />
+              <input id="openbbParamsInput" placeholder='参数 JSON，例如 {"symbol":"AAPL","provider":"yfinance"}' />
+              <button class="btn compact" type="submit">调用 OpenBB</button>
+            </form>
+            <div id="openbbRouteResult" class="openbb-route-result"></div>
+            <div id="openbbGrid" class="openbb-grid"></div>
+          </section>
+
+          <section class="panel" data-page-panel="research">
+            <div class="panel-head">
+              <div>
+                <p class="section-label">Open Source Radar</p>
+                <h2>开源能力雷达</h2>
+              </div>
+            </div>
+            <div id="capabilityRadar" class="capability-radar"></div>
+          </section>
+
+          <section class="panel" data-page-panel="research">
+            <div class="panel-head">
+              <div>
+                <p class="section-label">信号回测</p>
+                <h2>信号回测</h2>
+              </div>
+            </div>
+            <div id="backtestBox" class="backtest-box"></div>
+          </section>
+
+          <section class="split" data-page-panel="research">
+            <section class="panel">
+              <div class="panel-head">
+                <div>
+                  <p class="section-label">新闻</p>
+                  <h2>新闻与视频</h2>
+                </div>
+              </div>
+              <div id="newsList" class="feed-list"></div>
+            </section>
+
+            <section class="panel">
+              <div class="panel-head">
+                <div>
+                  <p class="section-label">SEC 官方披露</p>
+                  <h2>重点文件</h2>
+                </div>
+              </div>
+              <div id="filingList" class="feed-list"></div>
+            </section>
+          </section>
+        </section>
+
+        <aside class="side-column">
+          <section class="panel" data-page-panel="ops">
+            <div class="panel-head">
+              <div>
+                <p class="section-label">报告历史</p>
+                <h2>历史简报</h2>
+              </div>
+            </div>
+            <div id="runHistoryBox" class="run-history-box"></div>
+          </section>
+
+          <section class="panel" data-page-panel="portfolio">
+            <div class="panel-head">
+              <div>
+                <p class="section-label">持仓风险</p>
+                <h2>持仓风险</h2>
+              </div>
+            </div>
+            <form id="portfolioForm" class="portfolio-form">
+              <textarea
+                id="portfolioInput"
+                rows="4"
+                placeholder="AAPL 10 180&#10;NVDA 2 900"
+              ></textarea>
+              <div class="portfolio-actions">
+                <button class="btn compact" type="submit">保存持仓</button>
+                <button id="portfolioFromTradesButton" class="btn compact ghost" type="button">从交易日志同步</button>
+              </div>
+            </form>
+            <div id="portfolioBox" class="portfolio-box"></div>
+          </section>
+
+          <section class="panel trade-journal-panel" data-page-panel="portfolio">
+            <div class="panel-head">
+              <div>
+                <p class="section-label">操作日志</p>
+                <h2>交易复盘</h2>
+              </div>
+              <div class="trade-toolbar">
+                <button id="tradeReviewButton" class="btn compact" type="button">生成复盘</button>
+                <button id="tradeExportButton" class="btn compact ghost" type="button">导出交易</button>
+                <button id="tradeJournalExportButton" class="btn compact ghost" type="button">导出复盘</button>
+              </div>
+            </div>
+            <form id="tradeForm" class="trade-form">
+              <div class="trade-form-grid">
+                <label>
+                  <span>时间</span>
+                  <input id="tradeDate" type="datetime-local" />
+                </label>
+                <label>
+                  <span>Ticker</span>
+                  <input id="tradeTicker" placeholder="MRVL" />
+                </label>
+                <label>
+                  <span>方向</span>
+                  <select id="tradeSide">
+                    <option value="buy">买入</option>
+                    <option value="sell">卖出</option>
+                  </select>
+                </label>
+                <label>
+                  <span>数量</span>
+                  <input id="tradeQuantity" type="number" min="0" step="0.0001" />
+                </label>
+                <label>
+                  <span>价格</span>
+                  <input id="tradePrice" type="number" min="0" step="0.0001" />
+                </label>
+                <label>
+                  <span>费用</span>
+                  <input id="tradeFees" type="number" min="0" step="0.01" value="0" />
+                </label>
+              </div>
+              <input id="tradeStrategy" placeholder="策略/形态，例如 财报后突破" />
+              <textarea id="tradeThesis" rows="2" placeholder="操作理由、退出条件、当时情绪"></textarea>
+              <div class="trade-form-grid compact-grid">
+                <input id="tradeEmotion" placeholder="情绪" />
+                <input id="tradeTags" placeholder="标签，逗号分隔" />
+              </div>
+              <textarea id="tradeNotes" rows="2" placeholder="备注"></textarea>
+              <div id="tradeEditBar" class="trade-edit-bar hidden">
+                <span id="tradeEditLabel">正在编辑操作</span>
+                <button id="tradeEditCancel" class="icon-text" type="button">取消编辑</button>
+              </div>
+              <button id="tradeSubmitButton" class="btn compact primary" type="submit">记录操作</button>
+            </form>
+            <details class="import-box">
+              <summary>导入 CSV / IBKR</summary>
+              <textarea
+                id="tradeImportText"
+                rows="4"
+                placeholder="date,ticker,side,quantity,price,fees,strategy,notes&#10;或粘贴 IBKR Flex XML，包含 <Trade> / <TradeConfirm>"
+              ></textarea>
+              <div class="trade-actions">
+                <button id="tradeImportButton" class="btn compact" type="button">导入文本</button>
+                <button id="ibkrSyncButton" class="btn compact ghost" type="button">同步 IBKR Flex</button>
+              </div>
+            </details>
+            <div id="tradeJournalBox" class="trade-journal-box"></div>
+            <div id="tradeReviewBox" class="trade-review-box"></div>
+          </section>
+
+          <section class="panel" data-page-panel="portfolio">
+            <div class="panel-head">
+              <div>
+                <p class="section-label">提醒</p>
+                <h2>提醒</h2>
+              </div>
+            </div>
+            <div id="alertsBox" class="alerts-box"></div>
+          </section>
+
+          <section class="panel chat-panel" data-page-panel="ops">
+            <div class="panel-head">
+              <div>
+                <p class="section-label">LLM 聊天</p>
+                <h2>问这个信息台</h2>
+              </div>
+            </div>
+            <div id="chatLog" class="chat-log"></div>
+            <form id="chatForm" class="chat-form">
+              <textarea
+                id="chatInput"
+                rows="3"
+                placeholder="例如：NVDA 今天有哪些新增风险？"
+              ></textarea>
+              <button class="btn primary" type="submit">发送</button>
+            </form>
+          </section>
+
+          <section class="panel" data-page-panel="ops">
+            <div class="panel-head">
+              <div>
+                <p class="section-label">定时任务</p>
+                <h2>定时采集</h2>
+              </div>
+            </div>
+            <div id="scheduleBox" class="stack"></div>
+          </section>
+
+          <section class="panel" data-page-panel="ops">
+            <div class="panel-head">
+              <div>
+                <p class="section-label">IBKR Portal</p>
+                <h2>大盘与 Hot News</h2>
+              </div>
+            </div>
+            <form id="ibkrPortalForm" class="ibkr-portal-form">
+              <div class="feed-meta" id="ibkrPortalMeta"></div>
+              <select id="ibkrPortalKind" aria-label="IBKR Portal 内容类型">
+                <option value="mixed">自动判断</option>
+                <option value="market-overview">Market Overview</option>
+                <option value="hot-news">Hot News</option>
+              </select>
+              <textarea
+                id="ibkrPortalInput"
+                rows="5"
+                placeholder="从 IBKR Portal 的 Market Overview 或 Hot News 区域复制可见文本，粘贴到这里"
+              ></textarea>
+              <button class="btn compact" type="submit">导入 IBKR 内容</button>
+            </form>
+          </section>
+
+          <section class="panel" data-page-panel="ops">
+            <div class="panel-head">
+              <div>
+                <p class="section-label">数据质量</p>
+                <h2>数据源状态</h2>
+              </div>
+              <button id="diagnoseSources" class="btn compact" type="button">运行诊断</button>
+            </div>
+            <div id="providerBox" class="provider-box"></div>
+          </section>
+        </aside>
+      </main>
+    </div>
+
+    <script src="/app.js"></script>
+  </body>
+</html>

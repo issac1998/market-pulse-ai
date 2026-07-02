@@ -1,0 +1,104 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Market Pulse AI 配置中心</title>
+    <link rel="stylesheet" href="/styles.css" />
+  </head>
+  <body class="config-page">
+    <div class="app-shell">
+      <header class="topbar">
+        <div>
+          <p class="eyebrow">配置中心</p>
+          <h1>Market Pulse AI</h1>
+        </div>
+        <div class="top-actions">
+          <a class="btn ghost" href="/">返回信息台</a>
+          <a class="btn ghost" href="/docs/CONFIGURATION_GUIDE.md" target="_blank" rel="noreferrer">Markdown 攻略</a>
+          <button id="runDiagnostics" class="btn primary" type="button">运行诊断</button>
+        </div>
+      </header>
+
+      <main class="config-layout">
+        <section class="panel config-hero">
+          <div>
+            <p class="section-label">Setup Status</p>
+            <h2>完整可用配置进度</h2>
+            <p id="configSummary" class="muted">正在读取当前数据源状态。</p>
+          </div>
+          <div class="config-score-grid">
+            <div class="metric">
+              <strong id="readyScore">-</strong>
+              <span>报告可用度</span>
+            </div>
+            <div class="metric">
+              <strong id="okCount">-</strong>
+              <span>已点亮数据源</span>
+            </div>
+            <div class="metric">
+              <strong id="todoCount">-</strong>
+              <span>待处理项</span>
+            </div>
+          </div>
+        </section>
+
+        <section class="panel">
+          <div class="panel-head">
+            <div>
+              <p class="section-label">Integration Tasks</p>
+              <h2>外部接入任务面板</h2>
+              <p class="muted">把当前最关键的真实接入缺口、兜底路径和复检动作集中放在这里。</p>
+            </div>
+          </div>
+          <div id="integrationTaskList" class="integration-task-list"></div>
+        </section>
+
+        <section class="panel">
+          <div class="panel-head">
+            <div>
+              <p class="section-label">Quick Config</p>
+              <h2>快速填写配置</h2>
+              <p class="muted">只显示是否已配置，不回显已有密钥。留空表示不修改。</p>
+            </div>
+            <button id="saveEnvConfig" class="btn primary" type="button">保存到 .env</button>
+          </div>
+          <div id="envConfigGrid" class="env-config-grid"></div>
+          <p id="envConfigMessage" class="muted"></p>
+        </section>
+
+        <section class="panel">
+          <div class="panel-head">
+            <div>
+              <p class="section-label">Priority</p>
+              <h2>下一步优先处理</h2>
+            </div>
+          </div>
+          <div id="priorityList" class="config-priority-list"></div>
+        </section>
+
+        <section class="panel">
+          <div class="panel-head">
+            <div>
+              <p class="section-label">Diagnostics</p>
+              <h2>实时诊断</h2>
+            </div>
+            <span id="diagnosticTime" class="pill">-</span>
+          </div>
+          <div id="diagnosticGrid" class="diagnostic-grid"></div>
+        </section>
+
+        <section class="panel">
+          <div class="panel-head">
+            <div>
+              <p class="section-label">Guide</p>
+              <h2>逐项配置攻略</h2>
+            </div>
+          </div>
+          <div id="guideGrid" class="config-guide-grid"></div>
+        </section>
+      </main>
+    </div>
+    <script src="/configuration.js"></script>
+  </body>
+</html>

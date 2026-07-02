@@ -1,0 +1,60 @@
+{
+  "schemaVersion": "us-stock-strategy-config-v1",
+  "updatedAt": "2026-06-21",
+  "principles": [
+    "结论必须来自 analysisContextPack 中已有数据块；缺失字段要明示，不允许补数字。",
+    "新闻/财报必须优先使用正文、SEC/公告或公司 IR；只有标题时只能列为待核验。",
+    "社交热度和全市场异动榜只作为发现线索，必须用新闻、财报、行情、期权或产业链解释。",
+    "所有输出为非个性化研究信息，不构成投资建议。"
+  ],
+  "strategies": [
+    {
+      "id": "earnings_repricing",
+      "name": "财报/指引重定价",
+      "priority": 95,
+      "requiredBlocks": ["fundamentals", "news", "filings", "quote"],
+      "triggers": ["earnings", "guidance", "revenue", "eps", "margin", "财报", "指引", "业绩"],
+      "outputFocus": ["收入/EPS/毛利率/下季指引", "beat/miss 是否来自原文", "估值容错率", "下一份披露核验项"]
+    },
+    {
+      "id": "ai_semiconductor_chain",
+      "name": "AI 半导体产业链",
+      "priority": 90,
+      "requiredBlocks": ["industryChain", "fundamentals", "news", "technical"],
+      "triggers": ["AI", "chip", "semiconductor", "data center", "HBM", "EUV", "GPU", "ASIC", "芯片", "半导体", "数据中心"],
+      "outputFocus": ["具体产品", "上游约束", "下游客户/capex", "订单、产能、毛利率验证", "替代风险"]
+    },
+    {
+      "id": "social_heat_explainer",
+      "name": "全市场热度解释",
+      "priority": 84,
+      "requiredBlocks": ["social", "news", "quote", "industryChain"],
+      "triggers": ["social", "hot", "ApeWisdom", "Eastmoney", "Reddit", "热议", "异动", "涨幅榜", "成交量榜"],
+      "outputFocus": ["为什么被热议", "热度来自新闻、财报、价格还是行业主题", "是否有真实催化", "热度与价格是否背离"]
+    },
+    {
+      "id": "options_flow",
+      "name": "期权墙位与异常成交",
+      "priority": 78,
+      "requiredBlocks": ["options", "quote", "technical"],
+      "triggers": ["option", "call", "put", "GEX", "IV", "期权", "大单", "异常成交"],
+      "outputFocus": ["Call/Put wall", "链级 volume/OI 异常", "是否支持逐笔 time-and-sales", "关键失效价位"]
+    },
+    {
+      "id": "macro_duration",
+      "name": "宏观流动性与久期风险",
+      "priority": 70,
+      "requiredBlocks": ["marketOverview", "technical", "quote"],
+      "triggers": ["rates", "yield", "VIX", "Fed", "macro", "宏观", "利率", "通胀", "收益率"],
+      "outputFocus": ["市场风向", "风险偏好", "高估值/长久期折现压力", "板块轮动"]
+    },
+    {
+      "id": "prism_three_view",
+      "name": "Prism 三视角合议",
+      "priority": 68,
+      "requiredBlocks": ["industryChain", "marketOverview", "technical"],
+      "triggers": ["prism", "Seri", "Cat", "三棱镜", "供应链", "宏观", "技术执行"],
+      "outputFocus": ["供应链卡位", "宏观顺逆风", "技术执行条件", "三视角冲突点"]
+    }
+  ]
+}

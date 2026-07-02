@@ -1,0 +1,9 @@
+[project]
+name = "market-pulse-agent-harness"
+version = "0.1.0"
+description = "Independent Python agent harness for Market Pulse AI."
+requires-python = ">=3.9"
+dependencies = []
+
+[tool.market-pulse]
+default_invoker = "agy-cli"
