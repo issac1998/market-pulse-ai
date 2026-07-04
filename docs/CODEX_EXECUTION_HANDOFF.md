@@ -69,7 +69,7 @@ Scope here: W1 watcher + W3 triage + W4 push + W5 move→reason + W6 novelty + W
 - Both follow the akshare/openbb bridge contract: `runJsonCli`, timeouts, failures → diagnostics + `audit_events`, never block the native path.
 - **Verify**: bridge Sharpe/MaxDD match native within 1e-3 relative tolerance on a fixture series; kill the venv → report still renders with native engine + a visible degradation note.
 
-## ☐ WP6 — edgartools integration (D3)
+## ☑ WP6 — edgartools integration (D3)
 
 - `scripts/edgar_pit_bridge.py` (pip `edgartools`, MIT): (a) PIT fundamentals — XBRL facts keyed by **filing date** into `pit_fundamentals(ticker, filed_at, period, field, value, form)`; (b) 13F holdings deltas per quarter into `institutional_holdings` → upgrade the `smartMoney` factor raw inputs (holders count Δ, top-holder concentration Δ); (c) current-filings feed: watcher W2 polling every 1–2 min for watchlist CIKs, 8-K item→severity map (1.01/2.02/5.02/8.01 high; 7.01/9.01 low), wired into WP2 triage/push.
 - Extend `buildFactorSnapshotAsOf` to use `pit_fundamentals` for qualityGrowth/valuation (Tier 2), enabling those factors in WP4 re-runs.

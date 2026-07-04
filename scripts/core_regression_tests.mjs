@@ -395,6 +395,27 @@ assert.ok(
   historicalSnapshot.recommendationScore.contributions.some((item) => item.id === "momentum"),
   "Historical recommendation score should include standard recommender factor contributions",
 );
+const pitBeforeRestatement = buildFactorSnapshotAsOf({
+  ticker: "MU",
+  asOf: "2026-03-15",
+  bars: historicalBars,
+  pitFundamentals: [
+    { ticker: "MU", filed_at: "2026-02-01", period: "2025-12-31", field: "eps_diluted", value: 2 },
+    { ticker: "MU", filed_at: "2026-02-01", period: "2025-12-31", field: "revenue", value: 10_000 },
+    { ticker: "MU", filed_at: "2026-02-01", period: "2025-12-31", field: "net_income", value: 2_000 },
+    { ticker: "MU", filed_at: "2026-05-01", period: "2025-12-31", field: "eps_diluted", value: 0.2 },
+  ],
+});
+assert.equal(
+  pitBeforeRestatement.factorSnapshot.factors.valuationExpectation.raw.epsDiluted,
+  2,
+  "PIT fundamentals must use the originally filed value before a later restatement date",
+);
+assert.notEqual(
+  pitBeforeRestatement.factorSnapshot.factors.qualityGrowth.missingReason,
+  "not-reconstructable",
+  "PIT fundamentals should enable qualityGrowth when filed facts exist as of the date",
+);
 
 const historicalBacktestBars = ["SPY", "AAPL", "MSFT"].flatMap((ticker, tickerIndex) =>
   Array.from({ length: 80 }, (_, index) => {
@@ -477,11 +498,15 @@ const watcherRun = await runIntradayWatcherOnce(
       }],
       errors: [],
     }),
+    collectEdgarCurrentFilings: async () => ({
+      filings: [{ ticker: "MU", form: "8-K", item: "2.02", filed_at: "2026-07-01", severity: "high" }],
+      errors: [],
+    }),
   },
   {
     force: true,
     now: "2026-07-01T15:00:00.000Z",
-    config: { enabled: true, universeLimit: 10, push: { enabled: false, provider: "", target: "", minSeverity: "high", cooldownMs: 0 } },
+    config: { enabled: true, universeLimit: 10, edgar: { enabled: true, limit: 5 }, push: { enabled: false, provider: "", target: "", minSeverity: "high", cooldownMs: 0 } },
     simulatedSignals: [{
       ticker: "NVDA",
       movePercent: 5,
@@ -497,5 +522,10 @@ assert.ok(watcherRun.alerts.length >= 1, "Forced watcher fixture should create a
 assert.ok(watcherRun.auditEvents.every((event) => event.payload?.llmCriticalPath === false || event.eventType === "intraday_watcher.consensus_snapshot"), "Watcher critical path audit should be LLM-free");
 assert.equal(watcherRun.consensusSnapshots.length, 1, "Day-before earnings should snapshot consensus data");
 assert.equal(watcherRun.consensusSnapshots[0].epsEstimate, 1.23, "Consensus snapshot should persist EPS estimate");
+assert.equal(watcherRun.edgarFilings.length, 1, "EDGAR watcher seam should collect current filings when explicitly enabled");
+assert.ok(
+  watcherRun.alerts.some((alert) => alert.rawSignal?.source === "edgar-current-filings"),
+  "EDGAR current filings should be converted into watcher alerts",
+);
 
 console.log("core_regression_tests: ok");

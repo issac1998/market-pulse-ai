@@ -46,6 +46,10 @@ export function intradayWatcherConfigFromEnv(env = process.env) {
     noveltyLookbackDays: Math.max(1, Number(env.INTRADAY_WATCHER_NOVELTY_DAYS || 5)),
     minSeverity: String(env.INTRADAY_WATCHER_MIN_SEVERITY || "medium").toLowerCase(),
     explainBaseUrl: String(env.PUBLIC_APP_URL || env.APP_URL || "http://localhost:5173").replace(/\/+$/, ""),
+    edgar: {
+      enabled: String(env.EDGAR_WATCHER_ENABLED || "false").toLowerCase() === "true",
+      limit: Math.max(1, Number(env.EDGAR_WATCHER_LIMIT || 20)),
+    },
     push: normalizePushConfig(env),
   };
 }
@@ -237,12 +241,25 @@ export async function runIntradayWatcherOnce(deps = {}, options = {}) {
   const latestRun = typeof deps.latestRun === "function" ? (deps.latestRun(db) || {}) : (deps.latestRun || {});
   const universe = options.universe || buildIntradayUniverse(db, { limit: config.universeLimit });
   const tickers = universe.map((row) => row.ticker);
-  const [quoteResult, technicalResult] = await Promise.all([
+  const [quoteResult, technicalResult, edgarResult] = await Promise.all([
     deps.collectQuotes ? deps.collectQuotes(tickers) : Promise.resolve({ quotes: [], errors: [] }),
     deps.collectTechnicalData ? deps.collectTechnicalData(tickers, { limit: tickers.length }) : Promise.resolve({ technicals: [], errors: [] }),
+    config.edgar?.enabled && deps.collectEdgarCurrentFilings
+      ? deps.collectEdgarCurrentFilings(tickers, { limit: config.edgar.limit })
+      : Promise.resolve({ filings: [], errors: [], status: config.edgar?.enabled ? "missing_collector" : "disabled" }),
   ]);
   db.intradayWatcher ||= {};
   const previousQuotes = db.intradayWatcher.lastQuotes || {};
+  const filingSignals = (edgarResult.filings || []).map((filing) => ({
+    ticker: safeTicker(filing.ticker),
+    headline: `${safeTicker(filing.ticker)} ${filing.form || "SEC filing"} ${filing.item || ""}`.trim(),
+    title: `${safeTicker(filing.ticker)} SEC 文件更新`,
+    detail: [filing.form, filing.item, filing.filed_at || filing.filedAt].filter(Boolean).join(" / "),
+    source: "edgar-current-filings",
+    evidenceIds: ["sec_filing", filing.form, filing.item].filter(Boolean),
+    membership: (universe.find((row) => safeTicker(row.ticker) === safeTicker(filing.ticker)) || {}).membership || [],
+    filing,
+  })).filter((row) => row.ticker);
   const signals = buildIntradaySignals({
     universe,
     quotes: quoteResult.quotes || [],
@@ -251,7 +268,7 @@ export async function runIntradayWatcherOnce(deps = {}, options = {}) {
     latestRun,
     now,
     simulatedSignals: options.simulatedSignals || [],
-  });
+  }).concat(filingSignals);
   const existingAlerts = [...(db.alerts || []), ...(latestRun.alerts || [])];
   const auditEvents = [];
   const alerts = signals.map((signal) => {
@@ -300,7 +317,7 @@ export async function runIntradayWatcherOnce(deps = {}, options = {}) {
     (quoteResult.quotes || []).map((quote) => [safeTicker(quote.ticker), { price: numberOrNull(quote.price), timestamp: quote.timestamp || now.toISOString() }]),
   );
   db.intradayWatcher.lastRunAt = now.toISOString();
-  db.intradayWatcher.lastErrors = [...(quoteResult.errors || []), ...(technicalResult.errors || [])].slice(0, 20);
+  db.intradayWatcher.lastErrors = [...(quoteResult.errors || []), ...(technicalResult.errors || []), ...(edgarResult.errors || [])].slice(0, 20);
   db.pushDeliveryState ||= {};
   const pushResults = [];
   for (const alert of alerts) {
@@ -339,6 +356,7 @@ export async function runIntradayWatcherOnce(deps = {}, options = {}) {
     auditEvents,
     pushResults,
     consensusSnapshots,
+    edgarFilings: edgarResult.filings || [],
     staticCalendar: buildStaticAnticipationCalendar(now),
     llmCriticalPath: false,
   };

@@ -2636,6 +2636,22 @@ const ENV_CONFIG_FIELDS = Object.freeze([
     placeholder: "120000",
   },
   {
+    key: "EDGAR_WATCHER_ENABLED",
+    label: "EDGAR 文件 watcher 启用",
+    group: "定时任务",
+    live: false,
+    diagnostics: [],
+    placeholder: "false",
+  },
+  {
+    key: "EDGAR_WATCHER_LIMIT",
+    label: "EDGAR watcher 单轮上限",
+    group: "定时任务",
+    live: false,
+    diagnostics: [],
+    placeholder: "20",
+  },
+  {
     key: "PUSH_PROVIDER",
     label: "推送 Provider",
     group: "推送",

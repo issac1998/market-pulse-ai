@@ -523,9 +523,11 @@ export function runHistoricalWalkForwardFromRows({ bars = [], regimes = [], conf
     slippageBps: Math.max(0, Number(config.slippageBps || 0)),
     minSamplesForWeightUpdate: Math.max(1, Number(config.minSamplesForWeightUpdate || 20)),
     maxStepPct: Math.max(0, Math.min(2, Number(config.maxStepPct || 1))),
+    pitFundamentalsError: config.pitFundamentalsError || "",
   };
   const strategyHash = hashJson({ engine: "historical-walk-forward-v1", config: runConfig, weights: DEFAULT_WEIGHTS });
   const byTicker = groupBars(bars);
+  const pitRows = Array.isArray(config.pitFundamentals) ? config.pitFundamentals : [];
   const dates = allDatesFromBars(byTicker, runConfig.minLookback).slice(-runConfig.maxDates);
   const spyRows = byTicker.get("SPY") || [];
   const decisions = [];
@@ -542,6 +544,7 @@ export function runHistoricalWalkForwardFromRows({ bars = [], regimes = [], conf
         asOf: signalDate,
         bars: rows,
         historicalRegime: regimeForDate(regimes, signalDate),
+        pitFundamentals: pitRows.filter((row) => safeTicker(row.ticker) === ticker),
         weights: DEFAULT_WEIGHTS,
       });
       scored.push({ ticker, factorSnapshot, recommendationScore, latestBar: eligibleBars.at(-1) });
@@ -637,6 +640,7 @@ export function runHistoricalWalkForwardFromRows({ bars = [], regimes = [], conf
       dates: dates.length,
       barRows: normalizeHistoricalBars(bars).length,
       regimeRows: regimes.length,
+      pitFundamentalRows: pitRows.length,
       horizons: runConfig.horizons,
     },
     config: runConfig,
@@ -674,6 +678,9 @@ export function runHistoricalWalkForwardFromRows({ bars = [], regimes = [], conf
       backtestWeightsUsage: "candidate-only",
       friction: roundTripCostBps > 0 ? "costed" : "frictionless-reference",
       sectorBasketStatus: "missing_sector_mapping",
+      diagnostics: {
+        pitFundamentalsError: runConfig.pitFundamentalsError,
+      },
     },
     caveats: [
       "Walk-forward uses only dates present in historical_bars and never reads rows after the signal date.",
@@ -717,7 +724,19 @@ export async function runHistoricalWalkForwardFromSqlite({ sqlitePath, config = 
     `SELECT date,bucket,risk_score,json FROM historical_regimes ${where.length ? `WHERE ${where.join(" AND ")}` : ""} ORDER BY date;`,
     config.sqliteTimeoutMs || 30000,
   );
-  const result = runHistoricalWalkForwardFromRows({ bars, regimes, config });
+  let pitFundamentals = [];
+  let pitFundamentalsError = "";
+  try {
+    pitFundamentals = await sqliteJson(
+      sqlitePath,
+      `SELECT ticker,filed_at,period,field,value,form,json FROM pit_fundamentals WHERE ticker IN (${tickerList})${where.length ? ` AND filed_at <= '${sqlText(end || "9999-12-31")}'` : ""} ORDER BY ticker,filed_at,period;`,
+      config.sqliteTimeoutMs || 30000,
+    );
+  } catch (error) {
+    pitFundamentalsError = error.message;
+    pitFundamentals = [];
+  }
+  const result = runHistoricalWalkForwardFromRows({ bars, regimes, config: { ...config, pitFundamentals, pitFundamentalsError } });
   await applyMetricBridges(result.run, config);
   result.report = buildReport(result.run);
   return result;

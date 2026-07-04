@@ -377,3 +377,78 @@ $ curl -sS -X POST http://localhost:5173/api/recommender/historical-backtest ...
 - `quantstats>=0.0.81` could not be installed from the current pip index/Python environment. Pip listed versions only through `0.0.77`, so the exact WP5 pin is unavailable. I did not silently install an older `quantstats`; the bridge remains ready and degrades visibly to native metrics.
 - Because QuantStats is unavailable, the specific WP5 verification "bridge Sharpe/MaxDD match native within 1e-3 relative tolerance" could only be verified for the native-python bridge output, not the actual QuantStats engine.
 - `alphalens-reloaded==0.4.5` installed successfully and imports as `alphalens`; the current bridge still computes IC/quantile outputs through the native fallback shape because the frozen historical run is empty.
+
+## WP6 — edgartools Integration
+
+### What Changed
+
+- Installed `edgartools==4.6.3`; pinned `hishel==0.1.5` after discovering `hishel 1.1.8` removed the `FileStorage` API used by edgartools.
+- Added `scripts/edgar_pit_bridge.py` with commands:
+  - `init-schema`
+  - `pit-fundamentals`
+  - `current-filings`
+  - `13f`
+- Added append-only SQLite tables:
+  - `pit_fundamentals`
+  - `institutional_holdings`
+  - `edgar_current_filings`
+- `pit-fundamentals` extracts XBRL facts through `filing.xbrl().query().by_concept(...).to_dataframe()` and stores revenue, net income, diluted EPS, gross profit, assets, liabilities, equity, and operating cash flow by filing date.
+- Extended `buildFactorSnapshotAsOf` so PIT facts filed `<= asOf` activate Tier-2 `qualityGrowth` and `valuationExpectation`; later restatements do not overwrite earlier as-of values.
+- Extended `server/historical_backtest.mjs` to read `pit_fundamentals` from SQLite and pass them to the historical snapshot builder.
+- Added disabled-by-default EDGAR current-filings seam to `server/intraday_watcher.mjs`; `EDGAR_WATCHER_ENABLED=false` by default, and the watcher only calls a collector when explicitly enabled.
+- Added `EDGAR_WATCHER_ENABLED` / `EDGAR_WATCHER_LIMIT` to the config center.
+
+### Files / Functions
+
+- `scripts/edgar_pit_bridge.py`: EDGAR schema, PIT facts, current filings, 13F filing-level bridge.
+- `lib/historical_features.mjs`: PIT as-of fact filtering, `qualityGrowthFromPit`, `valuationFromPit`.
+- `server/historical_backtest.mjs`: SQLite `pit_fundamentals` read path and diagnostics.
+- `server/intraday_watcher.mjs`: disabled EDGAR filing watcher seam.
+- `server.mjs`: config fields for EDGAR watcher.
+- `scripts/core_regression_tests.mjs`: PIT restatement fixture and EDGAR watcher fixture.
+
+### Verification Output
+
+```text
+$ python3 -m pip install --user edgartools
+Successfully installed edgartools-4.6.3 ...
+
+$ python3 -m pip install --user 'hishel==0.1.5'
+Successfully installed anysqlite-0.0.5 hishel-0.1.5
+
+$ python3 scripts/edgar_pit_bridge.py init-schema --db data/market_pulse.sqlite
+{"ok": true, "command": "init-schema", "db": "data/market_pulse.sqlite"}
+
+$ python3 scripts/edgar_pit_bridge.py current-filings --db data/market_pulse.sqlite --tickers AAPL --limit 1 --output-limit 1
+{"ok": true, "command": "current-filings", "rows": 1, "filings": [{"id": "AAPL:0000320193-26-000013", "ticker": "AAPL", "cik": "320193", "form": "10-Q", "filed_at": "2026-05-01", "severity": "high"}]}
+
+$ python3 scripts/edgar_pit_bridge.py pit-fundamentals --db data/market_pulse.sqlite --ticker AAPL --limit 1
+{"ok": true, "command": "pit-fundamentals", "ticker": "AAPL", "rows": 8, "fields": ["assets", "eps_diluted", "equity", "gross_profit", "liabilities", "net_income", "operating_cash_flow", "revenue"]}
+
+$ python3 scripts/edgar_pit_bridge.py 13f --db data/market_pulse.sqlite --limit 1
+{"ok": true, "command": "13f", "rows": 1, "status": "filing-level-only"}
+
+$ node --check server.mjs
+$ node --check public/app.js
+$ node --check lib/historical_features.mjs
+$ node --check server/historical_backtest.mjs
+$ node --check server/intraday_watcher.mjs
+$ node --check scripts/core_regression_tests.mjs
+all passed with no output
+
+$ python3 -m py_compile scripts/edgar_pit_bridge.py scripts/quantstats_bridge.py scripts/alphalens_bridge.py scripts/build_historical_bars.py scripts/akshare_bridge.py scripts/sqlite_store_sync.py
+passed with no output
+
+$ node scripts/core_regression_tests.mjs
+core_regression_tests: ok
+
+$ node scripts/generate_route_inventory.mjs && node scripts/generate_route_inventory.mjs --check
+{"status":"ok","routes":67,"uiFetches":34,"storeKeys":25}
+{"status":"ok","routes":67,"uiFetches":34,"storeKeys":25}
+```
+
+### Contradictions / Blockers
+
+- The WP6 "known restated quarter" proof was implemented as a deterministic fixture: a later filed value is ignored for an earlier `asOf`. I did not identify and verify a real SEC restatement sample in this session.
+- The 13F command currently persists filing-level rows with `status:"filing-level-only"`; it does not yet expand each 13F information table into per-holding shares/value rows. This is recorded explicitly in the bridge output and table JSON.
+- The live watcher has an EDGAR current-filings seam, but no production collector is passed from `server.mjs` yet; it remains disabled by default and test-covered with an injected collector.
