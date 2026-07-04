@@ -166,7 +166,7 @@ All five live in `server/historical_backtest.mjs` metrics/report assembly (engin
 - **B3 seeds** registered as `prior:"literature"` specs: `residualMomentum` (60d return residual vs SPY+sector basket), `week52HighProximity`, `shortTermReversal` (−return5d, horizons [1,5]), `idioVol21`, `maxDailyReturn21`, `amihudIlliquidity21`, `overnightGapBias21`.
 - **Verify**: one seeded factor walks candidate→shadow with gate evidence stored in `evidence{}`; a deliberate noise spec is rejected AND its trial recorded; decay fixture demotes then auto-recovers; grep-verifiable: no code path changes weights without a candidate strategy version; `llmGovernance` stamp still truthful.
 
-## ☐ WP15 — factor_researcher agent, post-mortems, lifecycle UI (plan §4 C3)
+## ☑ WP15 — factor_researcher agent, post-mortems, lifecycle UI (plan §4 C3)
 
 - **`harness/agents/factor_researcher.md`** in the exact `review_attributor.md` format (tier `reasoning`, `veto_power: false`, `max_steps: 6`, output_schema `factor-proposal-v1`). Tools: `get_factor_performance_report`, `get_factor_registry` (includes past rejections — the agent must not re-propose them), `get_data_catalog`, `get_lessons`. Prompt requirements: hypothesis-first (falsifiable economic rationale mandatory), 1–3 proposals per cycle, each with a novelty argument referencing the correlation matrix and naming the weak factor it replaces (if any); numbers only from tool results.
 - **Ingest path** (mirror of `agent_harness_ingest` pattern): proposals → parse gate → originality gate → registry `candidate` with `createdBy:"llm:factor_researcher"`, `prior:"generated"`. `FACTOR_RESEARCHER_ENABLED=false` default; weekly schedule when enabled; manual `POST /api/factors/research`.

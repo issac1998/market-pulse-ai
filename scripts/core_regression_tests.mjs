@@ -40,7 +40,13 @@ import { runIntradayWatcherOnce } from "../server/intraday_watcher.mjs";
 import { historicalMaxDrawdownFromReturns, runHistoricalWalkForwardFromRows } from "../server/historical_backtest.mjs";
 import { proxyFetchResponse } from "../server/network_fetch.mjs";
 import { evaluateFactorSpec, parseFactorSpec } from "../lib/factor_spec.mjs";
-import { addFactorCandidate, evaluateFactorRegistry, normalizeFactorRegistry } from "../server/factor_registry.mjs";
+import {
+  addFactorCandidate,
+  appendFactorPostmortem,
+  evaluateFactorRegistry,
+  ingestFactorResearcherOutput,
+  normalizeFactorRegistry,
+} from "../server/factor_registry.mjs";
 import {
   activeStrategyVersion,
   activeStrategyWeights,
@@ -359,6 +365,48 @@ const recovered = evaluateFactorRegistry(decayed.registry, {
   factorStats: { activeDecayFixture: { samples: 80, rankIC: 0.03, avgExcessPct: 0.6 } },
 });
 assert.equal(recovered.registry.factors.find((item) => item.factorId === "activeDecayFixture").state, "shadow", "Decay monitor should recover decayed factors after positive IC");
+const researcherIngest = ingestFactorResearcherOutput(registryWithSeeds, {
+  schemaVersion: "factor-proposal-v1",
+  proposals: [
+    {
+      factorId: "volumeAccumulation63",
+      family: "smartMoney",
+      hypothesis: "成交量中期累积代表资金关注，预期 20/60 日超额为正；若跨 regime RankIC 不为正则证伪。",
+      expectedSign: 1,
+      horizons: [20, 60],
+      novelty: "相对价格动量因子，使用成交量累积且与现有 op sequence 不同。",
+      spec: {
+        factorId: "volumeAccumulation63",
+        family: "smartMoney",
+        hypothesis: "成交量中期累积代表资金关注，预期 20/60 日超额为正；若跨 regime RankIC 不为正则证伪。",
+        expectedSign: 1,
+        horizons: [20, 60],
+        pipeline: [
+          { op: "ref", input: "bars.volume" },
+          { op: "ts_sum", window: 63 },
+          { op: "ts_rank", window: 126 },
+        ],
+      },
+    },
+  ],
+});
+assert.equal(researcherIngest.accepted.length, 1, "Factor researcher proposals should enter registry through parse + originality gates");
+assert.equal(researcherIngest.accepted[0].factor.createdBy, "llm:factor_researcher", "Researcher candidates should retain LLM provenance");
+assert.equal(researcherIngest.accepted[0].factor.state, "candidate", "LLM researcher cannot set lifecycle state beyond candidate ingest");
+const postmortemRegistry = appendFactorPostmortem(decayed.registry, "activeDecayFixture", {
+  schemaVersion: "factor-postmortem-v1",
+  factorId: "activeDecayFixture",
+  hypothesis: "fixture",
+  evidenceShowed: "rolling IC <= 0",
+  transferableLesson: "弱因子只能沉淀教训，不能由 LLM 改状态或权重。",
+  tags: ["fixture"],
+});
+assert.equal(postmortemRegistry.registry.memory.lessons.length, 1, "Factor postmortem should append episodic memory");
+assert.equal(
+  postmortemRegistry.registry.factors.find((item) => item.factorId === "activeDecayFixture").postMortems.length,
+  1,
+  "Factor postmortem should also attach to registry factor entry",
+);
 
 const recommendationScore = scoreRecommendationFromFactorSnapshot(
   {

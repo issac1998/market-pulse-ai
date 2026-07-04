@@ -1133,3 +1133,93 @@ Regression fixtures added:
 Contradictions:
 
 - True nightly scheduling is intentionally not activated in WP14 because `FACTOR_EVALUATOR_ENABLED` defaults false per spec. The manual route is available.
+
+---
+
+## WP15 — Factor Researcher Agent + Post-Mortems + Lifecycle UI — 2026-07-05
+
+Implemented Round 2 WP15.
+
+Changes:
+
+- Added `harness/agents/factor_researcher.md` in the same frontmatter/prompt format as `review_attributor.md`: tier `reasoning`, `veto_power:false`, `max_steps:6`, `output_schema:factor-proposal-v1`.
+- Added read-only harness tools for factor research:
+  - `get_factor_performance_report`
+  - `get_factor_registry`
+  - `get_data_catalog`
+  - `get_lessons`
+- Extended the mock invoker so `factor_researcher` can produce `factor-proposal-v1` and `factor-postmortem-v1` outputs for deterministic smoke tests.
+- Added registry ingest for factor researcher proposals:
+  - proposals pass through `parseFactorSpec` and `factorOriginalityGate`.
+  - accepted entries are only `state:"candidate"`, `prior:"generated"`, `createdBy:"llm:factor_researcher"`.
+  - rejected entries still write trial ledger entries.
+- Added manual `POST /api/factors/research`; `FACTOR_RESEARCHER_ENABLED=false` remains default, with a disabled-by-default weekly schedule available when the owner flips it.
+- Added post-mortem memory for demotion/retirement transitions. The evaluator still performs the mechanical state transition; the researcher only writes `factor-postmortem-v1` lesson text into registry memory and the factor entry.
+- Added `factorRegistry` to `/api/state` and a factor lifecycle board on the all-stock-agent track-record area, with candidate/shadow/active/decayed/retired/rejected columns, IC sparkline, `n`, and expandable gate evidence.
+
+Verification:
+
+```text
+$ node --check server/factor_registry.mjs && node --check server.mjs && node --check scripts/core_regression_tests.mjs && node --check public/app.js
+pass
+
+$ python3 -m py_compile harness/invoker/mock.py harness/tools/http_tools.py harness/tests/test_harness.py
+pass
+
+$ node scripts/core_regression_tests.mjs
+core_regression_tests: ok
+
+$ python3 -m unittest harness.tests.test_harness
+........
+Ran 8 tests in 0.012s
+OK
+
+$ node scripts/generate_route_inventory.mjs && node scripts/generate_route_inventory.mjs --check
+{"status":"ok","routes":81,"uiFetches":43,"storeKeys":26}
+{"status":"ok","routes":81,"uiFetches":43,"storeKeys":26}
+
+$ PORT=5191 FACTOR_RESEARCHER_INVOKER=mock AGENT_HARNESS_TIMEOUT_MS=300000 node server.mjs
+Market Pulse AI running at http://localhost:5191
+
+$ curl -sS -X POST http://127.0.0.1:5191/api/factors/research ... {"invoker":"mock"}
+{
+  "ok": true,
+  "invoker": "mock",
+  "accepted": [
+    {
+      "factorId": "volumeAccumulation63",
+      "state": "candidate",
+      "createdBy": "llm:factor_researcher",
+      "prior": "generated"
+    }
+  ],
+  "rejected": 0
+}
+
+$ curl -sS -X POST /api/factors/candidates/volumeAccumulation63/advance ... active
+$ curl -sS -X POST /api/factors/evaluate ... factorStatsOverride negative IC
+{
+  "transitions": ["volumeAccumulation63:active->decayed"],
+  "postmortems": [
+    {
+      "factorId": "volumeAccumulation63",
+      "lesson": "因子降级后只沉淀可迁移教训，不由 LLM 改状态、分数或权重。"
+    }
+  ],
+  "memoryLessons": 3,
+  "factorState": "decayed"
+}
+
+$ rg -n "llm:factor_researcher|ingestFactorResearcherOutput|appendFactorPostmortem|writesScores|writesWeights|writesStates" server.mjs server/factor_registry.mjs
+factor researcher only enters proposal ingest and post-mortem memory; `llmGovernance` records writesScores/writesWeights/writesStates as false.
+```
+
+Regression fixtures added:
+
+- `ingestFactorResearcherOutput()` accepts a valid mock proposal through parse + originality gates and preserves `createdBy:"llm:factor_researcher"`.
+- `appendFactorPostmortem()` appends both episodic registry memory and per-factor post-mortem records.
+- Python harness mock test verifies the new agent can call tools and return a `factor-proposal-v1` proposal.
+
+Contradictions:
+
+- None. Weekly automation is implemented but disabled by default per spec through `FACTOR_RESEARCHER_ENABLED=false`.

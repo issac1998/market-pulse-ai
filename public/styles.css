@@ -1549,6 +1549,87 @@ body.stock-detail-mode .stock-report-panel {
   font-size: 14px;
 }
 
+.factor-lifecycle-board {
+  overflow: hidden;
+}
+
+.factor-lifecycle-grid {
+  display: grid;
+  grid-template-columns: repeat(6, minmax(180px, 1fr));
+  gap: 10px;
+  overflow-x: auto;
+  padding-bottom: 4px;
+}
+
+.factor-lifecycle-column {
+  display: grid;
+  align-content: start;
+  gap: 8px;
+  min-width: 180px;
+}
+
+.factor-lifecycle-column h4 {
+  display: flex;
+  justify-content: space-between;
+  margin: 0;
+  font-size: 13px;
+}
+
+.factor-lifecycle-column h4 span {
+  color: var(--muted);
+}
+
+.factor-lifecycle-card {
+  display: grid;
+  gap: 7px;
+  border: 1px solid rgba(148, 163, 184, 0.24);
+  border-radius: 8px;
+  padding: 9px;
+  background: rgba(248, 250, 252, 0.78);
+}
+
+.factor-lifecycle-card strong,
+.factor-lifecycle-card span,
+.factor-lifecycle-card p {
+  display: block;
+}
+
+.factor-lifecycle-card span,
+.factor-lifecycle-card p,
+.factor-lifecycle-card summary,
+.factor-lifecycle-card details {
+  color: var(--muted);
+  font-size: 12px;
+  line-height: 1.35;
+}
+
+.factor-lifecycle-card p {
+  margin: 0;
+}
+
+.factor-spark {
+  display: flex;
+  align-items: end;
+  gap: 2px;
+  height: 26px;
+}
+
+.factor-spark i {
+  width: 5px;
+  border-radius: 999px;
+  background: rgba(20, 184, 166, 0.82);
+}
+
+.factor-spark i.neg {
+  background: rgba(239, 68, 68, 0.76);
+}
+
+.factor-spark.empty {
+  height: 6px;
+  border-radius: 999px;
+  background: rgba(148, 163, 184, 0.22);
+}
+
 .all-stock-agent-mini-list {
   display: grid;
   gap: 7px;

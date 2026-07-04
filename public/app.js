@@ -5235,6 +5235,75 @@ function renderAllStockAgentTrackRecord(latest = {}) {
   </section>`;
 }
 
+function renderFactorLifecycleBoard(registry = {}) {
+  const factors = Array.isArray(registry?.factors) ? registry.factors : [];
+  if (!factors.length) return "";
+  const states = [
+    ["candidate", "候选"],
+    ["shadow", "Shadow"],
+    ["active", "Active"],
+    ["decayed", "Decayed"],
+    ["retired", "Retired"],
+    ["rejected", "Rejected"],
+  ];
+  const fmtPctMaybe = (value) => Number.isFinite(Number(value)) ? fmtNumber(Number(value), 2) : "-";
+  const evidenceLine = (factor) => {
+    const evidence = factor.evidence?.admission || factor.evidence?.latestAdmission || factor.evidence?.latestDecay || factor.evidence || {};
+    const n = evidence.n ?? evidence.samples ?? factor.liveStats?.n ?? factor.liveStats?.samples ?? 0;
+    const rankIC = evidence.rankIC ?? factor.liveStats?.rankIC;
+    const gate = evidence.status || factor.evidence?.status || "pending";
+    return `RankIC ${fmtPctMaybe(rankIC)} · n=${n || 0} · ${gate}`;
+  };
+  const sparkline = (factor) => {
+    const history = Object.values(factor.liveStats?.horizons || factor.evidence?.horizons || {})
+      .map((item) => Number(item.rankIC))
+      .filter(Number.isFinite)
+      .slice(0, 8);
+    if (!history.length) return `<span class="factor-spark empty"></span>`;
+    const bars = history.map((value) => {
+      const height = Math.max(12, Math.min(100, Math.abs(value) * 260));
+      const cls = value >= 0 ? "pos" : "neg";
+      return `<i class="${cls}" style="height:${escapeHtml(height)}%"></i>`;
+    }).join("");
+    return `<span class="factor-spark">${bars}</span>`;
+  };
+  const card = (factor) => {
+    const latestPostmortem = (factor.postMortems || [])[0] || null;
+    return `<article class="factor-lifecycle-card">
+      <div>
+        <strong>${escapeHtml(factor.factorId || "")}</strong>
+        <span>${escapeHtml(factor.family || "")} · ${escapeHtml(factor.prior || "")}</span>
+      </div>
+      ${sparkline(factor)}
+      <p>${escapeHtml(evidenceLine(factor))}</p>
+      <details>
+        <summary>Gate evidence</summary>
+        <p>${escapeHtml(factor.hypothesis || "")}</p>
+        <p>${escapeHtml(factor.researcherProposal?.novelty || factor.evidence?.reason || factor.evidence?.latestAdmission?.source || "")}</p>
+        ${latestPostmortem ? `<p>${escapeHtml(latestPostmortem.transferableLesson || latestPostmortem.evidenceShowed || "")}</p>` : ""}
+      </details>
+    </article>`;
+  };
+  return `<section class="all-stock-agent-section factor-lifecycle-board">
+    <div class="social-source-head">
+      <div>
+        <p class="section-label">Factor Registry</p>
+        <h3>因子生命周期看板</h3>
+      </div>
+      <span class="tag">${escapeHtml(factors.length)} 个因子 · trial ${escapeHtml(registry.trialLedger?.count || 0)}</span>
+    </div>
+    <div class="factor-lifecycle-grid">
+      ${states.map(([state, label]) => {
+        const rows = factors.filter((factor) => factor.state === state).slice(0, 12);
+        return `<div class="factor-lifecycle-column">
+          <h4>${escapeHtml(label)} <span>${escapeHtml(rows.length)}</span></h4>
+          ${rows.length ? rows.map(card).join("") : `<p class="muted">暂无。</p>`}
+        </div>`;
+      }).join("")}
+    </div>
+  </section>`;
+}
+
 function metricWithN(item = {}, digits = 1, suffix = "") {
   const value = item && typeof item === "object" ? item.value : item;
   const n = item && typeof item === "object" ? Number(item.n || 0) : 0;
@@ -5606,6 +5675,7 @@ function renderAllStockAgent(agentState) {
     ${revision?.changes?.length ? `<div class="all-stock-agent-note success"><strong>Skill 已自更新</strong><span>${escapeHtml(revision.summary || "")}</span></div>` : ""}
     ${renderAllStockAgentRoadmapBlock(latest)}
     ${renderAllStockAgentTrackRecord(latest)}
+    ${renderFactorLifecycleBoard(appState?.factorRegistry)}
     ${renderAllStockAgentBacktestBlock(allStockAgentBacktest)}
     ${renderAllStockAgentSection("正式买入", "Buy List", buyRows, (item) => renderAllStockAgentDecision(item, "buy", run))}
     ${renderAllStockAgentSection("待触发买入候选", "Watch Buy", watchBuyRows, (item) => renderAllStockAgentDecision(item, "watch", run))}

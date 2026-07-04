@@ -214,6 +214,12 @@ export function normalizeFactorRegistry(value = {}) {
   return {
     schemaVersion: REGISTRY_SCHEMA,
     generatedAt: registry.generatedAt || nowIso(),
+    memory: registry.memory && typeof registry.memory === "object"
+      ? {
+          schemaVersion: registry.memory.schemaVersion || "factor-episodic-memory-v1",
+          lessons: Array.isArray(registry.memory.lessons) ? registry.memory.lessons.slice(0, 500) : [],
+        }
+      : { schemaVersion: "factor-episodic-memory-v1", lessons: [] },
     trialLedger: {
       count: Number(registry.trialLedger?.count || trialEntries.length || 0),
       entries: trialEntries.slice(0, 1000),
@@ -334,6 +340,66 @@ export function addFactorCandidate(registryInput = {}, payload = {}, options = {
     factors: [factor, ...registry.factors.filter((item) => item.factorId !== factorId)],
   };
   return { registry: next, factor, trialEntry, gate };
+}
+
+function proposalSpecFromPayload(proposal = {}) {
+  const spec = proposal.spec && typeof proposal.spec === "object" ? proposal.spec : proposal;
+  return {
+    ...spec,
+    factorId: text(proposal.factorId || spec.factorId),
+    family: text(proposal.family || spec.family || "custom"),
+    hypothesis: text(proposal.hypothesis || spec.hypothesis || ""),
+    expectedSign: proposal.expectedSign ?? spec.expectedSign ?? 1,
+    horizons: Array.isArray(proposal.horizons) && proposal.horizons.length ? proposal.horizons : spec.horizons || [20],
+  };
+}
+
+export function ingestFactorResearcherOutput(registryInput = {}, output = {}, options = {}) {
+  let registry = normalizeFactorRegistry(registryInput);
+  const payload = output?.output && typeof output.output === "object" ? output.output : output;
+  const proposals = (Array.isArray(payload?.proposals) ? payload.proposals : [])
+    .filter((item) => item && typeof item === "object")
+    .slice(0, 3);
+  const results = [];
+  for (const proposal of proposals) {
+    const spec = proposalSpecFromPayload(proposal);
+    const result = addFactorCandidate(registry, {
+      ...proposal,
+      factorId: spec.factorId,
+      family: spec.family,
+      hypothesis: spec.hypothesis,
+      prior: "generated",
+      createdBy: "llm:factor_researcher",
+      spec,
+    }, {
+      ...options,
+      actor: "llm:factor_researcher",
+      createdBy: "llm:factor_researcher",
+    });
+    const factor = {
+      ...result.factor,
+      researcherProposal: {
+        schemaVersion: "factor-researcher-proposal-v1",
+        novelty: text(proposal.novelty || proposal.noveltyArgument || ""),
+        replacesFactorId: text(proposal.replacesFactorId || ""),
+        economicRationale: text(proposal.economicRationale || proposal.rationale || proposal.hypothesis || ""),
+        sourceRunId: text(options.sourceRunId || ""),
+        invoker: text(options.invoker || ""),
+      },
+    };
+    registry = {
+      ...result.registry,
+      factors: [factor, ...result.registry.factors.filter((item) => item.factorId !== factor.factorId)],
+    };
+    results.push({ factor, gate: result.gate, trialEntry: result.trialEntry });
+  }
+  return {
+    registry,
+    accepted: results.filter((item) => item.gate.ok),
+    rejected: results.filter((item) => !item.gate.ok),
+    results,
+    proposalCount: proposals.length,
+  };
 }
 
 export function advanceFactorState(registryInput = {}, factorId = "", nextState = "", options = {}) {
@@ -501,6 +567,49 @@ export function evaluateFactorRegistry(registryInput = {}, context = {}) {
       evaluated: factors.length,
       trialEntries: trialEntries.length,
     },
+  };
+}
+
+export function appendFactorPostmortem(registryInput = {}, factorId = "", postmortem = {}, options = {}) {
+  const registry = normalizeFactorRegistry(registryInput);
+  const now = options.now || nowIso();
+  const payload = postmortem?.output && typeof postmortem.output === "object" ? postmortem.output : postmortem;
+  const lesson = {
+    schemaVersion: "factor-postmortem-v1",
+    id: compactId("factor-postmortem"),
+    at: now,
+    factorId: text(factorId || payload.factorId),
+    transition: options.transition || null,
+    hypothesis: text(payload.hypothesis || ""),
+    evidenceShowed: text(payload.evidenceShowed || payload.evidence || ""),
+    transferableLesson: text(payload.transferableLesson || payload.lesson || ""),
+    tags: Array.isArray(payload.tags) ? payload.tags.map(text).filter(Boolean).slice(0, 10) : [],
+    source: text(options.source || "factor_researcher"),
+    invoker: text(options.invoker || ""),
+    llmGovernance: {
+      writesScores: false,
+      writesWeights: false,
+      writesStates: false,
+      purpose: "postmortem narrative memory only",
+    },
+  };
+  const factors = registry.factors.map((factor) => {
+    if (factor.factorId !== factorId) return factor;
+    return {
+      ...factor,
+      postMortems: [lesson, ...(Array.isArray(factor.postMortems) ? factor.postMortems : [])].slice(0, 50),
+    };
+  });
+  return {
+    registry: {
+      ...registry,
+      factors,
+      memory: {
+        schemaVersion: "factor-episodic-memory-v1",
+        lessons: [lesson, ...(registry.memory?.lessons || [])].slice(0, 500),
+      },
+    },
+    lesson,
   };
 }
 

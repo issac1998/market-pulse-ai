@@ -56,9 +56,11 @@ import {
 import { intradayWatcherConfigFromEnv, runIntradayWatcherOnce } from "./server/intraday_watcher.mjs";
 import {
   addFactorCandidate,
+  appendFactorPostmortem,
   advanceFactorState,
   buildFactorPerformanceReport,
   evaluateFactorRegistry,
+  ingestFactorResearcherOutput,
   normalizeFactorRegistry,
 } from "./server/factor_registry.mjs";
 import {
@@ -1146,6 +1148,9 @@ const ALL_STOCK_AGENT_PREFETCH_ENABLED = parseBoolean(process.env.ALL_STOCK_AGEN
 const SUBSIGNAL_IC_WEIGHTING_REQUESTED = parseBoolean(process.env.SUBSIGNAL_IC_WEIGHTING_ENABLED, false);
 const SUBSIGNAL_IC_WEIGHTING_ENABLED = false;
 const FACTOR_EVALUATOR_ENABLED = parseBoolean(process.env.FACTOR_EVALUATOR_ENABLED, false);
+const FACTOR_RESEARCHER_ENABLED = parseBoolean(process.env.FACTOR_RESEARCHER_ENABLED, false);
+const FACTOR_RESEARCHER_NEW_YORK_TIME = process.env.FACTOR_RESEARCHER_NEW_YORK_TIME || "19:30";
+const FACTOR_RESEARCHER_INVOKER = process.env.FACTOR_RESEARCHER_INVOKER || "mock";
 const ALL_STOCK_AGENT_TECHNICAL_PREFETCH_LIMIT = Math.max(
   0,
   Number(process.env.ALL_STOCK_AGENT_TECHNICAL_PREFETCH_LIMIT ?? 0),
@@ -37726,6 +37731,34 @@ async function runAgentHarnessDebate(ticker, invokerPreference = "") {
   return { debate, invoker, stdoutChars: result.stdout.length, stderr: result.stderr || "" };
 }
 
+async function runAgentHarnessAgent(agentId = "", task = {}, invokerPreference = "") {
+  const invoker = normalizeHarnessInvoker(invokerPreference);
+  const baseUrl = process.env.AGENT_HARNESS_BASE_URL || `http://127.0.0.1:${PORT}`;
+  const args = [
+    "-m",
+    "harness",
+    "run",
+    "--agent",
+    agentId,
+    "--invoker",
+    invoker,
+    "--base-url",
+    baseUrl,
+    "--sqlite",
+    SQLITE_DB_FILE,
+  ];
+  if (task.ticker) args.push("--ticker", safeTicker(task.ticker));
+  if (task.question) args.push("--question", typeof task.question === "string" ? task.question : JSON.stringify(task.question));
+  const result = await execFileText(AGENT_HARNESS_PYTHON, args, AGENT_HARNESS_TIMEOUT_MS);
+  if (!result.ok) {
+    throw new Error(`Agent harness ${agentId} 失败：${errorZh(result.stderr || result.error || "未知错误")}`);
+  }
+  const payload = parseHarnessJson(result.stdout);
+  payload.source = payload.source || `python-agent-harness:${agentId}:${invoker}`;
+  payload.invoker = payload.invoker || invoker;
+  return { payload, invoker, stdoutChars: result.stdout.length, stderr: result.stderr || "" };
+}
+
 function parseNewYorkClock(value = "") {
   const match = String(value || "").trim().match(/^(\d{1,2}):(\d{2})$/);
   if (!match) return { hour: 18, minute: 15 };
@@ -37827,6 +37860,122 @@ async function maybeRunDailyShadowDebates() {
   return { status: "ok", record };
 }
 
+function factorPostmortemTask(transition = {}, factor = {}, performanceReport = {}) {
+  return {
+    taskType: "postmortem",
+    schemaVersion: "factor-postmortem-task-v1",
+    factorId: factor.factorId || transition.factorId || "",
+    transition,
+    factor: {
+      factorId: factor.factorId,
+      family: factor.family,
+      state: factor.state,
+      hypothesis: factor.hypothesis,
+      expectedSign: factor.expectedSign,
+      horizons: factor.horizons,
+      evidence: factor.evidence,
+      stateHistory: (factor.stateHistory || []).slice(0, 10),
+    },
+    performance: (performanceReport.factors || []).find((item) => item.factorId === (factor.factorId || transition.factorId)) || null,
+    llmBoundary: "postmortem narrative only; do not change factor state, scores, weights, gates, or skill JSON",
+  };
+}
+
+async function runFactorResearcherCycle(db = {}, options = {}) {
+  const state = normalizeAllStockAgentState(db.allStockAgent);
+  const registry = normalizeFactorRegistry(db.factorRegistry);
+  const performanceReport = buildFactorPerformanceReport(registry, { latestRun: state.runs[0] || null });
+  const task = {
+    taskType: "proposal",
+    schemaVersion: "factor-researcher-task-v1",
+    generatedAt: nowIso(),
+    instructions: "提出 1-3 个 hypothesis-first 的新因子候选；数字只能来自工具；不要写状态、分数、权重或 skill JSON。",
+  };
+  const harness = await runAgentHarnessAgent("factor_researcher", { question: task }, options.invoker || FACTOR_RESEARCHER_INVOKER);
+  const output = harness.payload?.output || harness.payload;
+  const ingest = ingestFactorResearcherOutput(registry, output, {
+    invoker: harness.invoker,
+    sourceRunId: state.runs[0]?.id || "",
+  });
+  db.factorRegistry = { ...ingest.registry, performanceReport };
+  appendAuditEvent(db, "factor_researcher.proposals", {
+    enabledBySchedule: FACTOR_RESEARCHER_ENABLED,
+    manual: Boolean(options.manual),
+    invoker: harness.invoker,
+    proposalCount: ingest.proposalCount,
+    accepted: ingest.accepted.length,
+    rejected: ingest.rejected.length,
+    llmBoundary: "proposal-only-parse-and-originality-gated",
+  }, ingest.accepted.length ? "ok" : "warn");
+  return { harness, ingest, registry: db.factorRegistry };
+}
+
+async function appendFactorPostmortemsForTransitions(db = {}, transitions = [], performanceReport = {}, options = {}) {
+  let registry = normalizeFactorRegistry(db.factorRegistry);
+  const lessons = [];
+  for (const transition of transitions || []) {
+    if (!["decayed", "retired"].includes(transition.to)) continue;
+    const factor = registry.factors.find((item) => item.factorId === transition.factorId) || {};
+    try {
+      const harness = await runAgentHarnessAgent(
+        "factor_researcher",
+        { ticker: transition.factorId || "", question: factorPostmortemTask(transition, factor, performanceReport) },
+        options.invoker || FACTOR_RESEARCHER_INVOKER,
+      );
+      const output = harness.payload?.output || harness.payload;
+      const result = appendFactorPostmortem(registry, transition.factorId, output, {
+        transition,
+        invoker: harness.invoker,
+        source: "factor_researcher",
+      });
+      registry = result.registry;
+      lessons.push(result.lesson);
+    } catch (error) {
+      appendAuditEvent(db, "factor_researcher.postmortem_failed", {
+        factorId: transition.factorId,
+        transition,
+        error: errorZh(error.message),
+      }, "warn");
+    }
+  }
+  db.factorRegistry = registry;
+  if (lessons.length) {
+    appendAuditEvent(db, "factor_researcher.postmortems", {
+      count: lessons.length,
+      factors: lessons.map((item) => item.factorId),
+      llmBoundary: "postmortem-memory-only",
+    }, "ok");
+  }
+  return { registry, lessons };
+}
+
+function dueFactorResearcherWeekly(date = new Date(), scheduleLog = {}) {
+  if (!FACTOR_RESEARCHER_ENABLED || !isNyseTradingDate(date)) return null;
+  const parts = getNewYorkParts(date);
+  if (parts.weekday !== "Fri") return null;
+  const target = parseNewYorkClock(FACTOR_RESEARCHER_NEW_YORK_TIME);
+  const nowMinute = parts.hour * 60 + parts.minute;
+  const targetMinute = target.hour * 60 + target.minute;
+  const key = `${parts.ymd}:factor-researcher-weekly`;
+  if (scheduleLog[key]) return null;
+  if (nowMinute < targetMinute || nowMinute - targetMinute > SCHEDULE_CATCH_UP_MINUTES) return null;
+  return {
+    key,
+    newYorkDate: parts.ymd,
+    newYorkTime: `${String(target.hour).padStart(2, "0")}:${String(target.minute).padStart(2, "0")}`,
+  };
+}
+
+async function maybeRunWeeklyFactorResearcher() {
+  const db = await ensureStore();
+  const due = dueFactorResearcherWeekly(new Date(), db.scheduleLog || {});
+  if (!due) return { status: FACTOR_RESEARCHER_ENABLED ? "not_due" : "disabled" };
+  const result = await runFactorResearcherCycle(db, { manual: false, invoker: FACTOR_RESEARCHER_INVOKER });
+  db.scheduleLog[due.key] = result.ingest.accepted[0]?.factor.factorId || nowIso();
+  await saveStore(db);
+  return { status: "ok", due, accepted: result.ingest.accepted.length, rejected: result.ingest.rejected.length };
+}
+
 async function handleApi(req, res, url) {
   if (req.method === "GET" && url.pathname === "/api/state") {
     const db = await ensureStore();
@@ -37844,6 +37993,7 @@ async function handleApi(req, res, url) {
       emailLog: (db.emailLog || []).slice(0, 20),
       sourceDiagnostics: normalizeSourceDiagnostics(db.sourceDiagnostics),
       allStockAgent: allStockAgentForClient(db.allStockAgent),
+      factorRegistry: normalizeFactorRegistry(db.factorRegistry),
       latest: runForClient(latestRun(db), db.alertState, db.sourceControls),
       runStatus: runStatusForClient(),
       config: configForClient(db),
@@ -37877,18 +38027,42 @@ async function handleApi(req, res, url) {
     const result = evaluateFactorRegistry(registry, {
       actor: "system:evaluator",
       performanceReport,
-      factorStats: state.runs[0]?.factorStats || {},
+      factorStats: body.factorStatsOverride || state.runs[0]?.factorStats || {},
       evidenceOverrides: body.evidenceOverrides || {},
     });
     db.factorRegistry = { ...result.registry, performanceReport };
+    const postmortem = await appendFactorPostmortemsForTransitions(db, result.transitions, performanceReport, {
+      invoker: body.postmortemInvoker || body.invoker || FACTOR_RESEARCHER_INVOKER,
+    });
     appendAuditEvent(db, "factor_registry.evaluate", {
       enabledBySchedule: FACTOR_EVALUATOR_ENABLED,
       manual: true,
       transitions: result.transitions,
       trialEntries: result.trialEntries.length,
+      postmortems: postmortem.lessons.length,
+      factorStatsOverride: Boolean(body.factorStatsOverride),
     }, result.transitions.length ? "ok" : "warn");
     await saveStore(db);
-    return sendJson(res, { evaluation: result.report, transitions: result.transitions, registry: db.factorRegistry });
+    return sendJson(res, { evaluation: result.report, transitions: result.transitions, postmortems: postmortem.lessons, registry: db.factorRegistry });
+  }
+
+  if (req.method === "POST" && url.pathname === "/api/factors/research") {
+    const body = await readBody(req);
+    if (body.__readError) return sendJson(res, { error: body.__readError }, 400);
+    try {
+      const db = await ensureStore();
+      const result = await runFactorResearcherCycle(db, { manual: true, invoker: body.invoker || FACTOR_RESEARCHER_INVOKER });
+      await saveStore(db);
+      return sendJson(res, {
+        ok: true,
+        invoker: result.harness.invoker,
+        accepted: result.ingest.accepted.map((item) => item.factor),
+        rejected: result.ingest.rejected.map((item) => ({ factor: item.factor, gate: item.gate })),
+        registry: result.registry,
+      });
+    } catch (error) {
+      return sendJson(res, { error: errorZh(error.message) }, 500);
+    }
   }
 
   if (req.method === "POST" && url.pathname === "/api/factors/candidates") {
@@ -40255,6 +40429,14 @@ if (AGENT_DEBATE_DAILY_ENABLED) {
   setInterval(() => {
     maybeRunDailyShadowDebates().catch((error) => {
       console.error("Daily shadow debate failed:", error);
+    });
+  }, 60_000).unref?.();
+}
+
+if (FACTOR_RESEARCHER_ENABLED) {
+  setInterval(() => {
+    maybeRunWeeklyFactorResearcher().catch((error) => {
+      console.error("Weekly factor researcher failed:", error);
     });
   }, 60_000).unref?.();
 }

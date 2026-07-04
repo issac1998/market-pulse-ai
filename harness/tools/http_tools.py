@@ -217,6 +217,87 @@ def get_investment_advice(client, ticker):
     return {"status": "missing", "ticker": symbol, "error": payload.get("error") or payload}
 
 
+def get_factor_performance_report(client):
+    payload = client.request("GET", "/api/factors/performance-report", timeout=30)
+    report = payload.get("report") if isinstance(payload, dict) else None
+    if not report:
+        return {"status": "missing", "error": payload.get("error") if isinstance(payload, dict) else payload}
+    factors = (report.get("factors") or [])[:20]
+    factor_stats = report.get("factorStats") or {}
+    matrix = report.get("correlationMatrix") or {}
+    return {
+        "status": "ok",
+        "source": "/api/factors/performance-report",
+        "registrySummary": report.get("registrySummary"),
+        "factors": factors,
+        "factorStats": {key: factor_stats[key] for key in list(factor_stats.keys())[:20]},
+        "correlationMatrix": {
+            "n": matrix.get("n"),
+            "generatedAt": matrix.get("generatedAt"),
+            "highCorrelationPairs": (matrix.get("highCorrelationPairs") or [])[:20],
+        },
+        "llmGovernance": report.get("llmGovernance"),
+    }
+
+
+def get_factor_registry(client):
+    payload = client.request("GET", "/api/factors/registry", timeout=20)
+    registry = payload.get("registry") if isinstance(payload, dict) else None
+    if not registry:
+        return {"status": "missing", "error": payload.get("error") if isinstance(payload, dict) else payload}
+    factors = registry.get("factors") or []
+    rejected = [item for item in factors if item.get("state") == "rejected"][:30]
+    return {
+        "status": "ok",
+        "source": "/api/factors/registry",
+        "schemaVersion": registry.get("schemaVersion"),
+        "summary": {
+            "total": len(factors),
+            "byState": {state: len([item for item in factors if item.get("state") == state]) for state in sorted(set(item.get("state") for item in factors))},
+            "trialCount": (registry.get("trialLedger") or {}).get("count"),
+        },
+        "factors": factors[:60],
+        "pastRejections": rejected,
+        "trialLedger": {
+            "count": (registry.get("trialLedger") or {}).get("count"),
+            "entries": ((registry.get("trialLedger") or {}).get("entries") or [])[:40],
+        },
+        "memory": registry.get("memory"),
+    }
+
+
+def get_data_catalog(client):
+    payload = client.request("GET", "/api/state", timeout=10)
+    latest = payload.get("latest") if isinstance(payload, dict) else {}
+    state = payload.get("allStockAgent") if isinstance(payload, dict) else {}
+    latest_agent = (state or {}).get("latest") or {}
+    return {
+        "status": "ok",
+        "source": "/api/state",
+        "availableBlocks": [
+            {"key": "bars.close", "description": "价格/K线收盘价，来自 Longbridge/AkShare/缓存兜底。", "coverageHint": len(latest.get("technicals") or [])},
+            {"key": "bars.volume", "description": "K线成交量。", "coverageHint": len(latest.get("technicals") or [])},
+            {"key": "revisions.upgrades", "description": "分析师上调线索；覆盖不足时 registry 标记 insufficient-data。"},
+            {"key": "shortInterest.short_interest", "description": "空头仓位历史；依赖 short interest 数据接入。"},
+            {"key": "ivHistory.iv_atm", "description": "ATM IV 历史；依赖 options_snapshots。"},
+            {"key": "ivHistory.put_call_ratio", "description": "Put/Call 比率历史；依赖 options_snapshots。"},
+            {"key": "pit.sue_score", "description": "标准化盈利惊喜；依赖 PIT 财报 surprise 历史。"},
+        ],
+        "latestRunId": latest_agent.get("id"),
+        "evaluations": ((latest_agent.get("summary") or {}).get("evaluated")),
+        "note": "数据目录只描述可用输入，不授权 LLM 写入分数、权重或状态。",
+    }
+
+
+def get_lessons(client, ticker=""):
+    symbol = _ticker(ticker)
+    payload = client.request("GET", "/api/lessons/relevant", params={"ticker": symbol} if symbol else {}, timeout=15)
+    lessons = payload.get("lessons") if isinstance(payload, dict) else None
+    if lessons:
+        return {"status": "ok", "source": "/api/lessons/relevant", "lessons": lessons}
+    return {"status": "missing", "ticker": symbol, "error": payload.get("error") if isinstance(payload, dict) else payload}
+
+
 def http_tools(base_url=None):
     client = NodeHttpClient(base_url=base_url)
     ticker_schema = {
@@ -232,4 +313,8 @@ def http_tools(base_url=None):
         Tool("get_options_chain", "读取当前 run 已缓存的期权链和异常线索。", ticker_schema, lambda ticker: get_options_chain(client, ticker)),
         Tool("get_macro_regime", "读取 FRED/大盘宏观 regime。", {"type": "object", "properties": {}}, lambda: get_macro_regime(client)),
         Tool("get_investment_advice", "读取现有投资建议 Agent 产物和证据包。", ticker_schema, lambda ticker: get_investment_advice(client, ticker)),
+        Tool("get_factor_performance_report", "读取因子表现、IC、相关矩阵和生命周期统计。", {"type": "object", "properties": {}}, lambda: get_factor_performance_report(client)),
+        Tool("get_factor_registry", "读取因子注册表、历史拒绝项和 trial ledger。", {"type": "object", "properties": {}}, lambda: get_factor_registry(client)),
+        Tool("get_data_catalog", "读取当前可用的因子数据输入目录和覆盖提示。", {"type": "object", "properties": {}}, lambda: get_data_catalog(client)),
+        Tool("get_lessons", "读取长期记忆中的复盘教训。", {"type": "object", "properties": {"ticker": {"type": "string", "default": ""}}}, lambda ticker="": get_lessons(client, ticker)),
     ]

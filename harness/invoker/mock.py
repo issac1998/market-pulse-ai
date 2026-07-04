@@ -25,6 +25,7 @@ def _role_from_system(system):
         ("bear", "你是 Market Pulse AI 的空方研究员"),
         ("risk", "你是 Market Pulse AI 的风险经理"),
         ("coordinator", "你是 Market Pulse AI 的辩论协调者"),
+        ("factor_researcher", "你是 Market Pulse AI 的因子研究员"),
     ]
     for role, needle in checks:
         if needle in text:
@@ -73,6 +74,9 @@ class MockInvoker:
             elif role == "risk":
                 tool = "get_macro_regime"
                 args = {}
+            elif role == "factor_researcher":
+                tool = "get_factor_performance_report"
+                args = {}
             else:
                 tool = "get_stock_snapshot"
                 args = {"ticker": ticker}
@@ -103,6 +107,47 @@ class MockInvoker:
                 "severity": "low",
                 "rationale": ["mock 已读取宏观/风险工具结果，未触发硬否决。"],
             }
+        elif role == "factor_researcher":
+            user_text = user or ""
+            if "postmortem" in user_text.lower():
+                payload = {
+                    "action": "final",
+                    "schemaVersion": "factor-postmortem-v1",
+                    "factorId": ticker if ticker != "NVDA" else "activeDecayFixture",
+                    "hypothesis": "mock 因子假设用于验证 postmortem ingest 链路。",
+                    "evidenceShowed": "mock 工具结果显示该因子进入降级复盘流程。",
+                    "transferableLesson": "因子降级后只沉淀可迁移教训，不由 LLM 改状态、分数或权重。",
+                    "tags": ["mock", "factor-postmortem"],
+                }
+            else:
+                payload = {
+                    "action": "final",
+                    "schemaVersion": "factor-proposal-v1",
+                    "proposals": [
+                        {
+                            "factorId": "volumeAccumulation63",
+                            "family": "smartMoney",
+                            "hypothesis": "成交量在中期窗口持续累积时，可能代表增量资金关注，预期 20/60 日超额收益为正；若 RankIC 在多个 regime 不为正则证伪。",
+                            "expectedSign": 1,
+                            "horizons": [20, 60],
+                            "novelty": "mock 提案引用 correlation matrix：不同于 week52HighProximity 的纯价格位置，使用成交量累积，不替换现有因子，仅进入 shadow 前候选观察。",
+                            "replacesFactorId": "",
+                            "spec": {
+                                "schemaVersion": "factor-spec-v1",
+                                "factorId": "volumeAccumulation63",
+                                "family": "smartMoney",
+                                "hypothesis": "成交量在中期窗口持续累积时，可能代表增量资金关注，预期 20/60 日超额收益为正；若 RankIC 在多个 regime 不为正则证伪。",
+                                "expectedSign": 1,
+                                "horizons": [20, 60],
+                                "pipeline": [
+                                    {"op": "ref", "input": "bars.volume"},
+                                    {"op": "ts_sum", "window": 63},
+                                    {"op": "ts_rank", "window": 126},
+                                ],
+                            },
+                        }
+                    ],
+                }
         elif role == "bear":
             payload = {
                 "action": "final",

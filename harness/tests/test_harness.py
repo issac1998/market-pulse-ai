@@ -44,6 +44,57 @@ class HarnessSmokeTest(unittest.TestCase):
         self.assertIn("tool_call", kinds)
         self.assertIn("final", kinds)
 
+    def test_factor_researcher_mock_proposes_factor(self):
+        registry = ToolRegistry()
+        registry.register(
+            Tool(
+                "get_factor_performance_report",
+                "offline factor report",
+                {"type": "object", "properties": {}},
+                lambda: {
+                    "status": "ok",
+                    "correlationMatrix": {"highCorrelationPairs": []},
+                    "factorStats": {},
+                },
+            )
+        )
+        registry.register(
+            Tool(
+                "get_factor_registry",
+                "offline registry",
+                {"type": "object", "properties": {}},
+                lambda: {"status": "ok", "factors": [], "pastRejections": []},
+            )
+        )
+        registry.register(
+            Tool(
+                "get_data_catalog",
+                "offline data catalog",
+                {"type": "object", "properties": {}},
+                lambda: {"status": "ok", "availableBlocks": [{"key": "bars.volume"}]},
+            )
+        )
+        registry.register(
+            Tool(
+                "get_lessons",
+                "offline lessons",
+                {"type": "object", "properties": {"ticker": {"type": "string", "default": ""}}},
+                lambda ticker="": {"status": "ok", "lessons": {"rows": []}},
+            )
+        )
+        with TemporaryDirectory() as tmp:
+            ctx = RunContext(
+                invoker=MockInvoker(),
+                fallback_invoker=MockInvoker(),
+                tools=registry,
+                knowledge=FileKnowledgeBase(),
+                memory=SQLiteMemory(path=f"{tmp}/memory.sqlite"),
+            )
+            result = run_agent_loop(load_agent("factor_researcher"), {"question": "proposal"}, ctx)
+        self.assertEqual(result.output.get("schemaVersion"), "factor-proposal-v1")
+        self.assertGreaterEqual(len(result.output.get("proposals", [])), 1)
+        self.assertEqual(result.output["proposals"][0]["spec"]["pipeline"][0]["op"], "ref")
+
     def test_agy_stdout_preserves_protocol_json(self):
         raw = '{"action":"final","output":"should not be unwrapped","answer":"ok"}'
         parsed = _parse_agy_stdout(raw)
