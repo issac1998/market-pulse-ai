@@ -381,6 +381,40 @@ def init_schema(conn: sqlite3.Connection) -> None:
           json TEXT NOT NULL
         );
 
+        CREATE TABLE IF NOT EXISTS sue_history (
+          id TEXT PRIMARY KEY,
+          ticker TEXT,
+          event_date TEXT,
+          captured_at TEXT,
+          eps_estimate REAL,
+          revenue_estimate REAL,
+          actual_eps REAL,
+          actual_revenue REAL,
+          sue_eps REAL,
+          source TEXT,
+          json TEXT NOT NULL
+        );
+
+        CREATE TABLE IF NOT EXISTS short_interest_history (
+          id TEXT PRIMARY KEY,
+          ticker TEXT,
+          captured_at TEXT,
+          short_interest REAL,
+          source TEXT,
+          json TEXT NOT NULL
+        );
+
+        CREATE TABLE IF NOT EXISTS analyst_revision_history (
+          id TEXT PRIMARY KEY,
+          ticker TEXT,
+          captured_at TEXT,
+          upgrades INTEGER DEFAULT 0,
+          downgrades INTEGER DEFAULT 0,
+          rating_count INTEGER DEFAULT 0,
+          source TEXT,
+          json TEXT NOT NULL
+        );
+
         CREATE TABLE IF NOT EXISTS trade_recommendation_reconciliation (
           id TEXT PRIMARY KEY,
           trade_id TEXT,
@@ -423,6 +457,9 @@ def init_schema(conn: sqlite3.Connection) -> None:
         CREATE INDEX IF NOT EXISTS idx_pit_universe_time ON pit_universe_snapshots(as_of DESC, ticker);
         CREATE INDEX IF NOT EXISTS idx_audit_events_time ON audit_events(created_at DESC);
         CREATE INDEX IF NOT EXISTS idx_consensus_snapshots_ticker_event ON consensus_snapshots(ticker, event_date DESC);
+        CREATE INDEX IF NOT EXISTS idx_sue_history_ticker_event ON sue_history(ticker, event_date DESC);
+        CREATE INDEX IF NOT EXISTS idx_short_interest_ticker_time ON short_interest_history(ticker, captured_at DESC);
+        CREATE INDEX IF NOT EXISTS idx_analyst_revision_ticker_time ON analyst_revision_history(ticker, captured_at DESC);
         """
     )
     ensure_column(conn, "runs", "slim_json", "TEXT")
@@ -453,6 +490,9 @@ def sync_store(conn: sqlite3.Connection, store: dict[str, Any]) -> dict[str, int
         "pitUniverseSnapshots": 0,
         "auditEvents": 0,
         "consensusSnapshots": 0,
+        "sueHistory": 0,
+        "shortInterestHistory": 0,
+        "analystRevisionHistory": 0,
         "tradeRecommendationReconciliation": 0,
         "userPaperAcceptances": 0,
     }
@@ -1094,6 +1134,94 @@ def sync_store(conn: sqlite3.Connection, store: dict[str, Any]) -> dict[str, int
                 ),
             )
             counts["consensusSnapshots"] += 1
+            conn.execute(
+                """
+                INSERT INTO sue_history(
+                  id, ticker, event_date, captured_at, eps_estimate, revenue_estimate,
+                  actual_eps, actual_revenue, sue_eps, source, json
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(id) DO UPDATE SET
+                  ticker=excluded.ticker,
+                  event_date=excluded.event_date,
+                  captured_at=excluded.captured_at,
+                  eps_estimate=excluded.eps_estimate,
+                  revenue_estimate=excluded.revenue_estimate,
+                  actual_eps=excluded.actual_eps,
+                  actual_revenue=excluded.actual_revenue,
+                  sue_eps=excluded.sue_eps,
+                  source=excluded.source,
+                  json=excluded.json
+                """,
+                (
+                    f"sue:{row_id}",
+                    text(row.get("ticker")),
+                    text(row.get("eventDate")),
+                    text(row.get("capturedAt")),
+                    row.get("epsEstimate"),
+                    row.get("revenueEstimate"),
+                    row.get("actualEps"),
+                    row.get("actualRevenue"),
+                    row.get("sueEps"),
+                    text(row.get("source")),
+                    dump(row),
+                ),
+            )
+            counts["sueHistory"] += 1
+
+        for run in store.get("runs") or []:
+            if not isinstance(run, dict):
+                continue
+            captured_at = text(run.get("completedAt") or run.get("generatedAt") or run.get("startedAt"))
+            for pack in run.get("researchPacks") or []:
+                if not isinstance(pack, dict):
+                    continue
+                ticker = safe_ticker(pack.get("ticker"))
+                if not ticker:
+                    continue
+                summary = pack.get("summary") if isinstance(pack.get("summary"), dict) else {}
+                short_interest = number(
+                    summary.get("shortInterest")
+                    or summary.get("short_interest")
+                    or pack.get("shortInterest")
+                    or pack.get("short_interest")
+                )
+                if short_interest is not None:
+                    row_id = f"short:{ticker}:{captured_at}:{text(pack.get('provider'))}"
+                    conn.execute(
+                        """
+                        INSERT INTO short_interest_history(id, ticker, captured_at, short_interest, source, json)
+                        VALUES (?, ?, ?, ?, ?, ?)
+                        ON CONFLICT(id) DO UPDATE SET
+                          ticker=excluded.ticker,
+                          captured_at=excluded.captured_at,
+                          short_interest=excluded.short_interest,
+                          source=excluded.source,
+                          json=excluded.json
+                        """,
+                        (row_id, ticker, captured_at, short_interest, text(pack.get("provider")), dump(pack)),
+                    )
+                    counts["shortInterestHistory"] += 1
+                upgrades = int(number(summary.get("upgrades") or summary.get("upgradeCount") or 0) or 0)
+                downgrades = int(number(summary.get("downgrades") or summary.get("downgradeCount") or 0) or 0)
+                rating_count = int(number(summary.get("ratingCount") or summary.get("analystCount") or 0) or 0)
+                if upgrades or downgrades or rating_count:
+                    row_id = f"revision:{ticker}:{captured_at}:{text(pack.get('provider'))}"
+                    conn.execute(
+                        """
+                        INSERT INTO analyst_revision_history(id, ticker, captured_at, upgrades, downgrades, rating_count, source, json)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                        ON CONFLICT(id) DO UPDATE SET
+                          ticker=excluded.ticker,
+                          captured_at=excluded.captured_at,
+                          upgrades=excluded.upgrades,
+                          downgrades=excluded.downgrades,
+                          rating_count=excluded.rating_count,
+                          source=excluded.source,
+                          json=excluded.json
+                        """,
+                        (row_id, ticker, captured_at, upgrades, downgrades, rating_count, text(pack.get("provider")), dump(pack)),
+                    )
+                    counts["analystRevisionHistory"] += 1
 
         conn.execute("INSERT OR REPLACE INTO metadata(key, value) VALUES (?, ?)", ("last_sync", dump(counts)))
     return counts
@@ -1117,6 +1245,9 @@ def status(conn: sqlite3.Connection) -> dict[str, Any]:
         "pit_universe_snapshots",
         "audit_events",
         "consensus_snapshots",
+        "sue_history",
+        "short_interest_history",
+        "analyst_revision_history",
         "trade_recommendation_reconciliation",
         "user_paper_acceptances",
     ]:

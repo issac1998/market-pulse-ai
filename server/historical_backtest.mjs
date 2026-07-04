@@ -8,6 +8,7 @@ import {
   learnRecommendationFactorWeights,
   normalizeRecommendationFactorWeights,
   outcomeFromExcess,
+  winsorizeSeries,
 } from "../lib/recommender_core.mjs";
 import { numberOrNull } from "../lib/market_core.mjs";
 
@@ -299,8 +300,10 @@ function periodTable(outcomes = [], primaryHorizon = 20, size = 7) {
 
 function factorStats(outcomes = []) {
   const stats = {};
-  for (const outcome of outcomes.filter((row) => row.outcomeUsable !== false)) {
-    const value = pct(outcome.excessPct);
+  const usable = outcomes.filter((row) => row.outcomeUsable !== false);
+  const clippedReturns = winsorizeSeries(usable.map((row) => row.excessPct), { enabled: true, lowerPct: 1, upperPct: 99 });
+  for (const [outcomeIndex, outcome] of usable.entries()) {
+    const value = pct(clippedReturns.values[outcomeIndex]);
     if (!Number.isFinite(value)) continue;
     for (const [id, factor] of Object.entries(outcome.factorSnapshot?.factors || {})) {
       const score = pct(factor.score);
@@ -331,6 +334,12 @@ function factorStats(outcomes = []) {
     row.ic = correlation(row.scores, row.returns);
     row.hitRate = row.samples ? row.wins / row.samples : null;
     row.source = "historical-backtest";
+    row.winsorization = {
+      enabled: clippedReturns.enabled,
+      lower: clippedReturns.lower,
+      upper: clippedReturns.upper,
+      clipCount: clippedReturns.clipCount,
+    };
     delete row.scores;
     delete row.returns;
   }
@@ -340,9 +349,14 @@ function factorStats(outcomes = []) {
 function factorAnalysis(outcomes = []) {
   const stats = factorStats(outcomes);
   const rows = Object.values(stats);
+  const usable = outcomes.filter((row) => row.outcomeUsable !== false);
+  const factorIds = rows.map((row) => row.id);
+  const valuesByFactor = Object.fromEntries(
+    factorIds.map((id) => [id, usable.map((outcome) => pct(outcome.factorSnapshot?.factors?.[id]?.score))]),
+  );
   const correlationMatrix = rows.map((left) => ({
     factorId: left.id,
-    correlations: Object.fromEntries(rows.map((right) => [right.id, left.id === right.id ? 1 : null])),
+    correlations: Object.fromEntries(rows.map((right) => [right.id, left.id === right.id ? 1 : rankCorrelation(valuesByFactor[left.id] || [], valuesByFactor[right.id] || [])])),
     n: left.samples,
   }));
   return {

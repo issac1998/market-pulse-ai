@@ -452,3 +452,69 @@ $ node scripts/generate_route_inventory.mjs && node scripts/generate_route_inven
 - The WP6 "known restated quarter" proof was implemented as a deterministic fixture: a later filed value is ignored for an earlier `asOf`. I did not identify and verify a real SEC restatement sample in this session.
 - The 13F command currently persists filing-level rows with `status:"filing-level-only"`; it does not yet expand each 13F information table into per-holding shares/value rows. This is recorded explicitly in the bridge output and table JSON.
 - The live watcher has an EDGAR current-filings seam, but no production collector is passed from `server.mjs` yet; it remains disabled by default and test-covered with an injected collector.
+
+## WP7 — Factor Quality Pack
+
+### What Changed
+
+- Added winsorization utilities in `lib/recommender_core.mjs`:
+  - `winsorizeSeries`
+  - `winsorizeFactorSnapshots`
+- Historical backtest factor stats now winsorize outcome returns at 1/99 percentiles and persist per-factor winsorization audit fields.
+- Historical factor analysis now emits a real cross-factor Spearman correlation matrix instead of identity/null placeholders.
+- Enhanced PIT-driven `qualityGrowth` raw inputs with earnings-quality fields:
+  - accruals ratio
+  - cash conversion
+  - partial Piotroski score
+  - approximate Altman Z
+  - dilution trend placeholder from diluted share count
+- Extended EDGAR PIT extraction to include diluted shares.
+- Earnings blackout gate is now pre-earnings only; post-earnings periods are no longer buy-downgrade gates, enabling PEAD-style entries.
+- Added SQLite accrual tables and sync:
+  - `sue_history`
+  - `short_interest_history`
+  - `analyst_revision_history`
+- Consensus snapshots sync into `sue_history`; research packs with short-interest or revision counts sync into their accrual tables without fabricating missing values.
+
+### Files / Functions
+
+- `lib/recommender_core.mjs`: `winsorizeSeries`, `winsorizeFactorSnapshots`.
+- `server/historical_backtest.mjs`: winsorized factor stats and cross-factor correlation matrix.
+- `lib/historical_features.mjs`: accruals, cash conversion, Piotroski partial, Altman Z approximate, dilution trend.
+- `scripts/edgar_pit_bridge.py`: diluted shares XBRL concept extraction.
+- `scripts/sqlite_store_sync.py`: SUE/short-interest/analyst-revision accrual tables and sync.
+- `server.mjs`: pre-only earnings blackout gate.
+- `scripts/core_regression_tests.mjs`: winsorization, correlation matrix, PIT quality fixtures.
+
+### Verification Output
+
+```text
+$ node --check lib/recommender_core.mjs
+$ node --check lib/historical_features.mjs
+$ node --check server/historical_backtest.mjs
+$ node --check server.mjs
+$ node --check scripts/core_regression_tests.mjs
+all passed with no output
+
+$ python3 -m py_compile scripts/sqlite_store_sync.py scripts/edgar_pit_bridge.py scripts/quantstats_bridge.py scripts/alphalens_bridge.py
+passed with no output
+
+$ node scripts/core_regression_tests.mjs
+core_regression_tests: ok
+
+$ python3 scripts/sqlite_store_sync.py --store-json data/store.json --db data/market_pulse.sqlite --status
+{"status":"ok","tables":{"sue_history":0,"short_interest_history":0,"analyst_revision_history":0,...}}
+
+$ python3 scripts/sqlite_store_sync.py --store-json data/store.json --db data/market_pulse.sqlite
+{"status":"ok","synced":{"sueHistory":0,"shortInterestHistory":0,"analystRevisionHistory":0,...}}
+
+$ node scripts/generate_route_inventory.mjs && node scripts/generate_route_inventory.mjs --check
+{"status":"ok","routes":67,"uiFetches":34,"storeKeys":25}
+{"status":"ok","routes":67,"uiFetches":34,"storeKeys":25}
+```
+
+### Contradictions / Blockers
+
+- The new SUE/short-interest/revision accrual tables are wired, but current `store.json` has no `consensusSnapshots` and no research-pack fields matching short-interest/revision counts, so verification row counts are 0.
+- Piotroski F and Altman Z are partial/approximate because Tier-2 PIT fundamentals currently only extract core facts; full ratio fidelity requires more XBRL concepts and period-over-period balance-sheet history.
+- The correlation matrix is computed for historical backtest outcomes; live track-record frontend rendering remains part of WP9.

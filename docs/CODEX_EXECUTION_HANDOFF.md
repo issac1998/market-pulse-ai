@@ -75,7 +75,7 @@ Scope here: W1 watcher + W3 triage + W4 push + W5 move→reason + W6 novelty + W
 - Extend `buildFactorSnapshotAsOf` to use `pit_fundamentals` for qualityGrowth/valuation (Tier 2), enabling those factors in WP4 re-runs.
 - **Verify (the PIT proof)**: for a known restated quarter, `asOf` dates before the restatement return the *originally filed* value; 13F deltas match EDGAR web UI for 2 sampled funds; watcher receives a fresh 8-K within one poll interval.
 
-## ☐ WP7 — Factor quality pack (spec: §2)
+## ☑ WP7 — Factor quality pack (spec: §2)
 
 - Winsorization: clip factor raw inputs and outcome returns at cross-sectional 1/99 percentiles before normalization, in `lib/recommender_core.mjs` (flag-controlled, default on; log clip counts).
 - Cross-factor Spearman correlation matrix per run, persisted, rendered in track-record view; flag |ρ| > 0.6 pairs.

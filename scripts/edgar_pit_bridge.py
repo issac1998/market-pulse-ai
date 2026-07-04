@@ -141,6 +141,7 @@ def extract_facts_from_filing(filing: Any) -> list[dict[str, Any]]:
         "liabilities": ("Liabilities",),
         "equity": ("StockholdersEquity", "StockholdersEquityIncludingPortionAttributableToNoncontrollingInterest"),
         "operating_cash_flow": ("NetCashProvidedByUsedInOperatingActivities",),
+        "shares_diluted": ("WeightedAverageNumberOfDilutedSharesOutstanding", "WeightedAverageDilutedSharesOutstanding"),
     }
     try:
         xbrl = filing.xbrl()

@@ -25,6 +25,8 @@ import {
   pathExcursions,
   scoreRecommendationFromFactorSnapshot,
   stockHistoryPricePath,
+  winsorizeFactorSnapshots,
+  winsorizeSeries,
 } from "../lib/recommender_core.mjs";
 import { storyFingerprint, triageIntradaySignal } from "../lib/alert_triage.mjs";
 import {
@@ -232,6 +234,16 @@ assert.ok(
   learnedWeights.skipped.some((item) => item.factorId === "newsCatalyst" && /最小门槛/.test(item.reason)),
   "Factors below min sample gate should be skipped",
 );
+
+const winsorizedReturns = winsorizeSeries([-1000, 1, 2, 3, 1000], { lowerPct: 1, upperPct: 99 });
+assert.ok(winsorizedReturns.clipCount >= 2, "Winsorization should clip both tails in an extreme-return fixture");
+const winsorizedSnapshots = winsorizeFactorSnapshots([
+  { factors: { momentum: { score: 0 } } },
+  { factors: { momentum: { score: 50 } } },
+  { factors: { momentum: { score: 100 } } },
+]);
+assert.equal(winsorizedSnapshots.schemaVersion, "factor-winsorization-v1", "Factor winsorization should expose a versioned audit payload");
+assert.ok("momentum" in winsorizedSnapshots.clipCounts, "Factor winsorization should report clip counts by factor");
 
 const semiBasket = buildBenchmarkBasket("NVDA", {
   industry: "Semiconductors",
@@ -455,6 +467,14 @@ assert.equal(
   historicalWalkForward.run.weightOutputs.candidateWeights.status,
   "candidate-only",
   "Historical learned weights should remain candidate-only",
+);
+assert.ok(
+  historicalWalkForward.run.factorAnalysis.correlationMatrix.length > 0,
+  "Historical factor analysis should include a cross-factor correlation matrix",
+);
+assert.ok(
+  Object.values(historicalWalkForward.run.factorAnalysis.factorStats).every((row) => row.winsorization?.enabled === true),
+  "Historical factor stats should report winsorization audit fields",
 );
 assert.equal(
   historicalWalkForward.run.provenance.engine,

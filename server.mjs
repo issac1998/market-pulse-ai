@@ -21391,8 +21391,7 @@ function allStockAgentEarningsDate(run = {}, ticker = "") {
 
 function allStockAgentEarningsBlackoutGate(run = {}, ticker = "", skill = {}) {
   const preDays = Math.max(0, Number(skill.settings?.earningsBlackoutDays) || 0);
-  const postDays = Math.max(0, Number(skill.settings?.earningsBlackoutPostDays) || 0);
-  if (!preDays && !postDays) return { blocked: false };
+  if (!preDays) return { blocked: false };
   const dateText = allStockAgentEarningsDate(run, ticker);
   if (!dateText) return { blocked: false };
   const eventMs = new Date(`${String(dateText).slice(0, 10)}T16:00:00Z`).getTime();
@@ -21400,15 +21399,14 @@ function allStockAgentEarningsBlackoutGate(run = {}, ticker = "", skill = {}) {
   if (!Number.isFinite(eventMs) || !Number.isFinite(runMs)) return { blocked: false };
   const daysUntil = (eventMs - runMs) / (24 * 60 * 60 * 1000);
   const inPreWindow = daysUntil >= 0 && daysUntil <= preDays;
-  const inPostWindow = daysUntil < 0 && Math.abs(daysUntil) <= postDays;
-  if (!inPreWindow && !inPostWindow) return { blocked: false };
+  if (!inPreWindow) return { blocked: false };
   return {
     blocked: true,
     gate: {
       id: "earnings_blackout",
       label: "财报黑窗",
       action: "downgrade_research",
-      evidence: `${safeTicker(ticker)} 财报日 ${String(dateText).slice(0, 10)}，${daysUntil >= 0 ? "距离发布" : "发布后"}约 ${formatReportNumber(Math.abs(daysUntil), 1)} 天。`,
+      evidence: `${safeTicker(ticker)} 财报日 ${String(dateText).slice(0, 10)}，距离发布约 ${formatReportNumber(Math.abs(daysUntil), 1)} 天。`,
     },
   };
 }
