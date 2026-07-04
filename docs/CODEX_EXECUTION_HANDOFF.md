@@ -84,7 +84,7 @@ Scope here: W1 watcher + W3 triage + W4 push + W5 move→reason + W6 novelty + W
 - Earnings blackout becomes **pre-earnings only** (remove the post-earnings half of the abs-distance check) so PEAD entries are possible; keep a separate post-gap flag as information, not a gate.
 - **Verify**: unit tests per computed ratio vs hand-checked values for 3 tickers; correlation matrix renders with `n`.
 
-## ☐ WP8 — Phase-2 machinery on historical evidence (D11–D14)
+## ☑ WP8 — Phase-2 machinery on historical evidence (D11–D14)
 
 - Candidate workflow: learned weights (live or WP4-historical) write to a **candidate** `strategy_versions` row (`status:"candidate"`), never directly active. `POST /api/strategy-versions/promote {id}` = human adopt (requires stored validation record: candidate ≥ active on excess AND ≤ on MaxDD in walk-forward); `POST /api/strategy-versions/rollback` restores prior version byte-identically. The in-run auto-application of `learnedWeights` as `activeFactorWeights` is **removed** — active weights always come from the active strategy version.
 - Regime-split evaluation dashboard (track-record page): per horizon × regime metrics with `n` everywhere, live and historical panels separate.

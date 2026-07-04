@@ -518,3 +518,98 @@ $ node scripts/generate_route_inventory.mjs && node scripts/generate_route_inven
 - The new SUE/short-interest/revision accrual tables are wired, but current `store.json` has no `consensusSnapshots` and no research-pack fields matching short-interest/revision counts, so verification row counts are 0.
 - Piotroski F and Altman Z are partial/approximate because Tier-2 PIT fundamentals currently only extract core facts; full ratio fidelity requires more XBRL concepts and period-over-period balance-sheet history.
 - The correlation matrix is computed for historical backtest outcomes; live track-record frontend rendering remains part of WP9.
+
+## WP8 — Phase-2 Machinery on Historical Evidence
+
+### What Changed
+
+- Added a strategy-version governance module that keeps learned factor weights in `candidate` versions until a human promote call succeeds.
+- Removed the in-run auto-application path for `learnedWeights`; live scoring now reads active weights from the active strategy version, with legacy factor weights only as fallback.
+- Live all-stock-agent runs and historical backtests now write mechanical learning outputs as candidate strategy versions rather than active weights.
+- Added validation/promote/rollback workflow:
+  - `POST /api/strategy-versions/validate` appends a validation record to a candidate.
+  - `POST /api/strategy-versions/promote` requires a stored passed validation record.
+  - `POST /api/strategy-versions/rollback` restores the pre-promotion strategy-version snapshot.
+- Added regime-split and live-parity payloads:
+  - `GET /api/recommender/regime-split`
+  - `GET /api/recommender/live-parity`
+  - both are also attached to recommendation track-record payloads.
+- Added disabled-by-default daily shadow debate scheduling behind `AGENT_DEBATE_DAILY_ENABLED=false`.
+- Added `GET /api/agent-debate/shadow-daily` status endpoint. Shadow debate records are narrative/shadow-gate only and do not write factor scores, weights, hard gates, or skill JSON.
+
+### Files / Functions
+
+- `server/strategy_versions.mjs`: strategy version normalization, candidate creation, validation records, promote, rollback, regime-split payload, live-parity payload.
+- `server.mjs`: active strategy weight routing, candidate write path, strategy version APIs, regime/parity APIs, shadow debate status/scheduler.
+- `scripts/core_regression_tests.mjs`: candidate workflow, promote validation gate, rollback fixture, regime split, live parity.
+- `docs/CODEBASE_ROUTE_INVENTORY.md`: regenerated route inventory.
+
+### Verification Output
+
+```text
+$ node --check server.mjs
+$ node --check server/strategy_versions.mjs
+$ node --check scripts/core_regression_tests.mjs
+$ node --check public/app.js
+all passed with no output
+
+$ node scripts/core_regression_tests.mjs
+core_regression_tests: ok
+
+$ node scripts/generate_route_inventory.mjs && node scripts/generate_route_inventory.mjs --check
+{"status":"ok","routes":72,"uiFetches":34,"storeKeys":25}
+{"status":"ok","routes":72,"uiFetches":34,"storeKeys":25}
+
+$ curl -sS http://127.0.0.1:5173/api/strategy-versions
+count=2
+active=all-stock-e07073aab308
+candidates=0
+rollbackAvailable=false
+
+$ curl -sS http://127.0.0.1:5173/api/strategy-versions/validate
+schema=strategy-validation-v1
+active=all-stock-e07073aab308
+candidates=0
+rule="候选权重只在 walk-forward 同时不弱于 active 的超额收益与 MaxDD 后才可人工采纳；validate 只写 validationRecords，promote 才能切 active。"
+
+$ curl -sS -X POST http://127.0.0.1:5173/api/strategy-versions/promote -H 'Content-Type: application/json' -d '{"id":"missing-candidate"}'
+HTTP 404
+{"error":"未找到可提升的 candidate strategy version。"}
+
+$ curl -sS -X POST http://127.0.0.1:5173/api/strategy-versions/rollback
+HTTP 404
+{"error":"没有可用的 strategy version rollback 快照。"}
+
+$ curl -sS http://127.0.0.1:5173/api/recommender/regime-split
+schema=regime-split-evaluation-v1
+live.n=18
+historical.n=0
+live.rows=1
+historical.rows=0
+
+$ curl -sS http://127.0.0.1:5173/api/recommender/live-parity
+schema=live-parity-dashboard-v1
+live.n=90
+historical.n=0
+live.decisionRates.buyRate.n=154
+historical.decisionRates.buyRate.n=0
+
+$ curl -sS http://127.0.0.1:5173/api/agent-debate/shadow-daily
+enabled=false
+topN=5
+invoker=codex-cli
+due=false
+latest=false
+
+$ curl -sS http://127.0.0.1:5173/api/recommendations/track-record
+sampleCount=18
+excludedCount=1
+regimeSplit.panels.live.n=18
+liveParity.panels.live.n=90
+```
+
+### Contradictions / Blockers
+
+- Current production `store.json` has no candidate strategy version after prior runs, so runtime promote/rollback cannot be exercised without mutating production state or running a new learning-producing agent run. The promote/rollback behavior is covered by deterministic regression fixtures instead.
+- Historical panel sample counts are currently 0 because the stored historical backtest corpus has no completed outcomes in the current environment. The payload keeps live and historical panels separate and exposes `n=0` rather than blending sources.
+- `ALL_STOCK_AGENT_APPLY_LEARNED_WEIGHTS=true` is now intentionally ignored for active writes; the factor-weight state records `env_ignored_candidate_workflow_required` if that env is present, because WP8 requires candidate-only learning until promote.

@@ -37,6 +37,18 @@ import {
 import { runIntradayWatcherOnce } from "../server/intraday_watcher.mjs";
 import { runHistoricalWalkForwardFromRows } from "../server/historical_backtest.mjs";
 import { proxyFetchResponse } from "../server/network_fetch.mjs";
+import {
+  activeStrategyVersion,
+  activeStrategyWeights,
+  attachValidationRecord,
+  buildLiveParityPayload,
+  buildPromotionValidationRecord,
+  buildRegimeSplitEvaluationPayload,
+  candidateStrategyVersionFromLearning,
+  promoteStrategyVersion,
+  rollbackStrategyVersions,
+  upsertStrategyVersion,
+} from "../server/strategy_versions.mjs";
 
 function assertApprox(actual, expected, tolerance, message) {
   assert.ok(Math.abs(actual - expected) <= tolerance, `${message}: expected ${expected}, got ${actual}`);
@@ -234,6 +246,70 @@ assert.ok(
   learnedWeights.skipped.some((item) => item.factorId === "newsCatalyst" && /最小门槛/.test(item.reason)),
   "Factors below min sample gate should be skipped",
 );
+
+const activeStrategy = {
+  id: "active-v1",
+  status: "active",
+  weights: { momentum: 0.2, qualityGrowth: 0.2, valuationExpectation: 0.2, earningsRevision: 0.2, newsCatalyst: 0.2 },
+  configHash: "active-hash",
+};
+const candidateStrategy = candidateStrategyVersionFromLearning(learnedWeights, {
+  source: "fixture-live-learning",
+  sourceRunId: "run-1",
+  baseVersion: activeStrategy,
+  fallbackWeights: normalizeRecommendationFactorWeights(),
+});
+assert.equal(candidateStrategy.status, "candidate", "Learned weights should create a candidate strategy version");
+let strategyRows = upsertStrategyVersion([activeStrategy], candidateStrategy);
+assert.equal(activeStrategyVersion(strategyRows).id, "active-v1", "Candidate insertion must not change active strategy version");
+assert.notEqual(
+  activeStrategyWeights(strategyRows).momentum,
+  candidateStrategy.weights.momentum,
+  "Active scoring weights must not read candidate weights before promotion",
+);
+const failedPromotion = promoteStrategyVersion(strategyRows, candidateStrategy.id);
+assert.equal(failedPromotion.ok, false, "Promotion must fail without a passed validation record");
+const passedValidation = buildPromotionValidationRecord(candidateStrategy, activeStrategy, {
+  candidateExcessPct: 3,
+  activeExcessPct: 2,
+  candidateMaxDrawdownPct: -5,
+  activeMaxDrawdownPct: -7,
+  n: 42,
+});
+assert.equal(passedValidation.status, "passed", "Fixture validation should pass excess and MaxDD gates");
+strategyRows = attachValidationRecord(strategyRows, candidateStrategy.id, passedValidation);
+const beforePromotionSnapshot = JSON.parse(JSON.stringify(strategyRows));
+const promoted = promoteStrategyVersion(strategyRows, candidateStrategy.id);
+assert.equal(promoted.ok, true, "Candidate with passed validation can be promoted");
+assert.equal(activeStrategyVersion(promoted.rows).id, candidateStrategy.id, "Promoted candidate should become active");
+const rolledBack = rollbackStrategyVersions(promoted.rows, [{ id: "rollback-1", snapshot: beforePromotionSnapshot }]);
+assert.equal(rolledBack.ok, true, "Rollback fixture should restore previous snapshot");
+assert.deepEqual(rolledBack.rows, beforePromotionSnapshot, "Rollback must restore strategy versions byte-equivalent after normalization");
+
+const splitPayload = buildRegimeSplitEvaluationPayload({
+  liveOutcomes: [
+    { ticker: "AAPL", horizonDays: 20, regime: "risk_on", outcome: "win", excessPct: 2, outcomeQualityStatus: "ok" },
+    { ticker: "MSFT", horizonDays: 20, regime: "risk_on", outcome: "loss", excessPct: -1, outcomeQualityStatus: "ok" },
+  ],
+  historicalRuns: [{
+    outcomes: [{ ticker: "NVDA", horizonDays: 20, regime: "risk_off", outcome: "win", excessPct: 4, outcomeUsable: true }],
+  }],
+});
+assert.equal(splitPayload.panels.live.source, "live-outcomes", "Regime split must keep live panel separate");
+assert.equal(splitPayload.panels.historical.source, "historical-backtest", "Regime split must keep historical panel separate");
+assert.equal(splitPayload.panels.live.rows[0].avgExcessPct.n, 2, "Regime split metrics must carry sample count");
+
+const parityPayload = buildLiveParityPayload({
+  liveRun: {
+    summary: { evaluated: 10, buy: 2, sell: 1, actionableBuy: 1 },
+    evaluations: [{ factorSnapshot: { factors: { momentum: { score: 70 } } }, gates: [{ id: "low_data_quality" }] }],
+    buyCandidates: [{ factorSnapshot: { factors: { momentum: { score: 80 } } } }],
+  },
+  historicalRuns: [{ summary: { evaluated: 20, buy: 2, sell: 0 }, decisions: [{ factorSnapshot: { factors: { momentum: { score: 50 } } } }] }],
+});
+assert.equal(parityPayload.panels.live.decisionRates.buyRate.n, 10, "Live parity decision rate must include n");
+assert.equal(parityPayload.panels.historical.decisionRates.buyRate.n, 20, "Historical parity decision rate must include n");
+assert.ok(parityPayload.panels.live.factorDistributions.momentum.mean.n >= 1, "Live parity factor distribution must include n");
 
 const winsorizedReturns = winsorizeSeries([-1000, 1, 2, 3, 1000], { lowerPct: 1, upperPct: 99 });
 assert.ok(winsorizedReturns.clipCount >= 2, "Winsorization should clip both tails in an extreme-return fixture");

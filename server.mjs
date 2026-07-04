@@ -54,6 +54,19 @@ import {
   historicalBacktestReport,
   runHistoricalWalkForwardFromSqlite,
 } from "./server/historical_backtest.mjs";
+import {
+  activeStrategyVersion,
+  activeStrategyWeights,
+  attachValidationRecord,
+  buildLiveParityPayload,
+  buildPromotionValidationRecord,
+  buildRegimeSplitEvaluationPayload,
+  candidateStrategyVersionFromLearning,
+  normalizeStrategyVersions as normalizeStrategyVersionRows,
+  promoteStrategyVersion,
+  rollbackStrategyVersions,
+  upsertStrategyVersion as upsertStrategyVersionCore,
+} from "./server/strategy_versions.mjs";
 import { runJsonCli as runJsonCliProcess, runTextCli as runTextCliProcess } from "./server/cli_process.mjs";
 import { addressOnly, probeSmtpEmail, sendResendEmail, sendSmtpEmail } from "./server/email_delivery.mjs";
 import { loadEnvFile, parseBoolean, splitList } from "./server/env_utils.mjs";
@@ -1092,6 +1105,10 @@ const ALL_STOCK_AGENT_BACKTEST_DAYS = Math.max(3, Number(process.env.ALL_STOCK_A
 const ALL_STOCK_AGENT_BACKTEST_MAX_DATES = Math.max(3, Number(process.env.ALL_STOCK_AGENT_BACKTEST_MAX_DATES || 20));
 const RECOMMENDER_FACTOR_WEIGHTS = Object.freeze({ ...DEFAULT_RECOMMENDER_FACTOR_WEIGHTS });
 const ALL_STOCK_AGENT_APPLY_LEARNED_WEIGHTS = parseBoolean(process.env.ALL_STOCK_AGENT_APPLY_LEARNED_WEIGHTS, false);
+const AGENT_DEBATE_DAILY_ENABLED = parseBoolean(process.env.AGENT_DEBATE_DAILY_ENABLED, false);
+const AGENT_DEBATE_DAILY_NEW_YORK_TIME = process.env.AGENT_DEBATE_DAILY_NEW_YORK_TIME || "18:15";
+const AGENT_DEBATE_DAILY_TOP_N = Math.max(1, Math.min(10, Number(process.env.AGENT_DEBATE_DAILY_TOP_N || 5)));
+const AGENT_DEBATE_DAILY_INVOKER = process.env.AGENT_DEBATE_DAILY_INVOKER || "";
 const RECOMMENDER_PRIMARY_HORIZON_DAYS = Math.max(1, Number(process.env.RECOMMENDER_PRIMARY_HORIZON_DAYS || 20));
 const ALL_STOCK_AGENT_ACTIONABLE_BUY_LIMIT = Math.max(1, Number(process.env.ALL_STOCK_AGENT_ACTIONABLE_BUY_LIMIT || 3));
 const ALL_STOCK_AGENT_MIN_ACTIONABLE_DQ = Math.max(0, Math.min(100, Number(process.env.ALL_STOCK_AGENT_MIN_ACTIONABLE_DQ || 60)));
@@ -3223,22 +3240,7 @@ function appendAuditEventRecord(db = {}, record = {}) {
 }
 
 function normalizeStrategyVersions(rows = []) {
-  return (Array.isArray(rows) ? rows : [])
-    .filter((row) => row && typeof row === "object" && row.id)
-    .map((row) => ({
-      schemaVersion: "strategy-version-v1",
-      id: String(row.id),
-      strategyType: row.strategyType || "all-stock-agent",
-      configHash: row.configHash || "",
-      activeFrom: row.activeFrom || row.createdAt || row.generatedAt || "",
-      activeTo: row.activeTo || "",
-      changeReason: row.changeReason || "",
-      evaluationSummary: row.evaluationSummary || null,
-      sourceFile: row.sourceFile || "",
-      status: row.status || "active",
-      json: row.json && typeof row.json === "object" ? row.json : null,
-    }))
-    .slice(0, 200);
+  return normalizeStrategyVersionRows(rows);
 }
 
 function normalizeAllStockAgentState(value = {}) {
@@ -3275,6 +3277,8 @@ function normalizeAllStockAgentState(value = {}) {
     factorWeights,
     factorWeightLearning: state.factorWeightLearning && typeof state.factorWeightLearning === "object" ? state.factorWeightLearning : null,
     strategyVersions,
+    strategyVersionRollbackStack: Array.isArray(state.strategyVersionRollbackStack) ? state.strategyVersionRollbackStack.slice(0, 20) : [],
+    shadowDebates: Array.isArray(state.shadowDebates) ? state.shadowDebates.slice(0, 200) : [],
     skillRevisions: skillRevisions.slice(0, 200),
     lastRunAt: state.lastRunAt || "",
     lastSkillAutoUpdateDate: state.lastSkillAutoUpdateDate || "",
@@ -20308,16 +20312,24 @@ function allStockAgentStrategyVersion(skillBundle = {}, skill = null, options = 
     riskGates: normalizedSkill.riskGates,
   });
   return {
-    schemaVersion: "strategy-version-v1",
+    schemaVersion: "strategy-version-v2",
     id: `all-stock-${configHash.slice(0, 12)}`,
     strategyType: "all-stock-agent",
     configHash,
+    createdAt: options.createdAt || options.activeFrom || nowIso(),
     activeFrom: options.activeFrom || nowIso(),
     activeTo: "",
     changeReason: options.changeReason || "skill-json-hash",
     evaluationSummary: options.evaluationSummary || null,
     sourceFile: skillBundle.path || path.relative(__dirname, ALL_STOCK_AGENT_SKILL_FILE),
     status: "active",
+    active: true,
+    weights: normalizeRecommendationFactorWeights(
+      options.weights || normalizedSkill.settings?.factorWeights || RECOMMENDER_FACTOR_WEIGHTS,
+      RECOMMENDER_FACTOR_WEIGHTS,
+    ),
+    validationRecords: [],
+    llmWritable: false,
     json: normalizedSkill,
   };
 }
@@ -20335,13 +20347,7 @@ function strategyVersionHash(value = null) {
 }
 
 function upsertStrategyVersion(rows = [], version = null) {
-  if (!version?.id) return normalizeStrategyVersions(rows);
-  const normalized = normalizeStrategyVersions(rows);
-  const existing = normalized.find((item) => item.id === version.id);
-  if (existing) {
-    return normalized.map((item) => (item.id === version.id ? { ...item, ...version, activeFrom: item.activeFrom || version.activeFrom } : item));
-  }
-  return normalizeStrategyVersions([version, ...normalized]);
+  return upsertStrategyVersionCore(rows, version);
 }
 
 function regimeTagFromRiskScore(riskScore, label = "") {
@@ -21247,8 +21253,10 @@ function buildPortfolioFitScore(ticker = "", ctx = {}, state = {}, run = {}, opt
 }
 
 function allStockAgentCurrentFactorWeights(state = {}) {
+  const normalized = normalizeAllStockAgentState(state);
+  const activeWeights = activeStrategyWeights(normalized.strategyVersions, RECOMMENDER_FACTOR_WEIGHTS);
   return normalizeRecommendationFactorWeights(
-    state.factorWeights?.weights || state.factorWeights || RECOMMENDER_FACTOR_WEIGHTS,
+    activeWeights || normalized.factorWeights?.weights || normalized.factorWeights || RECOMMENDER_FACTOR_WEIGHTS,
     RECOMMENDER_FACTOR_WEIGHTS,
   );
 }
@@ -22949,7 +22957,8 @@ async function runAllStockAgentForRun(db, sourceRun, trigger = "manual", options
   let source = runWithDerivedAnalysisLayers(sourceRun);
   const skillBundle = loadAllStockAgentSkill();
   let skill = skillBundle.skill;
-  let strategyVersion = allStockAgentStrategyVersion(skillBundle, skill);
+  let skillStrategyVersion = allStockAgentStrategyVersion(skillBundle, skill);
+  let strategyVersion = activeStrategyVersion(state.strategyVersions) || skillStrategyVersion;
   const regimeTag = allStockAgentRegimeTagFromRun(source);
   let securityMaster = cachedNasdaqSecurityMasterSync();
   const securityMasterErrors = [];
@@ -22988,10 +22997,7 @@ async function runAllStockAgentForRun(db, sourceRun, trigger = "manual", options
   factorStats = tagFactorStatsWithRegime(factorStats, regimeTag);
   const persistentMemory = buildAllStockAgentPersistentMemory(usableOutcomeSnapshots);
   const factorWeightLearning = buildAllStockAgentFactorWeightLearning(factorStats, currentFactorWeights, skill, factorStatsSource);
-  const activeFactorWeights =
-    ALL_STOCK_AGENT_APPLY_LEARNED_WEIGHTS && factorWeightLearning.status === "updated"
-      ? factorWeightLearning.learnedWeights
-      : currentFactorWeights;
+  const activeFactorWeights = currentFactorWeights;
   const learningLog = buildRecommenderLearningLog(
     {
       samples: usableOutcomeSnapshots.filter((item) => item?.outcome && item.outcome !== "pending").length,
@@ -23003,10 +23009,12 @@ async function runAllStockAgentForRun(db, sourceRun, trigger = "manual", options
   );
   const skillUpdate = await maybeUpdateAllStockAgentSkill(skillBundle, state, ruleStats);
   skill = skillUpdate.skill;
-  strategyVersion = allStockAgentStrategyVersion(skillBundle, skill, {
+  skillStrategyVersion = allStockAgentStrategyVersion(skillBundle, skill, {
     changeReason: skillUpdate.revision ? skillUpdate.revision.summary : "skill-json-hash",
     evaluationSummary: skillUpdate.revision || null,
+    weights: activeFactorWeights,
   });
+  strategyVersion = activeStrategyVersion(state.strategyVersions) || skillStrategyVersion;
   const evaluations = universe
     .map((item) => buildAllStockAgentEvaluation(source, item, state, skill, {
       factorWeights: activeFactorWeights,
@@ -23198,6 +23206,25 @@ async function runAllStockAgentForRun(db, sourceRun, trigger = "manual", options
     ],
     disclaimer: "候选池 Agent 输出为系统化研究和交易计划候选，不是保证收益的自动下单策略；执行前仍需结合仓位、滑点、税费和风险预算。",
   };
+  const factorWeightCandidate = candidateStrategyVersionFromLearning(factorWeightLearning, {
+    source: factorStatsSource,
+    sourceRunId: agentRun.id,
+    baseVersion: strategyVersion,
+    previousWeights: currentFactorWeights,
+    fallbackWeights: RECOMMENDER_FACTOR_WEIGHTS,
+    evaluationSummary: {
+      schemaVersion: "factor-weight-candidate-summary-v1",
+      factorStatsSource,
+      changedFactors: factorWeightLearning.changes?.length || 0,
+      status: factorWeightLearning.status,
+    },
+  });
+  let nextStrategyVersions = activeStrategyVersion(state.strategyVersions)
+    ? normalizeStrategyVersions(state.strategyVersions)
+    : upsertStrategyVersion(state.strategyVersions || [], skillStrategyVersion);
+  if (factorWeightCandidate) {
+    nextStrategyVersions = upsertStrategyVersion(nextStrategyVersions, factorWeightCandidate);
+  }
   const nextState = normalizeAllStockAgentState({
     ...stateWithOutcomes,
     runs: [agentRun, ...(state.runs || [])],
@@ -23211,14 +23238,17 @@ async function runAllStockAgentForRun(db, sourceRun, trigger = "manual", options
       weights: activeFactorWeights,
       previousWeights: currentFactorWeights,
       updatedAt: agentRun.completedAt,
-      source: factorStatsSource,
-      mode: ALL_STOCK_AGENT_APPLY_LEARNED_WEIGHTS ? "learned_weights_applied_by_env" : "shadow_only_until_validation",
+      source: strategyVersion.id || "active-strategy-version",
+      mode: ALL_STOCK_AGENT_APPLY_LEARNED_WEIGHTS
+        ? "env_ignored_candidate_workflow_required"
+        : "active_strategy_version_only",
       candidateWeights: factorWeightLearning.learnedWeights || null,
       lastLearningRunId: agentRun.id,
       lastLearning: factorWeightLearning,
+      candidateStrategyVersionId: factorWeightCandidate?.id || "",
     },
     factorWeightLearning,
-    strategyVersions: upsertStrategyVersion(state.strategyVersions || [], strategyVersion),
+    strategyVersions: nextStrategyVersions,
     skillRevisions: skillUpdate.revision ? [skillUpdate.revision, ...(state.skillRevisions || [])] : state.skillRevisions || [],
     lastRunAt: agentRun.completedAt,
     lastSkillAutoUpdateDate: skillUpdate.reviewDate || state.lastSkillAutoUpdateDate,
@@ -23350,10 +23380,28 @@ function buildRecommendationTrackRecordPayload(db = {}, filters = {}) {
     buckets,
     factorStats: state.runs[0]?.factorStats || {},
     factorWeightLearning: state.factorWeightLearning || null,
+    regimeSplit: buildRecommenderRegimeSplitPayload(db),
+    liveParity: buildRecommenderLiveParityPayload(db),
     paperBook: state.paperBook || null,
     strategyVersions: state.strategyVersions || [],
     note: "所有指标按冻结 outcome 计算；样本数不足时只展示样本，不自动采纳权重。",
   };
+}
+
+function buildRecommenderRegimeSplitPayload(db = {}) {
+  const state = normalizeAllStockAgentState(db.allStockAgent);
+  return buildRegimeSplitEvaluationPayload({
+    liveOutcomes: state.outcomeSnapshots || [],
+    historicalRuns: db.historicalBacktests || [],
+  });
+}
+
+function buildRecommenderLiveParityPayload(db = {}) {
+  const state = normalizeAllStockAgentState(db.allStockAgent);
+  return buildLiveParityPayload({
+    liveRun: state.runs?.[0] || {},
+    historicalRuns: db.historicalBacktests || [],
+  });
 }
 
 function buildTodayRecommendationsPayload(db = {}) {
@@ -23545,10 +23593,13 @@ function buildStrategyValidationPayload(db = {}) {
   const learning = state.factorWeightLearning || latest.factorWeightLearning || null;
   const factorStats = latest.factorStats || {};
   const eligibleFactors = Object.values(factorStats).filter((row) => Number(row.samples || 0) >= 50);
+  const active = activeStrategyVersion(state.strategyVersions) || latest.skill?.strategyVersion || null;
+  const candidates = (state.strategyVersions || []).filter((row) => row.status === "candidate");
   return {
     schemaVersion: "strategy-validation-v1",
     generatedAt: nowIso(),
-    activeVersion: state.strategyVersions?.[0] || latest.skill?.strategyVersion || null,
+    activeVersion: active,
+    candidates,
     candidate: learning?.learnedWeights ? {
       sourceRunId: latest.id || "",
       learnedWeights: learning.learnedWeights,
@@ -23559,7 +23610,8 @@ function buildStrategyValidationPayload(db = {}) {
       status: eligibleFactors.length ? "ready_for_walk_forward" : "shadow_only",
       eligibleFactorCount: eligibleFactors.length,
       minSamplesPerFactor: 50,
-      rule: "候选权重只在 walk-forward 同时不弱于 active 的超额收益与 MaxDD 后才可人工采纳；本接口不自动修改 skill。",
+      candidateCount: candidates.length,
+      rule: "候选权重只在 walk-forward 同时不弱于 active 的超额收益与 MaxDD 后才可人工采纳；validate 只写 validationRecords，promote 才能切 active。",
     },
   };
 }
@@ -37297,6 +37349,12 @@ function configForClient(db) {
       skillFile: path.relative(__dirname, ALL_STOCK_AGENT_SKILL_FILE),
       buyLimit: ALL_STOCK_AGENT_BUY_LIMIT,
       universeLimit: ALL_STOCK_AGENT_UNIVERSE_LIMIT,
+      shadowDebateDaily: {
+        enabled: AGENT_DEBATE_DAILY_ENABLED,
+        newYorkTime: AGENT_DEBATE_DAILY_NEW_YORK_TIME,
+        topN: AGENT_DEBATE_DAILY_TOP_N,
+        invoker: normalizeHarnessInvoker(AGENT_DEBATE_DAILY_INVOKER),
+      },
       prefetch: {
         enabled: ALL_STOCK_AGENT_PREFETCH_ENABLED,
         technicalLimit: ALL_STOCK_AGENT_TECHNICAL_PREFETCH_LIMIT,
@@ -37370,6 +37428,107 @@ async function runAgentHarnessDebate(ticker, invokerPreference = "") {
   debate.source = debate.source || `python-agent-harness:${invoker}`;
   debate.invoker = debate.invoker || invoker;
   return { debate, invoker, stdoutChars: result.stdout.length, stderr: result.stderr || "" };
+}
+
+function parseNewYorkClock(value = "") {
+  const match = String(value || "").trim().match(/^(\d{1,2}):(\d{2})$/);
+  if (!match) return { hour: 18, minute: 15 };
+  return {
+    hour: Math.max(0, Math.min(23, Number(match[1]))),
+    minute: Math.max(0, Math.min(59, Number(match[2]))),
+  };
+}
+
+function dueShadowDebateDaily(date = new Date(), scheduleLog = {}) {
+  if (!AGENT_DEBATE_DAILY_ENABLED || !isNyseTradingDate(date)) return null;
+  const target = parseNewYorkClock(AGENT_DEBATE_DAILY_NEW_YORK_TIME);
+  const parts = getNewYorkParts(date);
+  const nowMinute = parts.hour * 60 + parts.minute;
+  const targetMinute = target.hour * 60 + target.minute;
+  const key = `${parts.ymd}:agent-debate-shadow`;
+  if (scheduleLog[key]) return null;
+  if (nowMinute < targetMinute || nowMinute - targetMinute > SCHEDULE_CATCH_UP_MINUTES) return null;
+  return {
+    key,
+    newYorkDate: parts.ymd,
+    newYorkTime: `${String(target.hour).padStart(2, "0")}:${String(target.minute).padStart(2, "0")}`,
+  };
+}
+
+function topShadowDebateCandidates(db = {}, limit = AGENT_DEBATE_DAILY_TOP_N) {
+  const state = normalizeAllStockAgentState(db.allStockAgent);
+  const latest = state.runs[0] || {};
+  const rows = [
+    ...(latest.buyCandidates || []),
+    ...(latest.watchBuyCandidates || []),
+    ...(latest.evaluations || []).filter((item) => item.buyEligible || item.trackingEligible),
+  ];
+  const seen = new Set();
+  return rows
+    .filter((item) => {
+      const ticker = safeTicker(item.ticker);
+      if (!ticker || seen.has(ticker)) return false;
+      seen.add(ticker);
+      return true;
+    })
+    .sort((a, b) => (Number(b.actionScore || 0) - Number(a.actionScore || 0)) || (Number(b.buyScore || 0) - Number(a.buyScore || 0)))
+    .slice(0, Math.max(1, limit));
+}
+
+async function maybeRunDailyShadowDebates() {
+  const db = await ensureStore();
+  const due = dueShadowDebateDaily(new Date(), db.scheduleLog || {});
+  if (!due) return { status: AGENT_DEBATE_DAILY_ENABLED ? "not_due" : "disabled" };
+  const candidates = topShadowDebateCandidates(db, AGENT_DEBATE_DAILY_TOP_N);
+  const state = normalizeAllStockAgentState(db.allStockAgent);
+  const results = [];
+  for (const candidate of candidates) {
+    const ticker = safeTicker(candidate.ticker);
+    try {
+      const harness = await runAgentHarnessDebate(ticker, AGENT_DEBATE_DAILY_INVOKER);
+      const ingest = ingestAgentDebateIntoRun(db, { ticker, debate: harness.debate, runId: state.runs[0]?.sourceRunId }, {
+        safeTicker,
+        latestRun,
+        cloneValue: cloneStoreValue,
+        nowIso,
+      });
+      results.push({
+        ticker,
+        status: ingest.error ? "ingest_failed" : "ok",
+        error: ingest.error || "",
+        invoker: harness.invoker,
+        finalDecision: harness.debate.finalDecision || null,
+      });
+    } catch (error) {
+      results.push({ ticker, status: "failed", error: errorZh(error.message), invoker: normalizeHarnessInvoker(AGENT_DEBATE_DAILY_INVOKER) });
+    }
+  }
+  const record = {
+    schemaVersion: "agent-debate-shadow-daily-v1",
+    id: compactId("debate-shadow"),
+    generatedAt: nowIso(),
+    scheduleKey: due.key,
+    enabled: true,
+    topN: AGENT_DEBATE_DAILY_TOP_N,
+    invoker: normalizeHarnessInvoker(AGENT_DEBATE_DAILY_INVOKER),
+    candidates: candidates.map((item) => safeTicker(item.ticker)).filter(Boolean),
+    results,
+    note: "Shadow debate results are narrative/shadow gates only; they do not write factor scores, weights, hard gates, or skill JSON.",
+  };
+  db.allStockAgent = normalizeAllStockAgentState({
+    ...normalizeAllStockAgentState(db.allStockAgent),
+    shadowDebates: [record, ...(state.shadowDebates || [])].slice(0, 200),
+  });
+  db.scheduleLog[due.key] = record.id;
+  appendAuditEvent(db, "agent_debate.shadow_daily", {
+    scheduleKey: due.key,
+    candidates: record.candidates,
+    ok: results.filter((item) => item.status === "ok").length,
+    failed: results.filter((item) => item.status !== "ok").length,
+    llmBoundary: "narrative-shadow-only",
+  }, results.some((item) => item.status === "ok") ? "ok" : "warn");
+  await saveStore(db);
+  return { status: "ok", record };
 }
 
 async function handleApi(req, res, url) {
@@ -37448,6 +37607,22 @@ async function handleApi(req, res, url) {
     } catch (error) {
       return sendJson(res, { error: errorZh(error.message) }, 502);
     }
+  }
+
+  if (req.method === "GET" && url.pathname === "/api/agent-debate/shadow-daily") {
+    const db = await ensureStore();
+    const state = normalizeAllStockAgentState(db.allStockAgent);
+    return sendJson(res, {
+      shadowDaily: {
+        schemaVersion: "agent-debate-shadow-daily-status-v1",
+        enabled: AGENT_DEBATE_DAILY_ENABLED,
+        newYorkTime: AGENT_DEBATE_DAILY_NEW_YORK_TIME,
+        topN: AGENT_DEBATE_DAILY_TOP_N,
+        invoker: normalizeHarnessInvoker(AGENT_DEBATE_DAILY_INVOKER),
+        due: dueShadowDebateDaily(new Date(), db.scheduleLog || {}),
+        latest: state.shadowDebates?.[0] || null,
+      },
+    });
   }
 
   if (req.method === "GET" && url.pathname === "/api/all-stock-agent") {
@@ -37529,6 +37704,51 @@ async function handleApi(req, res, url) {
       });
       const db = await ensureStore();
       db.historicalBacktests = [result.run, ...(db.historicalBacktests || []).filter((item) => item.id !== result.run.id)].slice(0, 50);
+      const agentState = normalizeAllStockAgentState(db.allStockAgent);
+      const skillBundle = loadAllStockAgentSkill();
+      const skillVersion = allStockAgentStrategyVersion(skillBundle, skillBundle.skill, {
+        changeReason: "historical-backtest-baseline",
+        weights: allStockAgentCurrentFactorWeights(agentState),
+      });
+      let strategyVersions = activeStrategyVersion(agentState.strategyVersions)
+        ? normalizeStrategyVersions(agentState.strategyVersions)
+        : upsertStrategyVersion(agentState.strategyVersions, skillVersion);
+      const activeVersion = activeStrategyVersion(strategyVersions) || skillVersion;
+      const historicalCandidate = candidateStrategyVersionFromLearning(result.run.weightOutputs?.candidateWeights, {
+        source: "historical-backtest",
+        sourceRunId: result.run.id,
+        baseVersion: activeVersion,
+        previousWeights: result.run.factorWeights || activeVersion.weights || RECOMMENDER_FACTOR_WEIGHTS,
+        fallbackWeights: RECOMMENDER_FACTOR_WEIGHTS,
+        evaluationSummary: {
+          schemaVersion: "historical-backtest-candidate-summary-v1",
+          runId: result.run.id,
+          status: result.run.status,
+          sampleCount: result.run.metrics?.sampleCount || 0,
+          primaryHorizon: result.run.metrics?.primaryHorizon || null,
+          candidateMetrics: {
+            excessVsSpy: result.run.metrics?.excessVsSpy || null,
+            maxDrawdown: result.run.metrics?.maxDrawdown || null,
+          },
+        },
+      });
+      if (historicalCandidate) {
+        const validationRecord = buildPromotionValidationRecord(historicalCandidate, activeVersion, {
+          source: "historical-backtest",
+          candidateExcessPct: result.run.metrics?.excessVsSpy,
+          candidateMaxDrawdownPct: result.run.metrics?.maxDrawdown,
+          activeExcessPct: body.activeExcessPct ?? body.activeAvgExcessPct,
+          activeMaxDrawdownPct: body.activeMaxDrawdownPct ?? body.activeMaxDDPct,
+          n: result.run.metrics?.sampleCount || 0,
+        });
+        historicalCandidate.validationRecords = [validationRecord];
+        historicalCandidate.validationStatus = validationRecord.status;
+        strategyVersions = upsertStrategyVersion(strategyVersions, historicalCandidate);
+        db.allStockAgent = normalizeAllStockAgentState({
+          ...agentState,
+          strategyVersions,
+        });
+      }
       appendAuditEventRecord(db, {
         eventType: "historical_backtest.run",
         severity: result.run.status === "ok" ? "info" : "warn",
@@ -37539,6 +37759,8 @@ async function handleApi(req, res, url) {
           outcomes: result.run.outcomes?.length || 0,
           sampleCount: result.run.metrics?.sampleCount || 0,
           source: "historical-backtest",
+          candidateStrategyVersionId: historicalCandidate?.id || "",
+          candidateValidationStatus: historicalCandidate?.validationStatus || "",
         },
       });
       await saveStore(db);
@@ -37573,6 +37795,16 @@ async function handleApi(req, res, url) {
         regime: url.searchParams.get("regime"),
       }),
     });
+  }
+
+  if (req.method === "GET" && url.pathname === "/api/recommender/regime-split") {
+    const db = await ensureStore();
+    return sendJson(res, { regimeSplit: buildRecommenderRegimeSplitPayload(db) });
+  }
+
+  if (req.method === "GET" && url.pathname === "/api/recommender/live-parity") {
+    const db = await ensureStore();
+    return sendJson(res, { liveParity: buildRecommenderLiveParityPayload(db) });
   }
 
   if ((req.method === "GET" || req.method === "POST") && url.pathname === "/api/stocks/deep-dive") {
@@ -37638,13 +37870,112 @@ async function handleApi(req, res, url) {
     const state = normalizeAllStockAgentState(db.allStockAgent);
     return sendJson(res, {
       strategyVersions: state.strategyVersions,
-      active: state.strategyVersions?.[0] || state.runs?.[0]?.skill?.strategyVersion || null,
+      active: activeStrategyVersion(state.strategyVersions) || state.runs?.[0]?.skill?.strategyVersion || null,
+      rollbackAvailable: Boolean(state.strategyVersionRollbackStack?.length),
     });
   }
 
   if ((req.method === "GET" || req.method === "POST") && url.pathname === "/api/strategy-versions/validate") {
     const db = await ensureStore();
-    return sendJson(res, { validation: buildStrategyValidationPayload(db) });
+    if (req.method === "GET") return sendJson(res, { validation: buildStrategyValidationPayload(db) });
+    const body = await readBody(req).catch((error) => ({ __readError: error.message }));
+    if (body.__readError) return sendJson(res, { error: body.__readError }, 400);
+    const state = normalizeAllStockAgentState(db.allStockAgent);
+    const candidateId = normalizeDisplayText(body.id || body.candidateId || "");
+    const candidate = (state.strategyVersions || []).find((row) => row.id === candidateId && row.status === "candidate");
+    if (!candidate) return sendJson(res, { error: "未找到 candidate strategy version。" }, 404);
+    const active = activeStrategyVersion(state.strategyVersions);
+    const validationRecord = buildPromotionValidationRecord(candidate, active, {
+      ...body,
+      source: body.source || "manual-walk-forward-validation",
+    });
+    const strategyVersions = attachValidationRecord(state.strategyVersions, candidate.id, validationRecord);
+    db.allStockAgent = normalizeAllStockAgentState({ ...state, strategyVersions });
+    appendAuditEvent(db, "strategy_version.validate", {
+      candidateId: candidate.id,
+      activeId: active?.id || "",
+      status: validationRecord.status,
+      passed: validationRecord.passed,
+      n: validationRecord.n,
+    }, validationRecord.passed ? "ok" : "warn");
+    await saveStore(db);
+    return sendJson(res, { validation: buildStrategyValidationPayload(db), record: validationRecord });
+  }
+
+  if (req.method === "POST" && url.pathname === "/api/strategy-versions/promote") {
+    const body = await readBody(req).catch((error) => ({ __readError: error.message }));
+    if (body.__readError) return sendJson(res, { error: body.__readError }, 400);
+    const candidateId = normalizeDisplayText(body.id || body.candidateId || "");
+    const db = await ensureStore();
+    const state = normalizeAllStockAgentState(db.allStockAgent);
+    const snapshot = cloneStoreValue(state.strategyVersions || []);
+    const promoted = promoteStrategyVersion(state.strategyVersions, candidateId, { promotedAt: nowIso(), promotedBy: "human" });
+    if (!promoted.ok) {
+      return sendJson(res, {
+        error: promoted.error === "validation_required"
+          ? "候选版本缺少通过的 walk-forward validation record，不能提升为 active。"
+          : "未找到可提升的 candidate strategy version。",
+      }, promoted.error === "validation_required" ? 409 : 404);
+    }
+    const rollbackEntry = {
+      id: compactId("strategy-rollback"),
+      createdAt: nowIso(),
+      reason: "pre-promotion-byte-identical-snapshot",
+      promotedCandidateId: candidateId,
+      snapshot,
+    };
+    db.allStockAgent = normalizeAllStockAgentState({
+      ...state,
+      strategyVersions: promoted.rows,
+      strategyVersionRollbackStack: [rollbackEntry, ...(state.strategyVersionRollbackStack || [])].slice(0, 20),
+      factorWeights: {
+        ...(state.factorWeights || {}),
+        weights: activeStrategyWeights(promoted.rows, RECOMMENDER_FACTOR_WEIGHTS),
+        source: candidateId,
+        mode: "active_strategy_version_only",
+        updatedAt: nowIso(),
+      },
+    });
+    appendAuditEvent(db, "strategy_version.promote", {
+      candidateId,
+      previousActiveId: promoted.previousActive?.id || "",
+      validationId: promoted.validationRecord?.id || "",
+    });
+    await saveStore(db);
+    return sendJson(res, {
+      strategyVersions: db.allStockAgent.strategyVersions,
+      active: activeStrategyVersion(db.allStockAgent.strategyVersions),
+      rollbackAvailable: true,
+    });
+  }
+
+  if (req.method === "POST" && url.pathname === "/api/strategy-versions/rollback") {
+    const db = await ensureStore();
+    const state = normalizeAllStockAgentState(db.allStockAgent);
+    const rolledBack = rollbackStrategyVersions(state.strategyVersions, state.strategyVersionRollbackStack);
+    if (!rolledBack.ok) return sendJson(res, { error: "没有可用的 strategy version rollback 快照。" }, 404);
+    db.allStockAgent = normalizeAllStockAgentState({
+      ...state,
+      strategyVersions: rolledBack.rows,
+      strategyVersionRollbackStack: rolledBack.rollbackStack,
+      factorWeights: {
+        ...(state.factorWeights || {}),
+        weights: activeStrategyWeights(rolledBack.rows, RECOMMENDER_FACTOR_WEIGHTS),
+        source: activeStrategyVersion(rolledBack.rows)?.id || "",
+        mode: "active_strategy_version_only",
+        updatedAt: nowIso(),
+      },
+    });
+    appendAuditEvent(db, "strategy_version.rollback", {
+      restoredSnapshotId: rolledBack.restoredSnapshotId,
+      activeId: activeStrategyVersion(rolledBack.rows)?.id || "",
+    });
+    await saveStore(db);
+    return sendJson(res, {
+      strategyVersions: db.allStockAgent.strategyVersions,
+      active: activeStrategyVersion(db.allStockAgent.strategyVersions),
+      rollbackAvailable: Boolean(db.allStockAgent.strategyVersionRollbackStack?.length),
+    });
   }
 
   if (req.method === "GET" && url.pathname === "/api/lessons/relevant") {
@@ -39471,6 +39802,14 @@ if (INTRADAY_WATCHER_CONFIG.enabled) {
       console.error("Intraday watcher scheduled run failed:", error);
     });
   }, INTRADAY_WATCHER_CONFIG.intervalMs).unref?.();
+}
+
+if (AGENT_DEBATE_DAILY_ENABLED) {
+  setInterval(() => {
+    maybeRunDailyShadowDebates().catch((error) => {
+      console.error("Daily shadow debate failed:", error);
+    });
+  }, 60_000).unref?.();
 }
 
 setInterval(() => {
