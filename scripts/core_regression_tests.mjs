@@ -26,6 +26,8 @@ import {
   scoreRecommendationFromFactorSnapshot,
   stockHistoryPricePath,
 } from "../lib/recommender_core.mjs";
+import { storyFingerprint, triageIntradaySignal } from "../lib/alert_triage.mjs";
+import { runIntradayWatcherOnce } from "../server/intraday_watcher.mjs";
 import { proxyFetchResponse } from "../server/network_fetch.mjs";
 
 function assertApprox(actual, expected, tolerance, message) {
@@ -286,5 +288,89 @@ assert.equal(buyExcursions.mfePct, 8, "Buy MFE should capture maximum favorable 
 const sellExcursions = pathExcursions(pricePath, 100, "卖出");
 assert.equal(sellExcursions.maePct, -8, "Sell MAE should invert unfavorable upside move");
 assert.equal(sellExcursions.mfePct, 4, "Sell MFE should treat price decline as favorable");
+
+const intradayTriage = triageIntradaySignal(
+  {
+    ticker: "NVDA",
+    movePercent: 5.2,
+    moveZ: 3.1,
+    volumePace: 3.4,
+    headline: "NVDA files 8-K and raises guidance after data-center demand update",
+    membership: ["watchlist", "today_candidate"],
+  },
+  { existingAlerts: [], now: "2026-07-01T15:00:00.000Z" },
+);
+assert.equal(intradayTriage.llmCriticalPath, false, "Intraday triage must not call or depend on LLM output");
+assert.ok(["high", "critical"].includes(intradayTriage.severity), "Large move + guidance keyword should triage as high priority");
+assert.equal(intradayTriage.catalystClass, "guidance", "Guidance headline should be classified as guidance catalyst");
+const repeatedTriage = triageIntradaySignal(
+  {
+    ticker: "NVDA",
+    movePercent: 4.1,
+    headline: "NVDA files 8-K and raises guidance after data-center demand update",
+  },
+  {
+    existingAlerts: [{ storyFingerprint: intradayTriage.storyFingerprint, createdAt: "2026-07-01T14:55:00.000Z" }],
+    now: "2026-07-01T15:00:00.000Z",
+  },
+);
+assert.equal(repeatedTriage.novelty, "update", "Matching story fingerprint inside lookback should become an update");
+assert.equal(
+  storyFingerprint({ ticker: "NVDA", headline: "NVDA files 8-K and raises guidance after data-center demand update", catalystClass: "guidance" }),
+  intradayTriage.storyFingerprint,
+  "Story fingerprint should be stable for the same ticker/headline/catalyst",
+);
+
+const disabledWatcher = await runIntradayWatcherOnce({ db: { watchlist: ["NVDA"] } }, { config: { enabled: false } });
+assert.equal(disabledWatcher.status, "disabled", "Intraday watcher must default to disabled");
+
+const watcherDb = {
+  watchlist: ["MU"],
+  alerts: [],
+  allStockAgent: { runs: [{ buyCandidates: [{ ticker: "NVDA" }] }], decisions: [] },
+  consensusSnapshots: [],
+};
+const watcherRun = await runIntradayWatcherOnce(
+  {
+    db: watcherDb,
+    latestRun: {
+      eventCalendar: { earnings: [{ ticker: "MU", date: "2026-07-02" }] },
+      researchPacks: [{ ticker: "MU", provider: "fixture-research", summary: { epsEstimate: 1.23, revenueEstimate: 9000 } }],
+      alerts: [],
+    },
+    collectQuotes: async () => ({
+      quotes: [{ ticker: "MU", price: 100, previousClose: 95, volume: 4000000, timestamp: "2026-07-01T15:00:00.000Z" }],
+      errors: [],
+    }),
+    collectTechnicalData: async () => ({
+      technicals: [{
+        ticker: "MU",
+        latestClose: 100,
+        atr14: 1.8,
+        chart: Array.from({ length: 20 }, (_, index) => ({ close: 90 + index, volume: 1000000 })),
+        keyLevels: { week52High: 99 },
+      }],
+      errors: [],
+    }),
+  },
+  {
+    force: true,
+    now: "2026-07-01T15:00:00.000Z",
+    config: { enabled: true, universeLimit: 10, push: { enabled: false, provider: "", target: "", minSeverity: "high", cooldownMs: 0 } },
+    simulatedSignals: [{
+      ticker: "NVDA",
+      movePercent: 5,
+      moveZ: 3,
+      headline: "NVDA 8-K guidance update",
+      source: "fixture-filing",
+      membership: ["today_candidate"],
+    }],
+  },
+);
+assert.equal(watcherRun.status, "ok", "Forced watcher fixture should run");
+assert.ok(watcherRun.alerts.length >= 1, "Forced watcher fixture should create alerts");
+assert.ok(watcherRun.auditEvents.every((event) => event.payload?.llmCriticalPath === false || event.eventType === "intraday_watcher.consensus_snapshot"), "Watcher critical path audit should be LLM-free");
+assert.equal(watcherRun.consensusSnapshots.length, 1, "Day-before earnings should snapshot consensus data");
+assert.equal(watcherRun.consensusSnapshots[0].epsEstimate, 1.23, "Consensus snapshot should persist EPS estimate");
 
 console.log("core_regression_tests: ok");

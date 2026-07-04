@@ -33,7 +33,7 @@
 
 **Verify**: agent run with >3 buyEligible names logs >3 decisions with actionable flags; `SELECT COUNT(*) FROM options_snapshots WHERE iv_atm IS NOT NULL` > 0 for the new run; `/api/recommendations/today` shows ≤3 actionable + downgraded names in research + `excludedCount` in trackRecord; the GDC outcome row is `suspect_price`.
 
-## ☐ WP2 — Intraday watcher fast lane (spec: CAPABILITY_GAPS §1)
+## ☑ WP2 — Intraday watcher fast lane (spec: CAPABILITY_GAPS §1)
 
 Scope here: W1 watcher + W3 triage + W4 push + W5 move→reason + W6 novelty + W7 anticipation calendar. (W2 real-time EDGAR lands in WP6 via edgartools — do not hand-roll it here.)
 - `server/intraday_watcher.mjs`: loop during NYSE regular+extended hours, `INTRADAY_WATCHER_INTERVAL_MS` (default 120000), universe = watchlist + open positions + today's candidates (cap ~100). Signals: |move| vs ATR(14) z-score (gap vs drift separately), volume pace vs same-time-of-day 20-day baseline, spread blowout/stale quote, 52-week crossing. Fingerprint-dedup into existing `alerts` + one `audit_events` row per firing.

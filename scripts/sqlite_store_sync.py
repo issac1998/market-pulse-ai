@@ -369,6 +369,18 @@ def init_schema(conn: sqlite3.Connection) -> None:
           payload_json TEXT NOT NULL
         );
 
+        CREATE TABLE IF NOT EXISTS consensus_snapshots (
+          id TEXT PRIMARY KEY,
+          ticker TEXT,
+          event_date TEXT,
+          captured_at TEXT,
+          eps_estimate REAL,
+          revenue_estimate REAL,
+          source TEXT,
+          status TEXT,
+          json TEXT NOT NULL
+        );
+
         CREATE TABLE IF NOT EXISTS trade_recommendation_reconciliation (
           id TEXT PRIMARY KEY,
           trade_id TEXT,
@@ -410,6 +422,7 @@ def init_schema(conn: sqlite3.Connection) -> None:
         CREATE INDEX IF NOT EXISTS idx_options_snapshots_ticker_time ON options_snapshots(ticker, as_of DESC);
         CREATE INDEX IF NOT EXISTS idx_pit_universe_time ON pit_universe_snapshots(as_of DESC, ticker);
         CREATE INDEX IF NOT EXISTS idx_audit_events_time ON audit_events(created_at DESC);
+        CREATE INDEX IF NOT EXISTS idx_consensus_snapshots_ticker_event ON consensus_snapshots(ticker, event_date DESC);
         """
     )
     ensure_column(conn, "runs", "slim_json", "TEXT")
@@ -439,6 +452,7 @@ def sync_store(conn: sqlite3.Connection, store: dict[str, Any]) -> dict[str, int
         "optionsSnapshots": 0,
         "pitUniverseSnapshots": 0,
         "auditEvents": 0,
+        "consensusSnapshots": 0,
         "tradeRecommendationReconciliation": 0,
         "userPaperAcceptances": 0,
     }
@@ -1046,6 +1060,41 @@ def sync_store(conn: sqlite3.Connection, store: dict[str, Any]) -> dict[str, int
             )
             counts["auditEvents"] += 1
 
+        for row in store.get("consensusSnapshots") or []:
+            if not isinstance(row, dict):
+                continue
+            row_id = text(row.get("id") or f"{row.get('ticker','')}:{row.get('eventDate','')}:{row.get('capturedAt','')}")
+            if not row_id:
+                continue
+            conn.execute(
+                """
+                INSERT INTO consensus_snapshots(
+                  id, ticker, event_date, captured_at, eps_estimate, revenue_estimate, source, status, json
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(id) DO UPDATE SET
+                  ticker=excluded.ticker,
+                  event_date=excluded.event_date,
+                  captured_at=excluded.captured_at,
+                  eps_estimate=excluded.eps_estimate,
+                  revenue_estimate=excluded.revenue_estimate,
+                  source=excluded.source,
+                  status=excluded.status,
+                  json=excluded.json
+                """,
+                (
+                    row_id,
+                    text(row.get("ticker")),
+                    text(row.get("eventDate")),
+                    text(row.get("capturedAt")),
+                    row.get("epsEstimate"),
+                    row.get("revenueEstimate"),
+                    text(row.get("source")),
+                    text(row.get("status")),
+                    dump(row),
+                ),
+            )
+            counts["consensusSnapshots"] += 1
+
         conn.execute("INSERT OR REPLACE INTO metadata(key, value) VALUES (?, ?)", ("last_sync", dump(counts)))
     return counts
 
@@ -1067,6 +1116,7 @@ def status(conn: sqlite3.Connection) -> dict[str, Any]:
         "options_snapshots",
         "pit_universe_snapshots",
         "audit_events",
+        "consensus_snapshots",
         "trade_recommendation_reconciliation",
         "user_paper_acceptances",
     ]:

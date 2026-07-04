@@ -131,3 +131,62 @@ trackRecord.excludedCount=1
 
 - The WP1 live verification item "agent run with >3 buyEligible names logs >3 decisions with actionable flags" could not be completed in this session: `POST /api/all-stock-agent/run` remained open for more than 5 minutes while the server stayed responsive to other endpoints. I stopped only that verification request and did not substitute a mock result.
 - Current `/api/recommendations/today` verifies the display split and `excludedCount`, but the latest stored run has zero actionable calls due to existing gates, so it does not prove a live `>3 buyEligible` distribution.
+
+## WP2 — Intraday Watcher Fast Lane
+
+### What Changed
+
+- Added `server/intraday_watcher.mjs` with disabled-by-default NYSE regular+extended-hours watcher config, universe builder, signal builder, static anticipation calendar, consensus snapshot builder, and a re-entrant `runIntradayWatcherOnce` test seam.
+- Added `lib/alert_triage.mjs` as a pure no-LLM triage layer: bilingual catalyst keyword classes, severity scoring, stable story fingerprints, and novelty update detection.
+- Added `server/push_delivery.mjs` with Bark / Telegram / ntfy delivery, severity threshold, and per-ticker cooldown. Email delivery was untouched.
+- Added `GET|POST /api/intraday/explain?ticker=...`: returns quote plus latest cached alerts/news/filings/social context immediately and queues asynchronous LLM enrichment into `intradayExplain`. LLM output only writes narrative fields (`llmSummary`, `llmStatus`) and never writes factor scores, gates, weights, or skill JSON.
+- Added append-only store keys: `intradayWatcher`, `pushDeliveryState`, `intradayExplain`, and `consensusSnapshots`.
+- Added SQLite mirror table `consensus_snapshots` and route inventory regeneration.
+
+### Files / Functions
+
+- `server/intraday_watcher.mjs`: `runIntradayWatcherOnce`, `buildIntradayUniverse`, `buildIntradaySignals`, `buildConsensusSnapshots`.
+- `lib/alert_triage.mjs`: `triageIntradaySignal`, `storyFingerprint`, `noveltyForFingerprint`.
+- `server/push_delivery.mjs`: `normalizePushConfig`, `deliverPushNotification`.
+- `server.mjs`: watcher env config, store keys, `runIntradayWatcherAndSave`, `/api/intraday/explain`, disabled-by-default interval startup.
+- `scripts/sqlite_store_sync.py`: `consensus_snapshots` schema and sync.
+- `scripts/core_regression_tests.mjs`: triage, novelty, disabled watcher, simulated alert, and consensus snapshot fixtures.
+- `docs/CODEBASE_ROUTE_INVENTORY.md`: regenerated for `/api/intraday/explain` and new store keys.
+
+### Verification Output
+
+```text
+$ node --check server.mjs
+$ node --check public/app.js
+$ node --check lib/alert_triage.mjs
+$ node --check server/push_delivery.mjs
+$ node --check server/intraday_watcher.mjs
+$ node --check scripts/core_regression_tests.mjs
+$ python3 -m py_compile scripts/sqlite_store_sync.py
+all passed with no output
+
+$ node scripts/core_regression_tests.mjs
+core_regression_tests: ok
+
+$ node scripts/generate_route_inventory.mjs && node scripts/generate_route_inventory.mjs --check
+{"status":"ok","routes":65,"uiFetches":34,"storeKeys":24}
+{"status":"ok","routes":65,"uiFetches":34,"storeKeys":24}
+
+$ python3 scripts/sqlite_store_sync.py --store-json data/store.json --db data/market_pulse.sqlite
+{"status":"ok","synced":{"auditEvents":6,"consensusSnapshots":0},"tables":{"consensus_snapshots":0}}
+
+$ sqlite3 data/market_pulse.sqlite "SELECT event_type, COUNT(*) FROM audit_events GROUP BY event_type ORDER BY event_type;"
+all_stock_agent.run|4
+order_draft.create|2
+
+$ node -e "runIntradayWatcherOnce(..., { config: { enabled:false } })"
+{"status":"disabled","alerts":[],"auditEvents":[],"consensusSnapshots":[],"llmCriticalPath":false}
+
+$ node -e "runIntradayWatcherOnce(...forced simulated ±5% move + fake filing...)"
+{"status":"ok","alerts":2,"auditEvents":3,"consensusSnapshots":1,"llmCriticalPath":false,"push":["disabled","disabled"],"volumePaceSource":"missing_same_time_20d_baseline"}
+```
+
+### Contradictions / Blockers
+
+- Same-time-of-day 20-day volume pace baseline does not exist in the current data model or providers. I did not substitute daily average volume as the signal. Live watcher only uses `quote.volumePace` / `quote.sameTimeVolumePace` if a future provider supplies it; otherwise the signal records `volumePaceSource:"missing_same_time_20d_baseline"`.
+- Real push end-to-end delivery was not sent because `PUSH_PROVIDER` / `PUSH_TARGET` are intentionally unconfigured and WP2 defaults push/watcher to disabled. The simulated path verifies alert creation, audit events, severity triage, and disabled push result without external side effects.

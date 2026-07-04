@@ -49,6 +49,7 @@ import {
   allStockAgentDebateGate as allStockAgentDebateGateCore,
   applyAllStockAgentShadowGates,
 } from "./server/all_stock/debate_gate.mjs";
+import { intradayWatcherConfigFromEnv, runIntradayWatcherOnce } from "./server/intraday_watcher.mjs";
 import { runJsonCli as runJsonCliProcess, runTextCli as runTextCliProcess } from "./server/cli_process.mjs";
 import { addressOnly, probeSmtpEmail, sendResendEmail, sendSmtpEmail } from "./server/email_delivery.mjs";
 import { loadEnvFile, parseBoolean, splitList } from "./server/env_utils.mjs";
@@ -1061,6 +1062,9 @@ const SCHEDULE_PRE_TIME = parseHourMinute(SCHEDULE_PRE_NEW_YORK_TIME, { hour: 7,
 const INTRADAY_ALERTS_ENABLED = parseBoolean(process.env.INTRADAY_ALERTS_ENABLED, false);
 const INTRADAY_ALERTS_NEW_YORK_TIME = process.env.INTRADAY_ALERTS_NEW_YORK_TIME || "12:30";
 const INTRADAY_ALERTS_TIME = parseHourMinute(INTRADAY_ALERTS_NEW_YORK_TIME, { hour: 12, minute: 30 });
+const INTRADAY_WATCHER_CONFIG = intradayWatcherConfigFromEnv(process.env);
+const INTRADAY_EXPLAIN_LLM_ENABLED = parseBoolean(process.env.INTRADAY_EXPLAIN_LLM_ENABLED, true);
+const INTRADAY_EXPLAIN_LLM_TIMEOUT_MS = Math.max(15000, Number(process.env.INTRADAY_EXPLAIN_LLM_TIMEOUT_MS || 180000));
 const SCHEDULES = [
   { id: "pre", label: "盘前", hour: SCHEDULE_PRE_TIME.hour, minute: SCHEDULE_PRE_TIME.minute },
   ...(INTRADAY_ALERTS_ENABLED
@@ -2611,6 +2615,55 @@ const ENV_CONFIG_FIELDS = Object.freeze([
     diagnostics: [],
     placeholder: "75",
   },
+  {
+    key: "INTRADAY_WATCHER_ENABLED",
+    label: "盘中 watcher 启用",
+    group: "定时任务",
+    live: false,
+    diagnostics: [],
+    placeholder: "false",
+  },
+  {
+    key: "INTRADAY_WATCHER_INTERVAL_MS",
+    label: "盘中 watcher 间隔 ms",
+    group: "定时任务",
+    live: false,
+    diagnostics: [],
+    placeholder: "120000",
+  },
+  {
+    key: "PUSH_PROVIDER",
+    label: "推送 Provider",
+    group: "推送",
+    live: false,
+    diagnostics: [],
+    placeholder: "bark / telegram / ntfy",
+  },
+  {
+    key: "PUSH_TARGET",
+    label: "推送目标",
+    group: "推送",
+    live: false,
+    secret: true,
+    diagnostics: [],
+    placeholder: "Bark key / Telegram chat_id / ntfy topic",
+  },
+  {
+    key: "PUSH_MIN_SEVERITY",
+    label: "推送最低严重度",
+    group: "推送",
+    live: false,
+    diagnostics: [],
+    placeholder: "high",
+  },
+  {
+    key: "PUSH_TICKER_COOLDOWN_MS",
+    label: "同 ticker 推送冷却 ms",
+    group: "推送",
+    live: false,
+    diagnostics: [],
+    placeholder: "900000",
+  },
 ]);
 const ENV_CONFIG_FIELD_BY_KEY = new Map(ENV_CONFIG_FIELDS.map((field) => [field.key, field]));
 
@@ -3139,6 +3192,16 @@ function appendAuditEvent(db = {}, eventType = "", payload = {}, status = "ok", 
   return event;
 }
 
+function appendAuditEventRecord(db = {}, record = {}) {
+  return appendAuditEvent(
+    db,
+    record.eventType || record.type || "unknown",
+    record.payload || record,
+    record.status || "ok",
+    record.actor || "system",
+  );
+}
+
 function normalizeStrategyVersions(rows = []) {
   return (Array.isArray(rows) ? rows : [])
     .filter((row) => row && typeof row === "object" && row.id)
@@ -3332,6 +3395,10 @@ function compactStoreForSave(db = {}) {
     chat: Array.isArray(db.chat) ? db.chat.slice(-80) : [],
     alerts: Array.isArray(db.alerts) ? db.alerts.slice(0, 200) : [],
     signalHistory: Array.isArray(db.signalHistory) ? db.signalHistory.slice(0, 1000) : [],
+    consensusSnapshots: Array.isArray(db.consensusSnapshots) ? db.consensusSnapshots.slice(0, 2000) : [],
+    intradayWatcher: db.intradayWatcher && typeof db.intradayWatcher === "object" ? db.intradayWatcher : {},
+    pushDeliveryState: db.pushDeliveryState && typeof db.pushDeliveryState === "object" ? db.pushDeliveryState : {},
+    intradayExplain: db.intradayExplain && typeof db.intradayExplain === "object" ? db.intradayExplain : {},
     auditEvents: normalizeAuditEvents(db.auditEvents),
     ibkrPortalFeed: normalizeIbkrPortalFeed(db.ibkrPortalFeed),
     allStockAgent: normalizeAllStockAgentState(db.allStockAgent),
@@ -3585,6 +3652,10 @@ async function ensureStore() {
           : {},
       ibkrSyncLog: Array.isArray(db.ibkrSyncLog) ? db.ibkrSyncLog : [],
       akshareGlobalNewsLog: Array.isArray(db.akshareGlobalNewsLog) ? db.akshareGlobalNewsLog : [],
+      consensusSnapshots: Array.isArray(db.consensusSnapshots) ? db.consensusSnapshots : [],
+      intradayWatcher: db.intradayWatcher && typeof db.intradayWatcher === "object" ? db.intradayWatcher : {},
+      pushDeliveryState: db.pushDeliveryState && typeof db.pushDeliveryState === "object" ? db.pushDeliveryState : {},
+      intradayExplain: db.intradayExplain && typeof db.intradayExplain === "object" ? db.intradayExplain : {},
       auditEvents: normalizeAuditEvents(db.auditEvents),
       scheduleLog: db.scheduleLog || {},
       sourceControls: normalizeSourceControls(db.sourceControls),
@@ -3621,6 +3692,10 @@ async function ensureStore() {
       tradeReviewActionState: {},
       ibkrSyncLog: [],
       akshareGlobalNewsLog: [],
+      consensusSnapshots: [],
+      intradayWatcher: {},
+      pushDeliveryState: {},
+      intradayExplain: {},
       auditEvents: [],
       scheduleLog: {},
       sourceControls: { disabled: [], updatedAt: "" },
@@ -6152,6 +6227,7 @@ function getProviderStatus(customFeeds = []) {
     articleLlmSummary: ARTICLE_LLM_SUMMARY_ENABLED && Boolean(activeLlmProvider(articleLlmSummaryProvider(LLM_PROVIDER))),
     marketOverview: MARKET_OVERVIEW_ENABLED,
     optionsChain: OPTIONS_ENABLED,
+    intradayWatcher: INTRADAY_WATCHER_CONFIG.enabled,
     sec: true,
     nasdaqSecurityMaster: true,
     yahooNewsFallback: true,
@@ -37428,6 +37504,50 @@ async function handleApi(req, res, url) {
     return sendJson(res, { deepDive: buildStockDeepDivePayload(db, ticker) });
   }
 
+  if ((req.method === "GET" || req.method === "POST") && url.pathname === "/api/intraday/explain") {
+    const body = req.method === "POST" ? await readBody(req).catch(() => ({})) : {};
+    const ticker = safeTicker(body.ticker || url.searchParams.get("ticker"));
+    if (!ticker) return sendJson(res, { error: "请输入 ticker。" }, 400);
+    const db = await ensureStore();
+    const quoteResult = await collectQuotes([ticker]).catch((error) => ({
+      quotes: [],
+      errors: [{ source: "Intraday Explain Quote", ticker, error: error.message }],
+    }));
+    const quote = (quoteResult.quotes || []).find((item) => safeTicker(item.ticker) === ticker) || null;
+    const cache = intradayExplainCacheRows(db, ticker);
+    const snapshot = {
+      schemaVersion: "intraday-explain-v1",
+      id: compactId("intraday-explain"),
+      ticker,
+      generatedAt: nowIso(),
+      status: "collected",
+      quote,
+      cache,
+      errors: quoteResult.errors || [],
+      llmStatus: "queued",
+      llmCriticalPath: false,
+    };
+    db.intradayExplain ||= {};
+    db.intradayExplain[ticker] = [snapshot, ...(db.intradayExplain[ticker] || [])].slice(0, 20);
+    appendAuditEvent(db, "intraday_explain.requested", {
+      ticker,
+      snapshotId: snapshot.id,
+      news: cache.news.length,
+      filings: cache.filings.length,
+      socialPosts: cache.socialPosts.length,
+      llmCriticalPath: false,
+    });
+    await saveStore(db);
+    const enrichment = queueIntradayExplainEnrichment(snapshot.id, ticker);
+    return sendJson(res, {
+      explain: {
+        ...snapshot,
+        llmStatus: enrichment.queued ? "queued" : "skipped",
+        llmSkippedReason: enrichment.queued ? "" : enrichment.reason,
+      },
+    }, 202);
+  }
+
   if (req.method === "GET" && url.pathname === "/api/trade-recommendation-reconciliation") {
     const db = await ensureStore();
     const reconciliation = buildTradeRecommendationReconciliation(db);
@@ -39133,6 +39253,111 @@ function localChatAnswer(message, run, db = null, tradeJournal = null) {
   return localGeneralChatAnswer(run);
 }
 
+async function runIntradayWatcherAndSave(options = {}) {
+  const db = await ensureStore();
+  const result = await runIntradayWatcherOnce(
+    {
+      db,
+      latestRun: () => latestRun(db),
+      collectQuotes,
+      collectTechnicalData,
+    },
+    options,
+  );
+  for (const event of result.auditEvents || []) appendAuditEventRecord(db, event);
+  if (result.status !== "disabled" && result.status !== "outside_market_window") {
+    await saveStore(db);
+  }
+  return result;
+}
+
+function intradayExplainCacheRows(db = {}, ticker = "") {
+  const symbol = safeTicker(ticker);
+  const run = latestRun(db) || {};
+  const match = (item) => itemMatchesRunTicker(item, symbol);
+  return {
+    runId: run.id || "",
+    runCompletedAt: run.completedAt || "",
+    alerts: (db.alerts || []).filter(match).slice(0, 8),
+    news: (run.news || []).filter(match).slice(0, 12),
+    filings: (run.filings || []).filter(match).slice(0, 8),
+    socialPosts: (run.socialPosts || []).filter(match).slice(0, 12),
+    socialHot: [
+      ...(run.socialHotStocks?.rising || []),
+      ...(run.socialHotStocks?.candidates || []),
+    ].find((item) => safeTicker(item.ticker) === symbol) || null,
+  };
+}
+
+function intradayExplainPrompt(payload = {}) {
+  return JSON.stringify({
+    ticker: payload.ticker,
+    quote: payload.quote,
+    alerts: (payload.cache?.alerts || []).map((item) => ({ title: item.title, detail: item.detail, severity: item.severity })),
+    news: (payload.cache?.news || []).map((item) => ({
+      title: item.titleZh || item.title,
+      summary: item.summaryZh || item.summary || item.article?.summaryZh,
+      publishedAt: item.publishedAt,
+      source: item.source || item.publisher,
+    })),
+    filings: (payload.cache?.filings || []).map((item) => ({
+      form: item.form,
+      title: item.titleZh || item.title || item.secInsight?.eventTitleZh,
+      filedAt: item.filedAt || item.publishedAt,
+    })),
+    socialPosts: (payload.cache?.socialPosts || []).map((item) => ({
+      title: item.title,
+      summary: item.summaryZh || item.summary,
+      source: item.source,
+    })),
+  });
+}
+
+function queueIntradayExplainEnrichment(snapshotId = "", ticker = "") {
+  if (!INTRADAY_EXPLAIN_LLM_ENABLED) return { queued: false, reason: "INTRADAY_EXPLAIN_LLM_ENABLED=false" };
+  const provider = activeLlmProvider(LLM_PROVIDER);
+  if (!provider) return { queued: false, reason: missingLlmMessage(LLM_PROVIDER) || "LLM provider unavailable" };
+  const task = async () => {
+    const db = await ensureStore();
+    const rows = Array.isArray(db.intradayExplain?.[ticker]) ? db.intradayExplain[ticker] : [];
+    const index = rows.findIndex((item) => item.id === snapshotId);
+    if (index < 0) return;
+    const snapshot = rows[index];
+    try {
+      const system = "你是美股盘中异动解释助手。只做事实摘要和后续核验点，不写入任何评分、闸门、权重或交易指令。输出中文，三句话以内。";
+      const user = `请解释 ${ticker} 盘中异动可能原因，并列出下一步要核验的数据。\n${intradayExplainPrompt(snapshot)}`;
+      const result = await callConfiguredLlm(system, user, provider, {
+        task: "standard",
+        timeoutMs: INTRADAY_EXPLAIN_LLM_TIMEOUT_MS,
+      });
+      rows[index] = {
+        ...snapshot,
+        llmStatus: "ok",
+        llmProvider: result.provider,
+        llmSummary: normalizeDisplayText(result.text || "").slice(0, 1400),
+        llmCompletedAt: nowIso(),
+      };
+      db.intradayExplain[ticker] = rows;
+      appendAuditEvent(db, "intraday_explain.llm_completed", { ticker, snapshotId, provider: result.provider });
+      await saveStore(db);
+    } catch (error) {
+      rows[index] = {
+        ...snapshot,
+        llmStatus: "failed",
+        llmError: error.message,
+        llmCompletedAt: nowIso(),
+      };
+      db.intradayExplain[ticker] = rows;
+      appendAuditEvent(db, "intraday_explain.llm_failed", { ticker, snapshotId, error: error.message }, "fail");
+      await saveStore(db);
+    }
+  };
+  task().catch((error) => {
+    console.error("Intraday explain LLM enrichment failed:", error);
+  });
+  return { queued: true, provider };
+}
+
 const server = http.createServer(async (req, res) => {
   res.on("error", (error) => {
     if (!isConnectionClosedError(error)) {
@@ -39157,6 +39382,17 @@ await ensureStore();
 server.listen(PORT, () => {
   console.log(`Market Pulse AI running at http://localhost:${PORT}`);
 });
+
+if (INTRADAY_WATCHER_CONFIG.enabled) {
+  runIntradayWatcherAndSave({ config: INTRADAY_WATCHER_CONFIG }).catch((error) => {
+    console.error("Intraday watcher initial run failed:", error);
+  });
+  setInterval(() => {
+    runIntradayWatcherAndSave({ config: INTRADAY_WATCHER_CONFIG }).catch((error) => {
+      console.error("Intraday watcher scheduled run failed:", error);
+    });
+  }, INTRADAY_WATCHER_CONFIG.intervalMs).unref?.();
+}
 
 setInterval(() => {
   maybeRunSchedule().catch((error) => {
