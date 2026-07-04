@@ -315,3 +315,65 @@ $ curl -sS http://localhost:5173/api/recommender/historical-backtest/hist-bt-178
 - Because WP3 provider verification could not populate `historical_bars`, the live API verification only proves the frozen empty-run and report path. The synthetic regression fixture proves non-empty walk-forward behavior, but it is not a provider spot-check.
 - Sector basket benchmarking is marked `sectorBasketStatus:"missing_sector_mapping"` and uses SPY only until a stable historical ticker→sector/security-master mapping exists. I did not invent a sector map inside WP4.
 - LLM narrative is deterministic Chinese narrative derived from frozen JSON. I did not call an LLM because the current historical corpus is empty and the hard rule forbids LLM-written numbers; the report pipeline is ready for a subordinate narrative once non-empty frozen JSON exists.
+
+## WP5 — Metrics & Factor-Analysis Bridges
+
+### What Changed
+
+- Added `scripts/quantstats_bridge.py`: stdin JSON daily return payload → metrics JSON. It prefers `quantstats` when installed; otherwise returns a native-python metrics payload with an explicit degradation note.
+- Added `scripts/alphalens_bridge.py`: stdin JSON factor observations → IC by horizon, top-bottom quantile spread, and turnover status. It imports `alphalens` when available and otherwise uses native Spearman/quantile fallback.
+- Integrated both bridges into `server/historical_backtest.mjs` for the SQLite historical backtest path:
+  - `metricEngines.native` always contains the native JS metrics.
+  - `metricEngines.quantstats` contains bridge output or failure/degradation.
+  - `factorAnalysis.alphalens` contains bridge factor-analysis output or failure/degradation.
+- Added `bridgeTimeoutMs` to `POST /api/recommender/historical-backtest` config.
+- The report keeps native metrics as the safe fallback and exposes the preferred engine plus degradation notes.
+
+### Files / Functions
+
+- `scripts/quantstats_bridge.py`: native/QuantStats metrics bridge.
+- `scripts/alphalens_bridge.py`: native/Alphalens factor-analysis bridge.
+- `server/historical_backtest.mjs`: `runJsonBridge`, `applyMetricBridges`, `quantstatsPayload`, `alphalensPayload`.
+- `server.mjs`: `bridgeTimeoutMs` route config pass-through.
+
+### Verification Output
+
+```text
+$ python3 -m py_compile scripts/quantstats_bridge.py scripts/alphalens_bridge.py scripts/build_historical_bars.py scripts/akshare_bridge.py scripts/sqlite_store_sync.py
+passed with no output
+
+$ node --check server.mjs
+$ node --check public/app.js
+$ node --check server/historical_backtest.mjs
+$ node --check scripts/core_regression_tests.mjs
+all passed with no output
+
+$ node scripts/core_regression_tests.mjs
+core_regression_tests: ok
+
+$ node scripts/generate_route_inventory.mjs && node scripts/generate_route_inventory.mjs --check
+{"status":"ok","routes":67,"uiFetches":34,"storeKeys":25}
+{"status":"ok","routes":67,"uiFetches":34,"storeKeys":25}
+
+$ printf ... | python3 scripts/quantstats_bridge.py
+{"ok":true,"engine":"native-python","preferredAvailable":false,"metrics":{"n":3,"sharpe":{"value":8.44610462977374,"n":3,"source":"native-python"},"maxDrawdown":{"value":-0.5000000000000004,"n":3,"source":"native-python"}},"degradation":"quantstats unavailable: ModuleNotFoundError: No module named 'quantstats'"}
+
+$ printf ... | python3 scripts/alphalens_bridge.py
+{"ok":true,"engine":"alphalens","preferredAvailable":true,"observations":3,"analysis":{"icByHorizon":{"momentum":{"1":{"value":0.9999999999999998,"n":3,"source":"native-python"}}}}}
+
+$ curl -sS -X POST http://localhost:5173/api/recommender/historical-backtest ...
+{
+  "status": "empty",
+  "preferred": "native-js",
+  "quant": "native-python",
+  "quantDegradation": "quantstats unavailable: ModuleNotFoundError: No module named 'quantstats'",
+  "alphalens": "alphalens",
+  "alphalensStatus": "ok"
+}
+```
+
+### Contradictions / Blockers
+
+- `quantstats>=0.0.81` could not be installed from the current pip index/Python environment. Pip listed versions only through `0.0.77`, so the exact WP5 pin is unavailable. I did not silently install an older `quantstats`; the bridge remains ready and degrades visibly to native metrics.
+- Because QuantStats is unavailable, the specific WP5 verification "bridge Sharpe/MaxDD match native within 1e-3 relative tolerance" could only be verified for the native-python bridge output, not the actual QuantStats engine.
+- `alphalens-reloaded==0.4.5` installed successfully and imports as `alphalens`; the current bridge still computes IC/quantile outputs through the native fallback shape because the frozen historical run is empty.

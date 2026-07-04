@@ -1,5 +1,6 @@
 import crypto from "node:crypto";
 import { execFile } from "node:child_process";
+import { fileURLToPath } from "node:url";
 
 import { buildFactorSnapshotAsOf, normalizeHistoricalBars } from "../lib/historical_features.mjs";
 import {
@@ -12,6 +13,9 @@ import { numberOrNull } from "../lib/market_core.mjs";
 
 const DEFAULT_HORIZONS = [1, 3, 5, 10, 20, 60];
 const DEFAULT_WEIGHTS = normalizeRecommendationFactorWeights();
+const PYTHON = process.env.HISTORICAL_BRIDGE_PYTHON || process.env.SQLITE_SYNC_PYTHON || "python3";
+const QUANTSTATS_BRIDGE = fileURLToPath(new URL("../scripts/quantstats_bridge.py", import.meta.url));
+const ALPHALENS_BRIDGE = fileURLToPath(new URL("../scripts/alphalens_bridge.py", import.meta.url));
 
 function safeTicker(value = "") {
   return String(value || "").toUpperCase().replace(/[^A-Z0-9.-]/g, "").slice(0, 16);
@@ -102,6 +106,22 @@ function sqliteJson(dbPath, sql, timeoutMs = 30000) {
         reject(new Error(`sqlite3 JSON parse failed: ${parseError.message}; output=${text.slice(0, 300)}`));
       }
     });
+  });
+}
+
+function runJsonBridge(scriptPath, payload, timeoutMs = 60000) {
+  return new Promise((resolve, reject) => {
+    execFile(PYTHON, [scriptPath], { timeout: timeoutMs, maxBuffer: 64 * 1024 * 1024 }, (error, stdout, stderr) => {
+      if (error) {
+        reject(new Error(`${error.message}${stderr ? `; ${stderr}` : ""}`));
+        return;
+      }
+      try {
+        resolve(JSON.parse(String(stdout || "{}").trim() || "{}"));
+      } catch (parseError) {
+        reject(new Error(`bridge JSON parse failed: ${parseError.message}; stderr=${String(stderr || "").slice(0, 300)}`));
+      }
+    }).stdin.end(JSON.stringify(payload));
   });
 }
 
@@ -392,6 +412,102 @@ function buildReport(run = {}) {
   };
 }
 
+function quantstatsPayload(run = {}) {
+  return {
+    schemaVersion: "quantstats-input-v1",
+    daily: (run.daily || []).map((row) => ({
+      date: row.date,
+      returnPct: row.avgExcessPct,
+      benchmarkReturnPct: 0,
+    })),
+    costs: {
+      costBps: run.config?.costBps || 0,
+      slippageBps: run.config?.slippageBps || 0,
+    },
+  };
+}
+
+function alphalensPayload(run = {}) {
+  const byKey = new Map();
+  for (const outcome of run.outcomes || []) {
+    const factors = outcome.factorSnapshot?.factors || {};
+    for (const [factorId, factor] of Object.entries(factors)) {
+      const score = pct(factor.score);
+      if (!Number.isFinite(score)) continue;
+      const key = `${outcome.decisionId}|${factorId}`;
+      const row = byKey.get(key) || {
+        date: ymd(outcome.decisionAt),
+        ticker: outcome.ticker,
+        factorId,
+        score,
+      };
+      row[`h${outcome.horizonDays}`] = pct(outcome.excessPct);
+      byKey.set(key, row);
+    }
+  }
+  return {
+    schemaVersion: "alphalens-input-v1",
+    horizons: run.config?.horizons || DEFAULT_HORIZONS,
+    observations: [...byKey.values()],
+  };
+}
+
+async function applyMetricBridges(run = {}, options = {}) {
+  const timeoutMs = Math.max(1000, Number(options.bridgeTimeoutMs || 60000));
+  const engines = {
+    native: {
+      engine: "native-js",
+      status: "ok",
+      metrics: run.metrics,
+    },
+  };
+  try {
+    const quantstats = await runJsonBridge(QUANTSTATS_BRIDGE, quantstatsPayload(run), timeoutMs);
+    engines.quantstats = {
+      status: quantstats.ok ? "ok" : "fail",
+      ...quantstats,
+    };
+  } catch (error) {
+    engines.quantstats = {
+      status: "fail",
+      ok: false,
+      engine: "quantstats",
+      degradation: error.message,
+    };
+  }
+  try {
+    const alphalens = await runJsonBridge(ALPHALENS_BRIDGE, alphalensPayload(run), timeoutMs);
+    run.factorAnalysis = {
+      ...(run.factorAnalysis || {}),
+      alphalens: {
+        status: alphalens.ok ? "ok" : "fail",
+        ...alphalens,
+      },
+    };
+  } catch (error) {
+    run.factorAnalysis = {
+      ...(run.factorAnalysis || {}),
+      alphalens: {
+        status: "fail",
+        ok: false,
+        engine: "alphalens",
+        degradation: error.message,
+      },
+    };
+  }
+  const preferred = engines.quantstats?.ok && engines.quantstats?.preferredAvailable ? "quantstats" : "native-js";
+  run.metricEngines = {
+    schemaVersion: "metric-engines-v1",
+    preferred,
+    engines,
+    degradationNotes: [
+      engines.quantstats?.degradation ? `quantstats: ${engines.quantstats.degradation}` : "",
+      run.factorAnalysis?.alphalens?.degradation ? `alphalens: ${run.factorAnalysis.alphalens.degradation}` : "",
+    ].filter(Boolean),
+  };
+  return run;
+}
+
 export function runHistoricalWalkForwardFromRows({ bars = [], regimes = [], config = {} } = {}) {
   const runConfig = {
     schemaVersion: "historical-walk-forward-config-v1",
@@ -585,7 +701,10 @@ export async function runHistoricalWalkForwardFromSqlite({ sqlitePath, config = 
   );
   const tickers = tickerRows.map((row) => safeTicker(row.ticker)).filter(Boolean);
   if (!tickers.length) {
-    return runHistoricalWalkForwardFromRows({ bars: [], regimes: [], config });
+    const result = runHistoricalWalkForwardFromRows({ bars: [], regimes: [], config });
+    await applyMetricBridges(result.run, config);
+    result.report = buildReport(result.run);
+    return result;
   }
   const tickerList = tickers.map((ticker) => `'${sqlText(ticker)}'`).join(",");
   const bars = await sqliteJson(
@@ -598,10 +717,12 @@ export async function runHistoricalWalkForwardFromSqlite({ sqlitePath, config = 
     `SELECT date,bucket,risk_score,json FROM historical_regimes ${where.length ? `WHERE ${where.join(" AND ")}` : ""} ORDER BY date;`,
     config.sqliteTimeoutMs || 30000,
   );
-  return runHistoricalWalkForwardFromRows({ bars, regimes, config });
+  const result = runHistoricalWalkForwardFromRows({ bars, regimes, config });
+  await applyMetricBridges(result.run, config);
+  result.report = buildReport(result.run);
+  return result;
 }
 
 export function historicalBacktestReport(run = {}) {
   return buildReport(run);
 }
-

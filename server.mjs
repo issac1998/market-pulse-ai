@@ -37510,6 +37510,7 @@ async function handleApi(req, res, url) {
           costBps: body.costBps || url.searchParams.get("costBps"),
           slippageBps: body.slippageBps || url.searchParams.get("slippageBps"),
           sqliteTimeoutMs: body.sqliteTimeoutMs || url.searchParams.get("sqliteTimeoutMs"),
+          bridgeTimeoutMs: body.bridgeTimeoutMs || url.searchParams.get("bridgeTimeoutMs"),
         },
       });
       const db = await ensureStore();

@@ -62,7 +62,7 @@ Scope here: W1 watcher + W3 triage + W4 push + W5 move→reason + W6 novelty + W
 - Anti-fooling (§7.4): walk-forward only; zero-cost runs labeled `frictionless-reference`; headline = pre-registered config (top-10, T+20 primary, current thresholds); backtest weights enter live ONLY as candidate strategy versions.
 - **Verify**: metrics independently recomputable from the frozen pseudo-decision tables (external reviewer will do this); report renders with all provenance fields.
 
-## ☐ WP5 — Metrics & factor-analysis bridges (D1/D2/D9/D10)
+## ☑ WP5 — Metrics & factor-analysis bridges (D1/D2/D9/D10)
 
 - `scripts/quantstats_bridge.py`: stdin JSON {daily equity series, benchmark series, costs} → stdout metrics JSON + optional HTML tearsheet path under `data/reports/`. Wire into WP4 report as the preferred engine; native metrics remain fallback; report states which engine ran (D10).
 - `scripts/alphalens_bridge.py`: long-format factor values + closes from SQLite → `get_clean_factor_and_forward_returns` → IC by horizon, quantile mean returns, turnover as JSON. Venv pins: `pandas>=2.2.2`, `numpy>=2`, `quantstats>=0.0.81`, `alphalens-reloaded>=0.4.5`.
