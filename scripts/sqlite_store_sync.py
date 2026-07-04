@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+from __future__ import annotations
+
 import argparse
 import hashlib
 import json
@@ -97,6 +99,105 @@ def row_regime(row: dict[str, Any]) -> str:
     return "high_risk"
 
 
+def number(value: Any) -> float | None:
+    try:
+        result = float(value)
+    except (TypeError, ValueError):
+        return None
+    return result if result == result else None
+
+
+def normalize_iv(value: Any) -> float | None:
+    result = number(value)
+    if result is None or result <= 0:
+        return None
+    return result / 100 if result > 3 else result
+
+
+def extract_atm_iv(option: dict[str, Any]) -> float | None:
+    direct = normalize_iv(option.get("ivAtm") or (option.get("summary") or {}).get("ivAtm"))
+    if direct is not None:
+        return direct
+    spot = number(option.get("underlyingPrice") or option.get("spot") or option.get("price"))
+    candidates: list[tuple[float, float]] = []
+    for row in option.get("ivSmile") or []:
+        if not isinstance(row, dict):
+            continue
+        strike = number(row.get("strike"))
+        iv = normalize_iv(row.get("avgIv") or row.get("iv") or row.get("impliedVolatility"))
+        if strike is not None and iv is not None:
+            candidates.append((strike, iv))
+    for row in option.get("contracts") or []:
+        if not isinstance(row, dict):
+            continue
+        strike = number(row.get("strike"))
+        iv = normalize_iv(row.get("impliedVolatility") or row.get("iv") or row.get("implied_volatility"))
+        if strike is not None and iv is not None:
+            candidates.append((strike, iv))
+    for expiry in option.get("expirations") or []:
+        if not isinstance(expiry, dict):
+            continue
+        for row in expiry.get("options") or []:
+            if not isinstance(row, dict):
+                continue
+            strike = number(row.get("strike"))
+            iv = normalize_iv(row.get("impliedVolatility") or row.get("iv") or row.get("avgIv"))
+            if strike is not None and iv is not None:
+                candidates.append((strike, iv))
+    if not candidates:
+        return None
+    if spot is not None and spot > 0:
+        return sorted(candidates, key=lambda item: abs(item[0] - spot))[0][1]
+    ordered = sorted(candidates, key=lambda item: item[0])
+    return ordered[len(ordered) // 2][1]
+
+
+def safe_ticker(value: Any) -> str:
+    return "".join(ch for ch in text(value).upper().strip() if ch.isalnum() or ch in {".", "-"}).split(".")[0]
+
+
+def same_ymd(a: Any, b: Any) -> bool:
+    ay = text(a)[:10]
+    by = text(b)[:10]
+    return bool(ay and by and ay == by)
+
+
+def normalize_trade_side(value: Any) -> str:
+    side = text(value).lower()
+    if side in {"buy", "b", "bot", "long", "买入"} or "buy" in side or "买" in side:
+        return "buy"
+    if side in {"sell", "s", "sld", "short", "卖出"} or "sell" in side or "卖" in side:
+        return "sell"
+    return side
+
+
+def outcome_quality_status(row: dict[str, Any]) -> str:
+    explicit = text(row.get("outcomeQualityStatus") or row.get("qualityStatus"))
+    if explicit in {"ok", "suspect_price"}:
+        return explicit
+    raw = number(
+        row.get("tickerReturnPct")
+        if row.get("tickerReturnPct") is not None
+        else row.get("rawReturnPct")
+        if row.get("rawReturnPct") is not None
+        else row.get("performancePct")
+    )
+    entry = number(row.get("entryPrice"))
+    exit_price = number(row.get("exitPrice"))
+    horizon = number(row.get("horizonDays"))
+    if entry is None or entry <= 0 or exit_price is None or exit_price <= 0:
+        return "suspect_price"
+    if entry < 0.5:
+        return "suspect_price"
+    short_horizon = horizon is None or horizon <= 10
+    if short_horizon and raw is not None and abs(raw) > 100:
+        return "suspect_price"
+    ratio = exit_price / entry
+    if short_horizon and (ratio > 3 or ratio < 1 / 3):
+        return "suspect_price"
+    return "ok"
+
+
 def news_checksum(row: dict[str, Any]) -> str:
     return sha256_text("|".join([text(row.get("ticker")), text(row.get("url") or row.get("link")), text(row.get("title") or row.get("titleZh")), text(row.get("publishedAt"))]))
 
@@ -180,6 +281,7 @@ def init_schema(conn: sqlite3.Connection) -> None:
           mae_pct REAL,
           mfe_pct REAL,
           regime TEXT,
+          outcome_quality_status TEXT,
           json TEXT NOT NULL
         );
 
@@ -317,6 +419,7 @@ def init_schema(conn: sqlite3.Connection) -> None:
     ensure_column(conn, "recommendation_decisions", "regime", "TEXT")
     ensure_column(conn, "recommendation_decisions", "evidence_refs", "TEXT")
     ensure_column(conn, "recommendation_outcomes", "regime", "TEXT")
+    ensure_column(conn, "recommendation_outcomes", "outcome_quality_status", "TEXT")
     ensure_column(conn, "factor_stats", "regime", "TEXT")
 
 
@@ -448,7 +551,7 @@ def sync_store(conn: sqlite3.Connection, store: dict[str, Any]) -> dict[str, int
                 contracts = option.get("contracts") if isinstance(option.get("contracts"), list) else []
                 expirations = option.get("expirations") if isinstance(option.get("expirations"), list) else []
                 contract_count = int(option.get("contractCount") or len(contracts) or sum(len((exp or {}).get("options") or []) for exp in expirations if isinstance(exp, dict)) or 0)
-                iv_atm = option.get("ivAtm") or (option.get("summary") or {}).get("ivAtm")
+                iv_atm = extract_atm_iv(option)
                 snap_id = text(f"{run.get('id')}:{ticker}:{option.get('provider','options')}")
                 conn.execute(
                     """
@@ -724,6 +827,69 @@ def sync_store(conn: sqlite3.Connection, store: dict[str, Any]) -> dict[str, int
                     )
                     counts["dataQualityAudits"] += 1
 
+            for trade in store.get("trades") or []:
+                if not isinstance(trade, dict):
+                    continue
+                ticker = safe_ticker(trade.get("ticker"))
+                executed_at = text(trade.get("executedAt") or trade.get("date") or trade.get("time"))
+                if not ticker or not executed_at:
+                    continue
+                same_day = [
+                    row
+                    for row in decision_rows.values()
+                    if safe_ticker(row.get("ticker")) == ticker and same_ymd(row.get("generatedAt"), executed_at)
+                ]
+                same_day.sort(key=lambda row: abs(number(row.get("actionScore") or row.get("score")) or 0), reverse=True)
+                decision = same_day[0] if same_day else None
+                side = normalize_trade_side(trade.get("side") or trade.get("action"))
+                aligned = bool(
+                    decision
+                    and ((side == "buy" and text(decision.get("action")) == "买入")
+                         or (side == "sell" and text(decision.get("action")) == "卖出"))
+                )
+                classification = "aligned" if aligned else "contrarian" if decision else "uncovered"
+                thesis_alignment = "same_direction" if classification == "aligned" else "opposite_direction" if classification == "contrarian" else "no_same_day_call"
+                rec_id = text(f"{trade.get('id') or ticker + ':' + executed_at}:{decision.get('id') if decision else 'uncovered'}")
+                payload = {
+                    "id": rec_id,
+                    "tradeId": trade.get("id") or "",
+                    "decisionId": decision.get("id") if decision else "",
+                    "ticker": ticker,
+                    "executedAt": executed_at,
+                    "tradeSide": side,
+                    "decisionAction": decision.get("action") if decision else "",
+                    "classification": classification,
+                    "thesisAlignment": thesis_alignment,
+                    "trade": trade,
+                    "decision": decision,
+                }
+                conn.execute(
+                    """
+                    INSERT INTO trade_recommendation_reconciliation(
+                      id, trade_id, decision_id, ticker, executed_at, classification, thesis_alignment, json
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(id) DO UPDATE SET
+                      trade_id=excluded.trade_id,
+                      decision_id=excluded.decision_id,
+                      ticker=excluded.ticker,
+                      executed_at=excluded.executed_at,
+                      classification=excluded.classification,
+                      thesis_alignment=excluded.thesis_alignment,
+                      json=excluded.json
+                    """,
+                    (
+                        rec_id,
+                        text(payload["tradeId"]),
+                        text(payload["decisionId"]),
+                        ticker,
+                        executed_at,
+                        classification,
+                        thesis_alignment,
+                        dump(payload),
+                    ),
+                )
+                counts["tradeRecommendationReconciliation"] += 1
+
             outcome_rows: dict[str, dict[str, Any]] = {}
             for outcome in agent.get("outcomeSnapshots") or []:
                 if isinstance(outcome, dict):
@@ -742,8 +908,8 @@ def sync_store(conn: sqlite3.Connection, store: dict[str, Any]) -> dict[str, int
                     """
                     INSERT INTO recommendation_outcomes(
                       id, decision_id, ticker, action, horizon_days, evaluated_at,
-                      outcome, excess_pct, mae_pct, mfe_pct, regime, json
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                      outcome, excess_pct, mae_pct, mfe_pct, regime, outcome_quality_status, json
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     ON CONFLICT(id) DO UPDATE SET
                       decision_id=excluded.decision_id,
                       ticker=excluded.ticker,
@@ -755,6 +921,7 @@ def sync_store(conn: sqlite3.Connection, store: dict[str, Any]) -> dict[str, int
                       mae_pct=excluded.mae_pct,
                       mfe_pct=excluded.mfe_pct,
                       regime=excluded.regime,
+                      outcome_quality_status=excluded.outcome_quality_status,
                       json=excluded.json
                     """,
                     (
@@ -769,6 +936,7 @@ def sync_store(conn: sqlite3.Connection, store: dict[str, Any]) -> dict[str, int
                         row.get("maePct"),
                         row.get("mfePct"),
                         row_regime(row),
+                        outcome_quality_status(row),
                         dump(row),
                     ),
                 )

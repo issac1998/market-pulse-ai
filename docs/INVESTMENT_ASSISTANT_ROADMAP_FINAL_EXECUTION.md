@@ -66,3 +66,68 @@ Generated: 2026-07-03
 - `T+20/T+60` outcome quality requires calendar time to accrue.
 - Validation-gated factor adoption requires enough completed samples; current validation correctly remains shadow-only when sample gates are not met.
 - IV rank/percentile needs months of `options_snapshots` accrual before it should be promoted into stronger scoring.
+
+## WP1 — Restore Sample Flow, Fix IV Accrual, Quarantine Bad Outcomes
+
+### What Changed
+
+- Restored frozen buy-decision logging to use the buy-eligible pool up to `skill.settings.buyLimit`; only the first `actionableBuyLimit` decisions remain actionable.
+- Added cooldown suppression for re-logging (`ticker_cooldown`, `failed_thesis_cooldown`) while keeping `low_data_quality`, `dynamic_threshold`, and `earnings_blackout` as research downgrades.
+- Split actionable vs downgraded buy rows in `/api/recommendations/today` and the all-stock Agent UI; paper-book opens only actionable buy decisions, while research-status buy decisions remain outcome-tracked.
+- Added Node-side `summary.ivAtm`, `summary.ivAtmSource`, and `summary.ivAtmQuality` in options post-processing using nearest 7-45 DTE ATM contract, provider IV first, Black-Scholes implied IV fallback from mid price.
+- Added append-only `outcomeQualityStatus` classification with `ok` / `suspect_price`, excluded non-`ok` rows from aggregates and learning inputs, and surfaced `excludedCount`.
+
+### Files / Functions
+
+- `server.mjs`: `runAllStockAgentForRun`, `allStockAgentDecisionLogSuppressed`, `allStockAgentDecisionOpensPaperPosition`, `buildTodayRecommendationsPayload`, `summarizeOptionAtmIv`, `summarizeOptionsChain`, outcome-quality wrappers.
+- `lib/recommender_core.mjs`: `classifyOutcomeQuality`, `outcomeIsUsable`.
+- `scripts/sqlite_store_sync.py`: `extract_atm_iv`, `outcome_quality_status`.
+- `scripts/core_regression_tests.mjs`: outcome quarantine fixture including the GDC-style price-scale case.
+- `public/app.js`: split actionable buy rows from downgraded tracked research rows.
+
+### Verification Output
+
+```text
+$ node --check server.mjs
+$ node --check public/app.js
+$ node --check lib/recommender_core.mjs
+$ node --check scripts/core_regression_tests.mjs
+$ python3 -m py_compile scripts/sqlite_store_sync.py
+all passed with no output
+
+$ node scripts/core_regression_tests.mjs
+core_regression_tests: ok
+
+$ python3 scripts/sqlite_store_sync.py --store-json data/store.json --db data/market_pulse.sqlite
+{"status":"ok","synced":{"runs":20,"recommendationOutcomes":19,"optionsSnapshots":15,"factorStats":60}}
+
+$ sqlite3 data/market_pulse.sqlite "SELECT outcome_quality_status, COUNT(*) FROM recommendation_outcomes GROUP BY outcome_quality_status ORDER BY outcome_quality_status;"
+ok|18
+suspect_price|1
+
+$ sqlite3 data/market_pulse.sqlite "SELECT ticker, horizon_days, entry_price, exit_price, outcome_quality_status FROM (SELECT json_extract(json,'$.entryPrice') AS entry_price, json_extract(json,'$.exitPrice') AS exit_price, * FROM recommendation_outcomes) WHERE ticker='GDC' ORDER BY horizon_days;"
+GDC|1|0.0137|2.625|suspect_price
+
+$ sqlite3 data/market_pulse.sqlite "SELECT COUNT(*) AS total, SUM(CASE WHEN iv_atm IS NOT NULL THEN 1 ELSE 0 END) AS non_null FROM options_snapshots;"
+15|15
+
+$ curl -sS -X POST http://localhost:5173/api/options/chain -H 'Content-Type: application/json' -d '{"ticker":"AAPL"}'
+provider=Nasdaq Option Chain (stocks, OpenBB-style normalized)
+contractCount=684
+ivAtm=0.2498655943110643
+summary.ivAtmSource=provider
+summary.ivAtmQuality=ok
+
+$ curl -sS http://localhost:5173/api/recommendations/today
+actionable=0
+research=13
+actionableLimit=3
+downgraded=3
+trackRecord.sampleCount=18
+trackRecord.excludedCount=1
+```
+
+### Contradictions / Blockers
+
+- The WP1 live verification item "agent run with >3 buyEligible names logs >3 decisions with actionable flags" could not be completed in this session: `POST /api/all-stock-agent/run` remained open for more than 5 minutes while the server stayed responsive to other endpoints. I stopped only that verification request and did not substitute a mock result.
+- Current `/api/recommendations/today` verifies the display split and `excludedCount`, but the latest stored run has zero actionable calls due to existing gates, so it does not prove a live `>3 buyEligible` distribution.

@@ -27,12 +27,14 @@ import {
 import {
   DEFAULT_RECOMMENDER_FACTOR_WEIGHTS,
   buildBenchmarkBasket as buildBenchmarkBasketCore,
+  classifyOutcomeQuality as classifyRecommendationOutcomeQuality,
   estimateThesisHit,
   learnRecommendationFactorWeights,
   normalizeBenchmarkBasket as normalizeBenchmarkBasketCore,
   normalizeFactorValue as normalizeRecommenderFactorValue,
   normalizeRecommendationFactorWeights,
   outcomeFromExcess,
+  outcomeIsUsable as recommendationOutcomeIsUsable,
   pathExcursions,
   scoreRecommendationFromFactorSnapshot,
   stockHistoryPricePath as recommenderStockHistoryPricePath,
@@ -1076,10 +1078,12 @@ const ALL_STOCK_AGENT_RUN_LIMIT = Math.max(10, Number(process.env.ALL_STOCK_AGEN
 const ALL_STOCK_AGENT_OUTCOME_LIMIT = Math.max(200, Number(process.env.ALL_STOCK_AGENT_OUTCOME_LIMIT || 6000));
 const ALL_STOCK_AGENT_PAPER_TRADE_LIMIT = Math.max(100, Number(process.env.ALL_STOCK_AGENT_PAPER_TRADE_LIMIT || 1500));
 const ALL_STOCK_AGENT_OUTCOME_DEADBAND_PCT = Math.max(0, Number(process.env.ALL_STOCK_AGENT_OUTCOME_DEADBAND_PCT || 0.5));
+const ALL_STOCK_AGENT_SUSPECT_PRICE_RETURN_PCT = Math.max(20, Number(process.env.ALL_STOCK_AGENT_SUSPECT_PRICE_RETURN_PCT || 100));
 const ALL_STOCK_AGENT_PAPER_POSITION_SIZE = Math.max(100, Number(process.env.ALL_STOCK_AGENT_PAPER_POSITION_SIZE || 10000));
 const ALL_STOCK_AGENT_BACKTEST_DAYS = Math.max(3, Number(process.env.ALL_STOCK_AGENT_BACKTEST_DAYS || 30));
 const ALL_STOCK_AGENT_BACKTEST_MAX_DATES = Math.max(3, Number(process.env.ALL_STOCK_AGENT_BACKTEST_MAX_DATES || 20));
 const RECOMMENDER_FACTOR_WEIGHTS = Object.freeze({ ...DEFAULT_RECOMMENDER_FACTOR_WEIGHTS });
+const ALL_STOCK_AGENT_APPLY_LEARNED_WEIGHTS = parseBoolean(process.env.ALL_STOCK_AGENT_APPLY_LEARNED_WEIGHTS, false);
 const RECOMMENDER_PRIMARY_HORIZON_DAYS = Math.max(1, Number(process.env.RECOMMENDER_PRIMARY_HORIZON_DAYS || 20));
 const ALL_STOCK_AGENT_ACTIONABLE_BUY_LIMIT = Math.max(1, Number(process.env.ALL_STOCK_AGENT_ACTIONABLE_BUY_LIMIT || 3));
 const ALL_STOCK_AGENT_MIN_ACTIONABLE_DQ = Math.max(0, Math.min(100, Number(process.env.ALL_STOCK_AGENT_MIN_ACTIONABLE_DQ || 60)));
@@ -3012,6 +3016,8 @@ function optionsCacheEntryFresh(entry) {
 }
 
 function compactOptionChainForCache(chain = {}) {
+  const summary = chain.summary || {};
+  const ivAtm = numberOrNull(chain.ivAtm ?? summary.ivAtm);
   const contractCount = Number.isFinite(chain.contractCount)
     ? chain.contractCount
     : Array.isArray(chain.contracts)
@@ -3028,6 +3034,15 @@ function compactOptionChainForCache(chain = {}) {
     generatedAt: chain.generatedAt || nowIso(),
     underlyingPrice: numberOrNull(chain.underlyingPrice),
     expirations: Array.isArray(chain.expirations) ? chain.expirations.slice(0, OPTIONS_EXPIRATION_LIMIT) : [],
+    ivAtm,
+    ivAtmSource: chain.ivAtmSource || summary.ivAtmSource || "",
+    ivAtmQuality: chain.ivAtmQuality || summary.ivAtmQuality || "",
+    summary: {
+      ...summary,
+      ivAtm,
+      ivAtmSource: chain.ivAtmSource || summary.ivAtmSource || "",
+      ivAtmQuality: chain.ivAtmQuality || summary.ivAtmQuality || "",
+    },
     totals: chain.totals || {},
     walls: chain.walls || {},
     topStrikes: Array.isArray(chain.topStrikes) ? chain.topStrikes.slice(0, 12) : [],
@@ -3043,8 +3058,8 @@ function compactOptionChainForCache(chain = {}) {
     contractCount,
     strikeCount,
     sourceRisk: chain.sourceRisk || "",
-	  };
-	}
+  };
+}
 
 function normalizeOptionsCache(value) {
   const entries = Object.entries(value && typeof value === "object" ? value : {})
@@ -3147,7 +3162,7 @@ function normalizeAllStockAgentState(value = {}) {
   const state = value && typeof value === "object" ? value : {};
   const runs = Array.isArray(state.runs) ? state.runs : [];
   const decisions = Array.isArray(state.decisions) ? state.decisions : [];
-  const outcomeSnapshots = Array.isArray(state.outcomeSnapshots) ? state.outcomeSnapshots : [];
+  const outcomeSnapshots = Array.isArray(state.outcomeSnapshots) ? state.outcomeSnapshots.map(withAllStockAgentOutcomeQuality) : [];
   const skillRevisions = Array.isArray(state.skillRevisions) ? state.skillRevisions : [];
   const strategyVersions = normalizeStrategyVersions(state.strategyVersions);
   const factorWeights = state.factorWeights && typeof state.factorWeights === "object"
@@ -20032,7 +20047,9 @@ function defaultAllStockAgentSkill() {
       cooldownTradingDays: 5,
       failedThesisCooldownTradingDays: 20,
       earningsBlackoutDays: 2,
-      maxPortfolioExposurePct: 100,
+      earningsBlackoutPostDays: 0,
+      maxPortfolioExposurePct: 60,
+      exposureSoftStartPct: 60,
       exposureThresholdStepPct: 5,
       autoUpdate: true,
       minSamplesForWeightUpdate: 20,
@@ -20116,7 +20133,20 @@ function normalizeAllStockAgentSkill(value = {}) {
     Math.min(90, Number(settings.failedThesisCooldownTradingDays) || fallback.settings.failedThesisCooldownTradingDays || 20),
   );
   settings.earningsBlackoutDays = Math.max(0, Math.min(10, Number(settings.earningsBlackoutDays) || fallback.settings.earningsBlackoutDays || 2));
+  settings.earningsBlackoutPostDays = Math.max(
+    0,
+    Math.min(10, Number(settings.earningsBlackoutPostDays) || fallback.settings.earningsBlackoutPostDays || 0),
+  );
   settings.maxPortfolioExposurePct = Math.max(0, Math.min(250, Number(settings.maxPortfolioExposurePct) || fallback.settings.maxPortfolioExposurePct || 100));
+  settings.exposureSoftStartPct = Math.max(
+    0,
+    Math.min(
+      settings.maxPortfolioExposurePct || 100,
+      Number(settings.exposureSoftStartPct) ||
+        Number(process.env.ALL_STOCK_AGENT_EXPOSURE_SOFT_START_PCT) ||
+        Math.min(60, Math.max(0, (Number(settings.maxPortfolioExposurePct) || 100) - 20)),
+    ),
+  );
   settings.exposureThresholdStepPct = Math.max(0, Math.min(20, Number(settings.exposureThresholdStepPct) || fallback.settings.exposureThresholdStepPct || 5));
   settings.autoUpdate = Boolean(settings.autoUpdate);
   settings.minSamplesForWeightUpdate = Math.max(20, Number(settings.minSamplesForWeightUpdate) || fallback.settings.minSamplesForWeightUpdate);
@@ -20367,7 +20397,7 @@ function allStockAgentActivePositions(state = {}) {
   for (const decision of decisions) {
     const ticker = safeTicker(decision.ticker);
     if (!ticker) continue;
-    if (allStockAgentDecisionIsExecutableBuy(decision)) {
+    if (allStockAgentDecisionOpensPaperPosition(decision)) {
       active.set(ticker, {
         ticker,
         decisionId: decision.id,
@@ -20387,6 +20417,10 @@ function allStockAgentActivePositions(state = {}) {
 
 function allStockAgentDecisionIsExecutableBuy(decision = {}) {
   return decision?.action === "买入" && decision.status !== "watch-buy" && decision.thresholdMet !== false;
+}
+
+function allStockAgentDecisionOpensPaperPosition(decision = {}) {
+  return allStockAgentDecisionIsExecutableBuy(decision) && decision.actionable !== false && decision.actionability?.status !== "research";
 }
 
 function allStockAgentDecisionTracksOutcome(decision = {}) {
@@ -21202,7 +21236,7 @@ function allStockAgentTradingDayCooldownStatus(fromAt = "", toAt = "", days = 0)
 function allStockAgentLatestLossForTicker(state = {}, ticker = "") {
   const symbol = safeTicker(ticker);
   return (state.outcomeSnapshots || [])
-    .filter((item) => safeTicker(item.ticker) === symbol && item.outcome === "loss")
+    .filter((item) => safeTicker(item.ticker) === symbol && item.outcome === "loss" && allStockAgentOutcomeIsUsable(item))
     .sort((a, b) => new Date(b.evaluatedAt || 0) - new Date(a.evaluatedAt || 0))[0] || null;
 }
 
@@ -21257,22 +21291,25 @@ function allStockAgentEarningsDate(run = {}, ticker = "") {
 }
 
 function allStockAgentEarningsBlackoutGate(run = {}, ticker = "", skill = {}) {
-  const days = Math.max(0, Number(skill.settings?.earningsBlackoutDays) || 0);
-  if (!days) return { blocked: false };
+  const preDays = Math.max(0, Number(skill.settings?.earningsBlackoutDays) || 0);
+  const postDays = Math.max(0, Number(skill.settings?.earningsBlackoutPostDays) || 0);
+  if (!preDays && !postDays) return { blocked: false };
   const dateText = allStockAgentEarningsDate(run, ticker);
   if (!dateText) return { blocked: false };
   const eventMs = new Date(`${String(dateText).slice(0, 10)}T16:00:00Z`).getTime();
   const runMs = new Date(run.completedAt || run.generatedAt || nowIso()).getTime();
   if (!Number.isFinite(eventMs) || !Number.isFinite(runMs)) return { blocked: false };
-  const distanceDays = Math.abs(eventMs - runMs) / (24 * 60 * 60 * 1000);
-  if (distanceDays > days) return { blocked: false };
+  const daysUntil = (eventMs - runMs) / (24 * 60 * 60 * 1000);
+  const inPreWindow = daysUntil >= 0 && daysUntil <= preDays;
+  const inPostWindow = daysUntil < 0 && Math.abs(daysUntil) <= postDays;
+  if (!inPreWindow && !inPostWindow) return { blocked: false };
   return {
     blocked: true,
     gate: {
       id: "earnings_blackout",
       label: "财报黑窗",
       action: "downgrade_research",
-      evidence: `${safeTicker(ticker)} 财报日 ${String(dateText).slice(0, 10)}，距当前约 ${formatReportNumber(distanceDays, 1)} 天。`,
+      evidence: `${safeTicker(ticker)} 财报日 ${String(dateText).slice(0, 10)}，${daysUntil >= 0 ? "距离发布" : "发布后"}约 ${formatReportNumber(Math.abs(daysUntil), 1)} 天。`,
     },
   };
 }
@@ -21284,25 +21321,46 @@ function allStockAgentPortfolioExposurePct(state = {}, run = {}) {
   const realGross = firstFiniteNumber(
     run.portfolioRisk?.summary?.grossMarketValue,
     run.portfolioRisk?.summary?.totalMarketValue,
+    run.portfolioRisk?.grossMarketValue,
+    run.portfolioRisk?.totalMarketValue,
+    run.portfolioRisk?.totalValue,
     realPositions.reduce((sum, item) => sum + Number(item.marketValue || 0), 0),
   );
-  const realTotal = firstFiniteNumber(run.portfolioRisk?.summary?.totalMarketValue, realGross);
-  if (Number.isFinite(realGross) && Number.isFinite(realTotal) && realTotal > 0) return Math.max(0, (realGross / realTotal) * 100);
   const positionSize = Number(paperSummary.positionSize || ALL_STOCK_AGENT_PAPER_POSITION_SIZE);
-  const denominator = Math.max(positionSize * 10, paperNotional);
-  return denominator > 0 ? (paperNotional / denominator) * 100 : 0;
+  const accountEquity = firstFiniteNumber(
+    run.accountSummary?.netLiquidation,
+    run.accountSummary?.netLiquidationValue,
+    run.accountSummary?.equityWithLoanValue,
+    run.accountSummary?.totalCashValue,
+    run.ibkrAccount?.netLiquidation,
+    run.ibkrAccount?.netLiquidationValue,
+    run.ibkr?.accountSummary?.netLiquidation,
+    run.ibkr?.accountSummary?.netLiquidationValue,
+    run.portfolioRisk?.summary?.netLiquidation,
+    run.portfolioRisk?.summary?.accountEquity,
+    run.portfolioRisk?.netLiquidation,
+    run.portfolioRisk?.accountEquity,
+  );
+  const combinedGross = (Number.isFinite(realGross) ? realGross : 0) + (Number.isFinite(paperNotional) ? paperNotional : 0);
+  if (Number.isFinite(accountEquity) && accountEquity > 0) return Math.max(0, (combinedGross / accountEquity) * 100);
+  const paperBudget = Number(paperSummary.maxGrossNotional || paperSummary.budget || positionSize * ALL_STOCK_AGENT_BUY_LIMIT);
+  const fallbackDenominator = Math.max(paperBudget, combinedGross, positionSize * Math.max(1, ALL_STOCK_AGENT_BUY_LIMIT));
+  return fallbackDenominator > 0 ? Math.max(0, (combinedGross / fallbackDenominator) * 100) : 0;
 }
 
 function allStockAgentDynamicBuyThreshold(skill = {}, state = {}, run = {}) {
   const base = numberOrNull(skill.settings?.buyThreshold) ?? 64;
   const exposurePct = allStockAgentPortfolioExposurePct(state, run);
-  const maxExposure = numberOrNull(skill.settings?.maxPortfolioExposurePct) ?? 100;
+  const maxExposure = numberOrNull(skill.settings?.maxPortfolioExposurePct) ?? 60;
+  const softStart = Math.min(maxExposure, numberOrNull(skill.settings?.exposureSoftStartPct) ?? Math.min(60, maxExposure));
   const step = numberOrNull(skill.settings?.exposureThresholdStepPct) ?? 5;
-  const exposurePenalty = exposurePct > maxExposure ? Math.min(18, Math.ceil((exposurePct - maxExposure) / 10) * step) : 0;
+  const exposurePenalty = exposurePct > softStart ? Math.min(18, Math.ceil((exposurePct - softStart) / 10) * step) : 0;
   return {
     threshold: Math.min(95, base + exposurePenalty),
     baseThreshold: base,
     exposurePct,
+    exposureSoftStartPct: softStart,
+    maxPortfolioExposurePct: maxExposure,
     exposurePenalty,
   };
 }
@@ -21340,6 +21398,14 @@ function allStockAgentActionability(evaluation = {}, state = {}, run = {}, skill
     dynamicThreshold: dynamic,
     gates,
   };
+}
+
+function allStockAgentDecisionLogSuppressed(evaluation = {}) {
+  const gates = [
+    ...(Array.isArray(evaluation.actionability?.gates) ? evaluation.actionability.gates : []),
+    ...(Array.isArray(evaluation.gates) ? evaluation.gates : []),
+  ];
+  return gates.some((gate) => gate?.id === "ticker_cooldown" || gate?.id === "failed_thesis_cooldown");
 }
 
 function evaluateAllStockAgentCondition(condition, ctx = {}, skill = {}) {
@@ -21674,6 +21740,7 @@ function buildAllStockAgentEvaluation(run = {}, tickerPoolItem = {}, state = {},
     regimeTag: options.regimeTag || allStockAgentRegimeTagFromSnapshot(factorSnapshot),
     buyScore: adjustedBuy.score,
     rawBuyScore: buy.score,
+    trackingEligible: buyEligible,
     shadowPenalties: adjustedBuy.penalties,
     sellScore: sell.score,
     confidence,
@@ -21716,7 +21783,8 @@ function buildAllStockAgentEvaluation(run = {}, tickerPoolItem = {}, state = {},
 function allStockAgentDecisionFromEvaluation(evaluation, action, runId, trigger) {
   const rules = action === "买入" ? evaluation.matchedBuyRules : evaluation.matchedSellRules;
   const score = action === "买入" ? evaluation.buyScore : evaluation.sellScore;
-  const isFallbackBuy = action === "买入" && !evaluation.buyEligible;
+  const tracksAsBuy = action === "买入" && (evaluation.buyEligible || evaluation.trackingEligible);
+  const isFallbackBuy = action === "买入" && !tracksAsBuy;
   return {
     schemaVersion: "recommendation-decision-v1",
     legacySchemaVersion: "all-stock-agent-decision-v1",
@@ -21750,6 +21818,7 @@ function allStockAgentDecisionFromEvaluation(evaluation, action, runId, trigger)
     regimeTag: evaluation.regimeTag || null,
     actionability: evaluation.actionability || null,
     actionable: action === "买入" ? evaluation.actionableEligible === true && !isFallbackBuy : action === "卖出",
+    trackingEligible: action === "买入" ? tracksAsBuy : true,
     evidenceRefs: [
       ...(evaluation.newsStorylines || []).map((item) => item.id || item.url || item.title).filter(Boolean),
       ...(evaluation.matchedFactors || []).map((item) => item.id || item.label).filter(Boolean),
@@ -22038,6 +22107,32 @@ function allStockAgentOutcomeFromExcess(excessPct) {
   return outcomeFromExcess(excessPct, ALL_STOCK_AGENT_OUTCOME_DEADBAND_PCT);
 }
 
+function classifyAllStockAgentOutcomeQuality(outcome = {}) {
+  return classifyRecommendationOutcomeQuality(outcome, {
+    suspectReturnPct: ALL_STOCK_AGENT_SUSPECT_PRICE_RETURN_PCT,
+  });
+}
+
+function allStockAgentOutcomeIsUsable(outcome = {}) {
+  return recommendationOutcomeIsUsable(outcome, {
+    suspectReturnPct: ALL_STOCK_AGENT_SUSPECT_PRICE_RETURN_PCT,
+  });
+}
+
+function withAllStockAgentOutcomeQuality(outcome = {}) {
+  if (!outcome || typeof outcome !== "object") return outcome;
+  if (outcome.outcomeQualityStatus === "ok" || outcome.outcomeQualityStatus === "suspect_price") return outcome;
+  const quality = classifyAllStockAgentOutcomeQuality(outcome);
+  return {
+    ...outcome,
+    outcomeQualityStatus: quality.status,
+    outcomeQualityReasons: Array.isArray(outcome.outcomeQualityReasons) && outcome.outcomeQualityReasons.length
+      ? outcome.outcomeQualityReasons
+      : quality.reasons,
+    outcomeUsable: quality.usable,
+  };
+}
+
 function stockHistoryPricePath(stockHistory = [], ticker = "", fromAt = "", toAt = "") {
   return recommenderStockHistoryPricePath(stockHistory, ticker, fromAt, toAt);
 }
@@ -22140,6 +22235,14 @@ function buildAllStockAgentOutcomeSnapshots(state = {}, run = {}, db = {}, skill
         : allStockAgentDecisionPerformance(decision, exit.price);
       const outcome = allStockAgentOutcomeFromExcess(excessPct);
       const process = allStockAgentOutcomeProcess(decision, db.stockHistory || [], entryPrice, decisionAt, dueAt, outcome);
+      const quality = classifyAllStockAgentOutcomeQuality({
+        entryPrice,
+        exitPrice: exit.price,
+        rawReturnPct,
+        performancePct: decision.action === "卖出" ? -rawReturnPct : rawReturnPct,
+        benchmarkReturnPct,
+        excessPct,
+      });
       additions.push({
         schemaVersion: "all-stock-agent-outcome-v1",
         id: compactId(`all-stock-outcome-${ticker}-${horizonDays}`),
@@ -22169,6 +22272,9 @@ function buildAllStockAgentOutcomeSnapshots(state = {}, run = {}, db = {}, skill
         benchmarkReturnPct,
         excessPct,
         outcome,
+        outcomeQualityStatus: quality.status,
+        outcomeQualityReasons: quality.reasons,
+        outcomeUsable: quality.usable,
         maePct: process.maePct,
         mfePct: process.mfePct,
         timeToProfitDays: process.timeToProfitDays,
@@ -22252,7 +22358,7 @@ function updateAllStockAgentRuleStat(row, value, outcome, options = {}) {
 
 function buildAllStockAgentRuleStats(reviews = [], outcomeSnapshots = []) {
   const stats = {};
-  const snapshots = (outcomeSnapshots || []).filter((item) => item?.outcome && item.outcome !== "pending");
+  const snapshots = (outcomeSnapshots || []).filter((item) => item?.outcome && item.outcome !== "pending" && allStockAgentOutcomeIsUsable(item));
   if (snapshots.length) {
     for (const snapshot of snapshots) {
       const value = firstFiniteNumber(snapshot.excessPct, snapshot.performancePct);
@@ -22324,7 +22430,7 @@ function buildAllStockAgentRuleStats(reviews = [], outcomeSnapshots = []) {
 function allStockAgentOutcomeByDecision(state = {}) {
   const map = new Map();
   for (const snapshot of state.outcomeSnapshots || []) {
-    if (!snapshot?.decisionId || snapshot.outcome === "pending") continue;
+    if (!snapshot?.decisionId || snapshot.outcome === "pending" || !allStockAgentOutcomeIsUsable(snapshot)) continue;
     const rows = map.get(snapshot.decisionId) || [];
     rows.push(snapshot);
     map.set(snapshot.decisionId, rows);
@@ -22421,7 +22527,7 @@ function buildAllStockAgentPaperBook(state = {}, run = {}, db = {}, skill = {}) 
     const ticker = safeTicker(decision.ticker);
     const price = numberOrNull(decision.price);
     if (!ticker || !Number.isFinite(price) || price <= 0) continue;
-    if (allStockAgentDecisionIsExecutableBuy(decision) && !positions.has(ticker)) {
+    if (allStockAgentDecisionOpensPaperPosition(decision) && !positions.has(ticker)) {
       positions.set(ticker, {
         ticker,
         name: decision.name || ticker,
@@ -22767,7 +22873,8 @@ async function runAllStockAgentForRun(db, sourceRun, trigger = "manual", options
   const reviews = buildAllStockAgentReviews(stateWithOutcomes, source);
   const ruleStats = buildAllStockAgentRuleStats(reviews, stateWithOutcomes.outcomeSnapshots);
   const currentFactorWeights = allStockAgentCurrentFactorWeights(state);
-  let factorStats = allStockAgentBacktestFactorStats(stateWithOutcomes.outcomeSnapshots || []);
+  const usableOutcomeSnapshots = (stateWithOutcomes.outcomeSnapshots || []).filter(allStockAgentOutcomeIsUsable);
+  let factorStats = allStockAgentBacktestFactorStats(usableOutcomeSnapshots);
   let factorStatsSource = "live-outcomes";
   let factorStatsBacktest = null;
   if (!factorStatsRowCount(factorStats)) {
@@ -22782,12 +22889,15 @@ async function runAllStockAgentForRun(db, sourceRun, trigger = "manual", options
     }
   }
   factorStats = tagFactorStatsWithRegime(factorStats, regimeTag);
-  const persistentMemory = buildAllStockAgentPersistentMemory(stateWithOutcomes.outcomeSnapshots || []);
+  const persistentMemory = buildAllStockAgentPersistentMemory(usableOutcomeSnapshots);
   const factorWeightLearning = buildAllStockAgentFactorWeightLearning(factorStats, currentFactorWeights, skill, factorStatsSource);
-  const activeFactorWeights = factorWeightLearning.learnedWeights || currentFactorWeights;
+  const activeFactorWeights =
+    ALL_STOCK_AGENT_APPLY_LEARNED_WEIGHTS && factorWeightLearning.status === "updated"
+      ? factorWeightLearning.learnedWeights
+      : currentFactorWeights;
   const learningLog = buildRecommenderLearningLog(
     {
-      samples: (stateWithOutcomes.outcomeSnapshots || []).filter((item) => item?.outcome && item.outcome !== "pending").length,
+      samples: usableOutcomeSnapshots.filter((item) => item?.outcome && item.outcome !== "pending").length,
       precisionAt10: null,
       actionScoreRankIC: null,
       alphaScoreRankIC: null,
@@ -22813,15 +22923,49 @@ async function runAllStockAgentForRun(db, sourceRun, trigger = "manual", options
       return (b.buyScore || 0) - (a.buyScore || 0) || (b.actionScore || 0) - (a.actionScore || 0) || (b.confidence || 0) - (a.confidence || 0);
     });
   const buyLimit = Math.min(
-    ALL_STOCK_AGENT_ACTIONABLE_BUY_LIMIT,
-    Number(skill.settings?.actionableBuyLimit) || ALL_STOCK_AGENT_ACTIONABLE_BUY_LIMIT,
+    ALL_STOCK_AGENT_BUY_LIMIT,
     Number(skill.settings?.buyLimit) || ALL_STOCK_AGENT_BUY_LIMIT,
   );
+  const actionableBuyLimit = Math.min(
+    ALL_STOCK_AGENT_ACTIONABLE_BUY_LIMIT,
+    Number(skill.settings?.actionableBuyLimit) || ALL_STOCK_AGENT_ACTIONABLE_BUY_LIMIT,
+    buyLimit,
+  );
   const agentRunId = `${Date.now()}-all-stock-agent`;
-  const primaryBuyPool = evaluations.filter((item) => item.actionableEligible);
+  const primaryBuyPool = evaluations.filter(
+    (item) => item.buyEligible && !allStockAgentDecisionLogSuppressed(item),
+  );
+  let actionableCount = 0;
   const buyDecisions = primaryBuyPool
     .slice(0, buyLimit)
-    .map((item) => allStockAgentDecisionFromEvaluation(item, "买入", agentRunId, trigger));
+    .map((item) => {
+      const canBeActionable = item.actionableEligible === true && actionableCount < actionableBuyLimit;
+      if (canBeActionable) {
+        actionableCount += 1;
+        return allStockAgentDecisionFromEvaluation(item, "买入", agentRunId, trigger);
+      }
+      const capGate = item.actionableEligible === true
+        ? {
+            id: "actionable_daily_cap",
+            label: "每日可执行展示上限",
+            action: "downgrade_research",
+            evidence: `已达到今日 ${actionableBuyLimit} 个 actionable 上限；该标的仍保留为冻结追踪样本。`,
+          }
+        : null;
+      const capped = {
+        ...item,
+        actionableEligible: false,
+        actionability: {
+          ...(item.actionability || {}),
+          eligible: false,
+          status: "research",
+          gates: capGate ? [...(item.actionability?.gates || []), capGate] : (item.actionability?.gates || []),
+        },
+        gates: capGate ? [...(item.gates || []), capGate] : (item.gates || []),
+        risks: capGate ? [...(item.risks || []), `${capGate.label}：${capGate.evidence}`].slice(0, 7) : item.risks,
+      };
+      return allStockAgentDecisionFromEvaluation(capped, "买入", agentRunId, trigger);
+    });
   const buyDecisionTickers = new Set(buyDecisions.map((item) => item.ticker));
   const watchBuyCandidates = evaluations
     .filter((item) => !buyDecisionTickers.has(item.ticker))
@@ -22888,8 +23032,10 @@ async function runAllStockAgentForRun(db, sourceRun, trigger = "manual", options
       outcomes: stateWithOutcomes.outcomeSnapshots.length,
       newOutcomes: outcomeUpdate.added,
       skillChanges: skillUpdate.revision?.changes?.length || 0,
-      actionableBuyLimit: buyLimit,
-      researchDowngraded: evaluations.filter((item) => item.buyEligible && !item.actionableEligible).length,
+      trackedBuyLimit: buyLimit,
+      actionableBuyLimit,
+      actionableBuy: buyDecisions.filter((item) => item.actionable !== false).length,
+      researchDowngraded: buyDecisions.filter((item) => item.actionable === false || item.actionability?.status === "research").length,
     },
     roadmap: {
       schemaVersion: "investment-assistant-roadmap-status-v1",
@@ -22897,11 +23043,15 @@ async function runAllStockAgentForRun(db, sourceRun, trigger = "manual", options
       strategyConfigHash: strategyVersion.configHash,
       regime: regimeTag,
       antiOvertrading: {
-        actionableBuyLimit: buyLimit,
+        trackedBuyLimit: buyLimit,
+        actionableBuyLimit,
         cooldownTradingDays: skill.settings?.cooldownTradingDays,
         failedThesisCooldownTradingDays: skill.settings?.failedThesisCooldownTradingDays,
         earningsBlackoutDays: skill.settings?.earningsBlackoutDays,
+        earningsBlackoutPostDays: skill.settings?.earningsBlackoutPostDays,
         minActionableDataQuality: skill.settings?.minActionableDataQuality,
+        exposureSoftStartPct: skill.settings?.exposureSoftStartPct,
+        maxPortfolioExposurePct: skill.settings?.maxPortfolioExposurePct,
       },
     },
     universeCoverage: {
@@ -22965,6 +23115,8 @@ async function runAllStockAgentForRun(db, sourceRun, trigger = "manual", options
       previousWeights: currentFactorWeights,
       updatedAt: agentRun.completedAt,
       source: factorStatsSource,
+      mode: ALL_STOCK_AGENT_APPLY_LEARNED_WEIGHTS ? "learned_weights_applied_by_env" : "shadow_only_until_validation",
+      candidateWeights: factorWeightLearning.learnedWeights || null,
       lastLearningRunId: agentRun.id,
       lastLearning: factorWeightLearning,
     },
@@ -23044,8 +23196,11 @@ function buildRecommendationTrackRecordPayload(db = {}, filters = {}) {
   const regimeFilter = normalizeDisplayText(filters.regime || "");
   const completed = (state.outcomeSnapshots || [])
     .filter((item) => item?.outcome && item.outcome !== "pending")
+    .filter((item) => allStockAgentOutcomeIsUsable(item))
     .filter((item) => !horizonFilter || Number(item.horizonDays) === horizonFilter)
     .filter((item) => !regimeFilter || item.regime === regimeFilter || item.regimeTag?.bucket === regimeFilter);
+  const excluded = (state.outcomeSnapshots || [])
+    .filter((item) => item?.outcome && item.outcome !== "pending" && !allStockAgentOutcomeIsUsable(item));
   const byKey = new Map();
   for (const item of completed) {
     const horizon = Number(item.horizonDays) || 0;
@@ -23092,6 +23247,9 @@ function buildRecommendationTrackRecordPayload(db = {}, filters = {}) {
       regime: regimeFilter || "",
     },
     sampleCount: completed.length,
+    excludedCount: excluded.length,
+    quarantinedCount: excluded.length,
+    quarantineRule: `outcomeQualityStatus != ok 的样本不进入均值/胜率/学习统计；短周期价格异常阈值为 ${ALL_STOCK_AGENT_SUSPECT_PRICE_RETURN_PCT}%。`,
     buckets,
     factorStats: state.runs[0]?.factorStats || {},
     factorWeightLearning: state.factorWeightLearning || null,
@@ -23108,9 +23266,20 @@ function buildTodayRecommendationsPayload(db = {}) {
   const actionable = (latestAgent?.buyCandidates || [])
     .filter((item) => item.actionable !== false && item.actionability?.status !== "research")
     .slice(0, 3);
+  const downgradedTracked = (latestAgent?.buyCandidates || [])
+    .filter((item) => item.actionable === false || item.actionability?.status === "research");
+  const researchSeen = new Set(downgradedTracked.map((item) => safeTicker(item.ticker)).filter(Boolean));
+  const appendResearch = (items = []) =>
+    (items || []).filter((item) => {
+      const ticker = safeTicker(item.ticker);
+      if (!ticker || researchSeen.has(ticker)) return false;
+      researchSeen.add(ticker);
+      return true;
+    });
   const research = [
-    ...(latestAgent?.watchBuyCandidates || []),
-    ...(latestAgent?.evaluations || []).filter((item) => item.buyEligible && !item.actionableEligible),
+    ...downgradedTracked,
+    ...appendResearch(latestAgent?.watchBuyCandidates || []),
+    ...appendResearch((latestAgent?.evaluations || []).filter((item) => item.buyEligible && !item.actionableEligible)),
   ].slice(0, 20);
   return {
     schemaVersion: "recommendations-today-v1",
@@ -23129,8 +23298,8 @@ function buildTodayRecommendationsPayload(db = {}) {
     calls: {
       actionable,
       research,
-      actionableLimit: 3,
-      downgraded: latestAgent?.summary?.researchDowngraded || research.length,
+      actionableLimit: latestAgent?.summary?.actionableBuyLimit ?? 3,
+      downgraded: latestAgent?.summary?.researchDowngraded ?? research.length,
     },
     trackRecord: buildRecommendationTrackRecordPayload(db),
     health: {
@@ -23500,6 +23669,7 @@ function stockHistoryPriceAtOrAfter(stockHistory = [], ticker = "", afterDate = 
 function allStockAgentBacktestRuleStats(decisions = [], outcomes = []) {
   const stats = {};
   for (const outcome of outcomes || []) {
+    if (!allStockAgentOutcomeIsUsable(outcome)) continue;
     const value = firstFiniteNumber(outcome.excessPct, outcome.performancePct);
     if (!Number.isFinite(value)) continue;
     for (const rule of outcome.matchedRules || []) {
@@ -23611,6 +23781,7 @@ function backtestTurnover(daily = []) {
 function allStockAgentBacktestFactorStats(outcomes = []) {
   const stats = {};
   for (const outcome of outcomes || []) {
+    if (!allStockAgentOutcomeIsUsable(outcome)) continue;
     const value = firstFiniteNumber(outcome.excessPct, outcome.performancePct);
     if (!Number.isFinite(value)) continue;
     const factors = outcome.factorSnapshot?.factors || {};
@@ -23654,6 +23825,7 @@ function allStockAgentBacktestFactorStats(outcomes = []) {
 function allStockAgentBacktestRegimeSplit(outcomes = []) {
   const buckets = {};
   for (const outcome of outcomes || []) {
+    if (!allStockAgentOutcomeIsUsable(outcome)) continue;
     const value = firstFiniteNumber(outcome.excessPct, outcome.performancePct);
     if (!Number.isFinite(value)) continue;
     const macro = outcome.factorSnapshot?.factors?.macroRegime || {};
@@ -23693,7 +23865,7 @@ function allStockAgentBacktestRegimeSplit(outcomes = []) {
 }
 
 function allStockAgentBacktestLearningMetrics(decisions = [], outcomes = [], daily = []) {
-  const completed = outcomes.filter((item) => item.outcome && item.outcome !== "pending");
+  const completed = outcomes.filter((item) => item.outcome && item.outcome !== "pending" && allStockAgentOutcomeIsUsable(item));
   const wins = completed.filter((item) => item.outcome === "win").length;
   const precisionAt10 = completed.length ? wins / completed.length : null;
   const actionScoreIc = rankCorrelation(
@@ -23767,7 +23939,7 @@ function buildRecommenderLearningLog(learningMetrics = {}, factorStats = {}) {
 }
 
 function buildAllStockAgentPersistentMemory(outcomeSnapshots = []) {
-  const completed = (outcomeSnapshots || []).filter((item) => item?.outcome && item.outcome !== "pending");
+  const completed = (outcomeSnapshots || []).filter((item) => item?.outcome && item.outcome !== "pending" && allStockAgentOutcomeIsUsable(item));
   const recent = completed.slice(0, 40);
   const memories = recent
     .map((item) => {
@@ -23845,7 +24017,7 @@ function runAllStockAgentBacktest(db = {}, options = {}) {
       .sort((a, b) => Number(b.buyEligible) - Number(a.buyEligible) || (b.buyScore || 0) - (a.buyScore || 0) || (b.actionScore || 0) - (a.actionScore || 0));
     const buyLimit = Math.min(ALL_STOCK_AGENT_BUY_LIMIT, Number(skill.settings?.buyLimit) || ALL_STOCK_AGENT_BUY_LIMIT);
     const formalEvaluations = evaluations
-      .filter((item) => item.buyEligible || allStockAgentSupplementalBuyAllowed(item, skill))
+      .filter((item) => item.trackingEligible || item.buyEligible || allStockAgentSupplementalBuyAllowed(item, skill))
       .slice(0, buyLimit);
     const formalTickers = new Set(formalEvaluations.map((item) => item.ticker));
     const watchEvaluations = evaluations
@@ -23877,6 +24049,14 @@ function runAllStockAgentBacktest(db = {}, options = {}) {
           dueDate?.toISOString(),
           outcome,
         );
+        const quality = classifyAllStockAgentOutcomeQuality({
+          entryPrice,
+          exitPrice: exit.price,
+          rawReturnPct,
+          performancePct: rawReturnPct,
+          benchmarkReturnPct,
+          excessPct,
+        });
         outcomes.push({
           schemaVersion: "all-stock-agent-backtest-outcome-v1",
           decisionId: decision.id,
@@ -23898,6 +24078,9 @@ function runAllStockAgentBacktest(db = {}, options = {}) {
           excessPct,
           performancePct: rawReturnPct,
           outcome,
+          outcomeQualityStatus: quality.status,
+          outcomeQualityReasons: quality.reasons,
+          outcomeUsable: quality.usable,
           maePct: process.maePct,
           mfePct: process.mfePct,
           timeToProfitDays: process.timeToProfitDays,
@@ -23924,7 +24107,7 @@ function runAllStockAgentBacktest(db = {}, options = {}) {
         });
       }
     }
-    const dayOutcomes = outcomes.filter((item) => item.decisionAt === run.completedAt);
+    const dayOutcomes = outcomes.filter((item) => item.decisionAt === run.completedAt && allStockAgentOutcomeIsUsable(item));
     const avgExcess =
       dayOutcomes.length ? dayOutcomes.reduce((sum, item) => sum + Number(item.excessPct || 0), 0) / dayOutcomes.length : null;
     daily.push({
@@ -23940,7 +24123,8 @@ function runAllStockAgentBacktest(db = {}, options = {}) {
       tickers: buyDecisions.map((item) => item.ticker),
     });
   }
-  const completed = outcomes.filter((item) => item.outcome && item.outcome !== "pending");
+  const completed = outcomes.filter((item) => item.outcome && item.outcome !== "pending" && allStockAgentOutcomeIsUsable(item));
+  const quarantined = outcomes.filter((item) => item.outcome && item.outcome !== "pending" && !allStockAgentOutcomeIsUsable(item));
   const wins = completed.filter((item) => item.outcome === "win").length;
   const flats = completed.filter((item) => item.outcome === "flat").length;
   const avgExcess = completed.length ? completed.reduce((sum, item) => sum + Number(item.excessPct || 0), 0) / completed.length : null;
@@ -23964,6 +24148,7 @@ function runAllStockAgentBacktest(db = {}, options = {}) {
       formalBuy: decisions.filter((item) => item.signalKind === "formal-buy").length,
       watchBuy: decisions.filter((item) => item.signalKind === "watch-buy").length,
       outcomeSamples: completed.length,
+      quarantinedOutcomeSamples: quarantined.length,
       winRate: completed.length ? wins / completed.length : null,
       flatRate: completed.length ? flats / completed.length : null,
       avgExcessPct: avgExcess,
@@ -27212,6 +27397,130 @@ function optionContractTradePrice(contract = {}) {
   return null;
 }
 
+function optionContractMidPrice(contract = {}) {
+  const bid = numberOrNull(contract.bid);
+  const ask = numberOrNull(contract.ask);
+  if (Number.isFinite(bid) && Number.isFinite(ask) && bid >= 0 && ask > 0 && ask >= bid) {
+    return (bid + ask) / 2;
+  }
+  const mark = numberOrNull(contract.mark);
+  if (Number.isFinite(mark) && mark > 0) return mark;
+  return optionContractTradePrice(contract);
+}
+
+function optionContractProviderIv(contract = {}) {
+  return normalizeOptionIv(firstDefined(contract.impliedVolatility, contract.iv, contract.impliedVol, contract.implied_volatility));
+}
+
+function optionContractAtmIvCandidate(contract = {}, spot = null) {
+  const providerIv = optionContractProviderIv(contract);
+  if (Number.isFinite(providerIv) && providerIv > 0) {
+    return { iv: numberOrNull(providerIv), source: "provider", price: numberOrNull(optionContractMidPrice(contract)) };
+  }
+  const price = optionContractMidPrice(contract);
+  const strike = numberOrNull(contract.strike);
+  const dte = numberOrNull(contract.dte);
+  const finiteSpot = numberOrNull(spot ?? contract.underlyingPrice);
+  if (!Number.isFinite(price) || price <= 0 || !Number.isFinite(strike) || !Number.isFinite(dte) || !Number.isFinite(finiteSpot) || finiteSpot <= 0) {
+    return { iv: null, source: "", price: numberOrNull(price) };
+  }
+  const estimated = inferOptionIvFromPrice({
+    spot: finiteSpot,
+    strike,
+    dte,
+    optionType: contract.optionType === "put" ? "put" : "call",
+    price,
+  });
+  return Number.isFinite(estimated) && estimated > 0
+    ? { iv: numberOrNull(estimated), source: "estimated", price: numberOrNull(price) }
+    : { iv: null, source: "", price: numberOrNull(price) };
+}
+
+function optionContractAtmIvQuality(contract = {}, ivCandidate = {}) {
+  const openInterest = numberOrNull(contract.openInterest) || 0;
+  const volume = numberOrNull(contract.volume) || 0;
+  const bid = numberOrNull(contract.bid);
+  const ask = numberOrNull(contract.ask);
+  const hasQuote = Number.isFinite(bid) && Number.isFinite(ask) && ask >= bid && ask > 0;
+  const lastMs = new Date(contract.lastTradeTime || 0).getTime();
+  const staleLastTrade = Number.isFinite(lastMs) && lastMs > 0 && Date.now() - lastMs > 5 * 86400000;
+  if (!Number.isFinite(ivCandidate.iv) || ivCandidate.iv <= 0) return "thin";
+  if (!hasQuote && staleLastTrade) return "stale";
+  if (!hasQuote || openInterest + volume <= 0) return "thin";
+  return "ok";
+}
+
+function summarizeOptionAtmIv(contracts = [], spot = null) {
+  const finiteSpot = numberOrNull(spot);
+  if (!Array.isArray(contracts) || !contracts.length || !Number.isFinite(finiteSpot) || finiteSpot <= 0) {
+    return {
+      ivAtm: null,
+      ivAtmSource: "",
+      ivAtmQuality: "thin",
+      reason: "缺少期权链或标的价格，无法计算 ATM IV。",
+    };
+  }
+  const dated = contracts
+    .map((contract) => ({
+      contract,
+      dte: numberOrNull(contract?.dte),
+      strike: numberOrNull(contract?.strike),
+    }))
+    .filter((item) => Number.isFinite(item.dte) && item.dte >= 7 && item.dte <= 45 && Number.isFinite(item.strike));
+  if (!dated.length) {
+    return {
+      ivAtm: null,
+      ivAtmSource: "",
+      ivAtmQuality: "thin",
+      reason: "7-45 DTE 区间没有可用合约，按规范不做跨期限补值。",
+    };
+  }
+  const bestDte = dated
+    .slice()
+    .sort((a, b) => Math.abs(a.dte - 30) - Math.abs(b.dte - 30) || a.dte - b.dte)[0].dte;
+  const expiryRows = dated.filter((item) => item.dte === bestDte);
+  const ranked = expiryRows
+    .map((item) => {
+      const iv = optionContractAtmIvCandidate(item.contract, finiteSpot);
+      return {
+        ...item,
+        iv,
+        distance: Math.abs(item.strike - finiteSpot),
+        liquidity: Number(item.contract.openInterest || 0) + Number(item.contract.volume || 0),
+      };
+    })
+    .filter((item) => Number.isFinite(item.iv.iv) && item.iv.iv > 0)
+    .sort((a, b) => {
+      const distanceDiff = a.distance - b.distance;
+      if (distanceDiff) return distanceDiff;
+      const providerDiff = Number(b.iv.source === "provider") - Number(a.iv.source === "provider");
+      if (providerDiff) return providerDiff;
+      return b.liquidity - a.liquidity;
+    });
+  const selected = ranked[0];
+  if (!selected) {
+    return {
+      ivAtm: null,
+      ivAtmSource: "",
+      ivAtmQuality: "thin",
+      expirationDte: bestDte,
+      reason: "ATM 附近合约缺少 provider IV 且无法由中点价反推。",
+    };
+  }
+  return {
+    ivAtm: numberOrNull(selected.iv.iv),
+    ivAtmSource: selected.iv.source,
+    ivAtmQuality: optionContractAtmIvQuality(selected.contract, selected.iv),
+    expiration: selected.contract.expiration || "",
+    expirationDte: selected.dte,
+    strike: numberOrNull(selected.contract.strike),
+    optionType: selected.contract.optionType === "put" ? "put" : "call",
+    contractSymbol: selected.contract.contractSymbol || "",
+    midPrice: numberOrNull(selected.iv.price),
+    reason: selected.iv.source === "provider" ? "使用 provider 提供的 ATM IV。" : "provider IV 缺失，使用 bid/ask 中点反推 IV。",
+  };
+}
+
 function optionContractNotional(contract = {}) {
   const price = optionContractTradePrice(contract);
   const volume = Number(contract.volume || 0);
@@ -27437,11 +27746,16 @@ function summarizeOptionsChain(ticker, spot, contracts, expirations, errors = []
   const unusualActivity = compactOptionUnusualActivity(contracts, spot);
   const providerName = source.provider || "Yahoo Finance Options (OpenBB-style normalized)";
   const providerCapabilities = source.providerCapabilities || optionProviderCapabilities(providerName);
+  const summary = summarizeOptionAtmIv(contracts, spot);
   return {
     ticker,
     provider: providerName,
     generatedAt: nowIso(),
     underlyingPrice: numberOrNull(spot),
+    ivAtm: summary.ivAtm,
+    ivAtmSource: summary.ivAtmSource,
+    ivAtmQuality: summary.ivAtmQuality,
+    summary,
     expirations,
     contracts,
     contractCount: Array.isArray(contracts) ? contracts.length : 0,

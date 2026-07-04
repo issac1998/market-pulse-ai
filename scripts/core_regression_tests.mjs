@@ -16,10 +16,12 @@ import {
 } from "../lib/market_core.mjs";
 import {
   buildBenchmarkBasket,
+  classifyOutcomeQuality,
   learnRecommendationFactorWeights,
   normalizeRecommendationFactorWeights,
   normalizeFactorValue,
   outcomeFromExcess,
+  outcomeIsUsable,
   pathExcursions,
   scoreRecommendationFromFactorSnapshot,
   stockHistoryPricePath,
@@ -238,6 +240,33 @@ assert.ok(Math.abs(semiBasket.reduce((sum, item) => sum + item.weight, 0) - 1) <
 assert.equal(outcomeFromExcess(1.2, 0.5), "win", "Excess return above deadband should be win");
 assert.equal(outcomeFromExcess(-1.2, 0.5), "loss", "Excess return below negative deadband should be loss");
 assert.equal(outcomeFromExcess(0.2, 0.5), "flat", "Excess return inside deadband should be flat");
+const normalOutcomeQuality = classifyOutcomeQuality({
+  entryPrice: 100,
+  exitPrice: 104,
+  rawReturnPct: 4,
+  benchmarkReturnPct: 1,
+  excessPct: 3,
+});
+assert.equal(normalOutcomeQuality.status, "ok", "Normal outcome should remain usable");
+assert.equal(
+  outcomeIsUsable({ entryPrice: 100, exitPrice: 104, rawReturnPct: 4, benchmarkReturnPct: 1, excessPct: 3 }),
+  true,
+  "Complete outcome should be usable",
+);
+const badOutcomeQuality = classifyOutcomeQuality({
+  entryPrice: 0.0137,
+  exitPrice: 2.625,
+  rawReturnPct: 19059,
+  benchmarkReturnPct: 0.4,
+  excessPct: 19058,
+});
+assert.equal(badOutcomeQuality.status, "suspect_price", "Extreme price-scale outcome should be marked suspect_price");
+assert.equal(badOutcomeQuality.usable, false, "Extreme price-scale outcome should be quarantined");
+assert.equal(
+  outcomeIsUsable({ entryPrice: 0.0137, exitPrice: 2.625, rawReturnPct: 19059, excessPct: 19058 }),
+  false,
+  "Legacy rows without explicit quality status should still be quarantined when returns are extreme",
+);
 
 const pricePath = stockHistoryPricePath(
   [

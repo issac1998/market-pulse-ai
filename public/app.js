@@ -5279,8 +5279,19 @@ function renderAllStockAgent(agentState) {
     return;
   }
   const summary = latest.summary || {};
-  const buyRows = latest.buyCandidates || [];
-  const watchBuyRows = latest.watchBuyCandidates || [];
+  const allBuyRows = latest.buyCandidates || [];
+  const buyRows = allBuyRows.filter((item) => item.actionable !== false && item.actionability?.status !== "research");
+  const downgradedBuyRows = allBuyRows.filter((item) => item.actionable === false || item.actionability?.status === "research");
+  const downgradedTickers = new Set(downgradedBuyRows.map((item) => normalizeTickerSymbol(item.ticker)).filter(Boolean));
+  const watchBuyRows = [
+    ...downgradedBuyRows,
+    ...(latest.watchBuyCandidates || []).filter((item) => {
+      const ticker = normalizeTickerSymbol(item.ticker);
+      if (!ticker || downgradedTickers.has(ticker)) return false;
+      downgradedTickers.add(ticker);
+      return true;
+    }),
+  ];
   const sellRows = latest.sellCandidates || [];
   const holdRows = latest.holdReviews || [];
   const reviewRows = latest.reviews || [];
