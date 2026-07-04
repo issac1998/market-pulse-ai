@@ -3,6 +3,7 @@
 node_modules/
 .tools/
 .venv-openbb/
+.venv-bridges/
 .ruff_cache/
 data/*.log
 data/

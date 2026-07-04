@@ -728,3 +728,155 @@ consoleErrors=[]
 - Strategy-version promote is human-only by design and requires a stored passed validation record.
 - Live trading remains locked behind existing `IBKR_TRADING_ENABLED` plus `data/ALLOW_LIVE_TRADING`; no broker order-submission path was added.
 - To exercise successful promote/rollback in production, first run a learning-producing agent/backtest to create a candidate, then attach/persist a passed walk-forward validation record.
+
+---
+
+## External Review (Claude) — 2026-07-05
+
+Reviewed all nine commits (`b916737`..`92d1ad6`) by code reading plus live verification on `localhost:5173`. **Verdict: 8 of 9 WPs pass; WP3 conditional-pass on an environmental blocker whose root cause this review identified (see below). No ground-rule violations found** — LLM write-boundary intact, all scoring through `lib/recommender_core.mjs`, frozen records untouched, sample counts everywhere, order double-lock verified still blocking, schemas append-only.
+
+| WP | Verdict | Review evidence |
+|---|---|---|
+| WP1 | ✅ pass | Code: pool = buyEligible minus cooldown-suppressed, ≤10 tracked, top-3 actionable with `actionable_daily_cap` gate labeling. Live: GDC outcome tagged `suspect_price`; track record 18 ok + 1 excluded; **T+1 avg excess now +0.71% vs the poisoned +1003.8%**; `options_snapshots` 15/15 non-null iv_atm (AAPL ATM IV 0.2499, source=provider). The ">3 tracked decisions" live demo remains blocked by market state, not code: a fresh 166s agent run produced 0 buyEligible because every top scorer is either a held position (TSM/SNDK/GLW/META/MRVL — no-add-to-existing rule; shadow debate penalties working, e.g. META 89→63) or stale-data vetoed (collection run is 2026-06-30). Will self-verify on the next fresh trading-day run. |
+| WP2 | ✅ pass | No `llm` references in watcher/triage/push beyond `llmCriticalPath:false` flags; explain endpoint writes only `llmSummary/llmStatus`; volume-pace honestly `missing_same_time_20d_baseline`; disabled by default. Push end-to-end untested (no provider configured — owner action). |
+| WP3 | ⚠️ conditional | Code correct (asOf filtering, Alpha158 subset parity fixtures, resumable builder). Corpus empty for an **environmental reason this review diagnosed**: `akshare_bridge.py` strips proxy env by default (`AKSHARE_KEEP_PROXY` unset) while this network reaches EastMoney/FRED only through the `.env` proxy; Finnhub 403 = free-tier candle limitation. Deeper diagnosis (post-review): EastMoney is unreachable from this network even unsandboxed and proxied; all three D5 sources are dead here. **D5 amended (see CAPABILITY_GAPS §9): Longbridge CLI `kline` becomes the primary bar source** — verified live returning 1,000 daily bars (AAPL back to 2022-07) — with IBKR `history_payload` secondary. **Follow-up F1 (expanded, final)**: (a) add Longbridge + IBKR fetchers to `build_historical_bars.py` as primary/secondary bar sources; keep AkShare/Finnhub/AV tertiary with `.env` proxies loaded; (b) **fetch FRED via a Node one-shot (or `curl` subprocess), not Python urllib** — verified: FRED silently drops Python's TLS handshake (urllib times out direct *and* proxied) while Node fetch returns the full DGS10 CSV (267 KB, history to 1962) and curl returns 200; the script already spawns Node for `scoreFredMacroRegime`, so route the CSV download through the same process. |
+| WP4 | ✅ pass | Engine verified lookahead-free (bars ≤ signalDate; entry next bar open; round-trip costs); pseudo-decisions labeled `historical-backtest`, separate tables; provenance complete; sector-basket gap honestly labeled. Real-corpus run pending WP3 data. |
+| WP5 | ✅ pass | Bridges degrade visibly, never block. quantstats unavailable because the pip index reachable *without proxy* caps at 0.0.77 — same proxy root cause; retry install with proxy env (**F2**). alphalens-reloaded installed and functioning. |
+| WP6 | ✅ pass | Real PIT rows live (AAPL 10-Q filed 2026-05-01, revenue 111.184B), current-filings row present, restatement property fixture-proven. **F3**: 13F per-holding expansion (currently filing-level). **F4**: wire production EDGAR collector into the watcher seam. **F5**: verify one real-world restated quarter once more history is ingested. |
+| WP7 | ✅ pass | Winsorization + Spearman matrix in engine; earnings blackout verified signed/pre-only (`daysUntil`); accrual tables wired (0 rows until consensus snapshots/data flow — by design, no fabrication). |
+| WP8 | ✅ pass | `activeFactorWeights = currentFactorWeights` (from active strategy version); `ALL_STOCK_AGENT_APPLY_LEARNED_WEIGHTS` explicitly ignored with `env_ignored_candidate_workflow_required`; promote requires a `passed` validation record (verified in `strategy_versions.mjs`); rollback restores stacked snapshot; regime-split/live-parity live with labeled sources + n. **F6**: retire the legacy duplicate `active` row via an append-only retire event. |
+| WP9 | ✅ pass | All four containers live (`todayDeskBox`, `stockDeepDiveBox`, `recommendationReconciliationBox`, `strategyGovernanceBox`); route inventory consistent (72 routes / 42 UI fetches); regression suite green under review re-run. |
+
+**Owner actions to activate shipped-but-dormant capability**: enable `INTRADAY_WATCHER_ENABLED` + configure `PUSH_PROVIDER`/`PUSH_TARGET`; enable `AGENT_DEBATE_DAILY_ENABLED` (starts the Phase-3.1 evidence clock per D14); install quantstats through the proxy; commit the two outstanding doc edits (README.md, ROADMAP_FINAL amendment).
+
+### Data-verification session (Claude, 2026-07-05, post-review)
+
+Corpus populated via the D5-amended recipe (review-side scratchpad scripts; Codex's F1 replaces them in-repo):
+
+- **`historical_bars`: 40,172 rows, 45 tickers (44 universe + SPY), 2019-11-18 → 2026-07-02** via Longbridge CLI `--format json` (values arrive as strings — F1 implementation note).
+- **`historical_regimes`: 1,648 dates** via curl-downloaded FRED CSVs fed into the script's own `compute_regimes_with_node`; buckets: 宏观中性 1327 / 宏观谨慎 261 / 宏观顺风 54 / 宏观风险收缩 6.
+- **WP3 gate CLOSED**: cross-provider spot-check vs June live quotes (IBKR/Finnhub-sourced): 58/64 (ticker,day) pairs within 1%; the 6 outliers are capture-timing semantics (live quotes snapshotted mid-session at 15:18Z, incl. TSLA on a volatile day), not bad data.
+- **WP4 core gate CLOSED**: full pre-registered run (top-10, T+20 primary, 5+10 bps, 1,000 signal dates) completed server-side: 4,374 pseudo-decisions, 25,314 outcomes. Independent recomputation: **0 lookahead violations, 0 label violations; engine T+20 hit rate 0.49520 vs independently recomputed 0.495 — match.**
+- **First real factor evidence** (all under the survivorship caveat — the 44-ticker universe was selected in 2026, so *levels* are inflated; *structure* is the usable part): avg excess vs SPY rises monotonically with horizon — T+1 −0.00%, T+3 +0.61%, T+5 +1.25%, T+10 +1.66%, **T+20 +2.10%, T+60 +5.44%**; hit(>+0.5%) 37.0% → 55.7%. Pooled rankIC (n=25,179): momentum **−0.042** (short-horizon reversal — supports the two-sleeve split), liquidity proxy +0.139, macroRegime ≈0, non-reconstructable factors honestly null.
+
+**New follow-ups from this session (F7–F11, all in `server/historical_backtest.mjs` metrics/report assembly — the engine core is sound):**
+
+- **F7 (serialization)**: runs >~500 dates kill the HTTP response (1,000-date run: HTTP 000 at 137s; 2-year segment: truncated at 1.57 MB despite HTTP 200; report endpoint returns an empty body for the big run). Runs DO persist server-side. Fix: persist decisions/outcomes to SQLite tables, return compact summaries, paginate detail reads.
+- **F8 (headline metrics null)**: `avgExcessPct`, `totalReturnPct`, `excessReturnPct` are null while per-horizon data exists — assembly incomplete.
+- **F9 (MaxDD broken)**: `maxDrawdown = −100%` (duration 4094, recovered:false) — equity-curve construction is wrong (portfolio did not go to zero); Sharpe (0.147) and CAGR (4.7%) are untrustworthy until the daily book is rebuilt correctly.
+- **F10 (weight windows empty)**: `candidateWeights.status="candidate-only"` with **0 windows** despite 4,166 completed primary-horizon samples ≥ minSamples — the windowed learner never ran; the §7.1 weight deliverable is not yet produced.
+- **F11 (stub analytics)**: `icDecay` returns `pending-more-horizons`/null despite 6 horizons of outcomes; `regimeSplit` rows = 0 in the run payload despite populated `historical_regimes`.
+
+**Deferred-gate status after this session**: WP3 ✅ closed; WP4 core ✅ closed, WP4 *report deliverable* ❌ blocked on F8–F10; WP5 tolerance still pending quantstats install; WP6 real-restatement and WP8 successful-promote unchanged.
+
+### Data-verification addendum — segment B + regime evidence + WP5 closure (Claude, 2026-07-05)
+
+- **Segment B run** (2024-07-01 → 2026-07-02, same pre-registered config, executed via direct Node `runHistoricalWalkForwardFromSqlite` — validating the F7 workaround): 4,430 pseudo-decisions, 25,649 outcomes, **0 lookahead / 0 label violations; engine T+20 hit 0.5714 vs independent recomputation 0.572 — second match**. Avg excess vs SPY: T+1 +0.13%, T+5 +1.73%, T+10 +3.79%, **T+20 +8.49% (hit 0.572), T+60 +24.99% (hit 0.614)**. Same survivorship caveat, amplified: Seg B's universe is the 2026 watchlist's AI-era winners — treat levels as ceiling, structure as signal.
+- **First regime-dependence evidence (the corpus's headline insight)**: momentum rankIC **−0.042** in Seg A (2022-24, n=25,179) vs **+0.049** in Seg B (2024-26, n=25,649). One momentum weight cannot serve both eras — direct empirical support for regime-split evaluation (§10 D11) and the two-sleeve split (§3.1).
+- **F10 nuance**: pooled candidate weights ARE produced per run (capped ≤1% steps, `candidate-only`, e.g. momentum 0.18→0.1785 in Seg A vs 0.18→0.1806 in Seg B — the two segments push opposite directions, consistent with the IC flip); what's missing is only the per-window trajectory. Reference (rankIC-proportional) weights are degenerate (≈96% liquidity-proxy) until WP6 makes more factors reconstructable — labeled, not misleading.
+- **WP5 gate closed with an amendment (F12)**: system Python is 3.9.6 → quantstats ≥0.0.81 uninstallable (needs ≥3.10), and 0.0.77 is runtime-incompatible with the installed pandas (`int − Timedelta` in `qs.stats`). The bridge degrades **visibly and correctly** to native-python, whose Sharpe/MaxDD match an independent recomputation to 1e-15 on a 120-day fixture. **F12 for Codex: give the bridges a Python ≥3.10 venv (e.g. `.venv-bridges`, `BRIDGE_PYTHON` env) with quantstats≥0.0.81 + pandas≥2.2.2; until then the native engine is the metrics source and reports say so (D10).**
+- Bar-source implementation note for F1: Longbridge `--format json` returns OHLCV values as **strings** — coerce to float before insert.
+
+### Codex Follow-Up F1 / F7-F12 Execution — 2026-07-05
+
+Implemented the remaining historical-calibration polish items from the execution log.
+
+- **F1 Longbridge / IBKR fetchers**: `scripts/build_historical_bars.py` now tries `longbridge:kline` first, `ibkr:socket-historical` second, then AkShare / Finnhub / Alpha Vantage. Longbridge JSON OHLCV strings are coerced through the shared `number()` path before insert. Longbridge `history` failures and count-limit failures are recorded in provider errors and the fetcher progressively falls back through safe `--count` sizes. FRED CSV download now uses a Node `fetch` one-shot with curl fallback instead of Python urllib.
+- **F7 SQLite persistence + pagination**: historical backtest runs now persist summary, decisions, outcomes, and daily rows into append-only SQLite tables (`historical_backtest_runs`, `historical_backtest_decisions`, `historical_backtest_outcomes`, `historical_backtest_daily`). The POST API returns compact samples plus `detailCounts` and pagination endpoints. New details API: `GET /api/recommender/historical-backtest/:id/details?kind=outcomes|decisions|daily&page=1&pageSize=100`.
+- **F8 headline metrics**: run metrics now include `avgExcessPct`, `totalReturnPct`, `excessReturnPct`, `avgBenchmarkReturnPct`, `benchmarkTotalReturnPct`, and `portfolioDailyExcessPct`, each with sample count.
+- **F9 equity curve / MaxDD fix**: MaxDD, Sharpe, Sortino, CAGR, Calmar, and volatility now use the daily portfolio-average return series instead of compounding overlapping individual outcome samples. Returns at or below -100% are guarded and counted in `maxDrawdown.guardedReturnCount`.
+- **F10 per-window weight trajectory**: `weightOutputs.trajectory.windows` now records rolling candidate weights, factor rankIC, window dates, status, and sample counts. Pooled learned weights remain `candidate-only`.
+- **F11 icDecay / regimeSplit**: `factorAnalysis.icDecay` now computes horizon-by-horizon rankIC curves per factor. `factorAnalysis.regimeSplit` now groups usable outcomes by macro-regime bucket with `n`, average excess, hit rate, and horizons.
+- **F12 Python bridge venv**: created `.venv-bridges` with Python 3.12.13, `quantstats==0.0.81`, `pandas==2.3.3`, `numpy==2.5.1`; `.gitignore` excludes it. `server/historical_backtest.mjs` now prefers `BRIDGE_PYTHON`, then `.venv-bridges/bin/python`, before falling back. `scripts/quantstats_bridge.py` now supplies a DatetimeIndex to QuantStats, fixing the pandas `int - Timedelta` failure.
+
+Verification:
+
+```text
+$ python3 scripts/build_historical_bars.py --db /tmp/mp_hist_test.sqlite --tickers AAPL --days 10 --provider-order longbridge --skip-regimes --force --fetch-timeout 30 --sleep-ms 0 --min-existing 0
+{"ticker":"AAPL","rows":19,"insertedOrReplaced":19,"source":"longbridge:kline"}
+
+$ python3 - <<'PY'  # FRED Node/curl path
+fred_csv("DGS10", 30) -> rows=16109, last={"date":"2026-07-01","value":4.48}
+PY
+
+$ printf ... | .venv-bridges/bin/python scripts/quantstats_bridge.py
+{"ok":true,"engine":"quantstats","preferredAvailable":true,...}
+
+$ BRIDGE_PYTHON=.venv-bridges/bin/python node --input-type=module - <<'NODE'
+runHistoricalWalkForwardFromSqlite(... compactResponse:true) -> detailCounts={decisions:10,outcomes:18,daily:5}, quantPreferred=quantstats, weightWindows=1, icDecayKeys=10, regimeSplitRows=1
+historicalBacktestDetailsFromSqlite(... kind:"outcomes") -> total=18, rows=3
+NODE
+
+$ curl -sS -X POST http://localhost:5173/api/recommender/historical-backtest ...
+detailCounts={decisions:3,outcomes:4,daily:3}, returned={decisions:1,outcomes:1}, quant=quantstats
+
+$ curl -sS http://localhost:5173/api/recommender/historical-backtest/<id>/details?kind=outcomes&page=1&pageSize=2
+{"kind":"outcomes","total":4,"rows":2,"first":"AMD"}
+
+$ node --check server.mjs && node --check server/historical_backtest.mjs && node --check scripts/generate_route_inventory.mjs
+pass
+
+$ python3 -m py_compile scripts/build_historical_bars.py scripts/quantstats_bridge.py scripts/ibkr_gateway_bridge.py
+pass
+
+$ node scripts/core_regression_tests.mjs
+core_regression_tests: ok
+
+$ node scripts/generate_route_inventory.mjs && node scripts/generate_route_inventory.mjs --check
+{"status":"ok","routes":75,"uiFetches":43,"storeKeys":25}
+{"status":"ok","routes":75,"uiFetches":43,"storeKeys":25}
+```
+
+Notes:
+
+- `.venv-bridges/` is a local runtime artifact and is intentionally ignored by git.
+- Longbridge `history` still returns `301607` in this environment, but the implemented fetcher records it and falls back to bounded `kline --count` calls.
+- IBKR historical fetcher is wired behind `HISTORICAL_IBKR_ENABLED=1` / `--ibkr-enabled 1`; it uses the existing socket bridge and remains non-trading.
+
+---
+
+## WP10 — Backtest Analytics Repair — 2026-07-05
+
+Implemented Round 2 WP10 on top of the earlier F7-F12 repairs.
+
+Changes:
+
+- Rebuilt the historical daily equity book in `server/historical_backtest.mjs`: equal-weight open pseudo-positions are now marked daily from `historical_bars` closes, with entry/exit cost applied on the holding path. `portfolioReturnPct`, `benchmarkReturnPct`, and `avgExcessPct` are stored per day.
+- MaxDD / Sharpe / CAGR / Calmar now derive from the corrected daily book, not from overlapping outcome samples.
+- Added `historicalMaxDrawdownFromReturns()` fixture seam and an exact 10-day MaxDD regression test.
+- Added SQLite compatibility tables `historical_decisions` and `historical_outcomes` in addition to the existing `historical_backtest_*` detail tables.
+- Details pagination now accepts both `page/pageSize` and `offset/limit`.
+- Weight trajectory defaults now produce real rolling windows on multi-quarter runs; the 2-year segment produced 17 windows.
+
+Verification:
+
+```text
+$ node --check server/historical_backtest.mjs && node --check server.mjs && node --check public/app.js
+pass
+
+$ node scripts/core_regression_tests.mjs
+core_regression_tests: ok
+
+$ python3 -m py_compile scripts/build_historical_bars.py scripts/quantstats_bridge.py scripts/ibkr_gateway_bridge.py
+pass
+
+$ node scripts/generate_route_inventory.mjs && node scripts/generate_route_inventory.mjs --check
+{"status":"ok","routes":75,"uiFetches":43,"storeKeys":25}
+{"status":"ok","routes":75,"uiFetches":43,"storeKeys":25}
+
+$ curl -sS --max-time 300 -X POST http://localhost:5173/api/recommender/historical-backtest ...
+2-year segment, maxDates=500:
+detailCounts={decisions:4430,outcomes:25649,daily:444}
+returned={decisions:1,outcomes:1}
+maxDrawdown=-18.2994%, guardedReturnCount=0
+headline avgExcessPct=7.2522%, totalReturnPct=712.8069%, excessReturnPct=543.7442%
+weightWindows=17
+firstIcDecayCells=6
+regimeSplitRows=3
+preferred=quantstats
+responseBytes=346718
+```
+
+Contradictions:
+
+- None for WP10. The spec expected the populated 40k-bar / 45-ticker corpus, which is present in `data/market_pulse.sqlite`.

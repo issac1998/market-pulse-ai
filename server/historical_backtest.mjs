@@ -1,5 +1,6 @@
 import crypto from "node:crypto";
 import { execFile } from "node:child_process";
+import fs from "node:fs";
 import { fileURLToPath } from "node:url";
 
 import { buildFactorSnapshotAsOf, normalizeHistoricalBars } from "../lib/historical_features.mjs";
@@ -14,7 +15,12 @@ import { numberOrNull } from "../lib/market_core.mjs";
 
 const DEFAULT_HORIZONS = [1, 3, 5, 10, 20, 60];
 const DEFAULT_WEIGHTS = normalizeRecommendationFactorWeights();
-const PYTHON = process.env.HISTORICAL_BRIDGE_PYTHON || process.env.SQLITE_SYNC_PYTHON || "python3";
+const BRIDGE_VENV_PYTHON = fileURLToPath(new URL("../.venv-bridges/bin/python", import.meta.url));
+const PYTHON = process.env.BRIDGE_PYTHON
+  || process.env.HISTORICAL_BRIDGE_PYTHON
+  || (fs.existsSync(BRIDGE_VENV_PYTHON) ? BRIDGE_VENV_PYTHON : "")
+  || process.env.SQLITE_SYNC_PYTHON
+  || "python3";
 const QUANTSTATS_BRIDGE = fileURLToPath(new URL("../scripts/quantstats_bridge.py", import.meta.url));
 const ALPHALENS_BRIDGE = fileURLToPath(new URL("../scripts/alphalens_bridge.py", import.meta.url));
 
@@ -110,6 +116,19 @@ function sqliteJson(dbPath, sql, timeoutMs = 30000) {
   });
 }
 
+function sqliteExec(dbPath, sql, timeoutMs = 60000) {
+  return new Promise((resolve, reject) => {
+    const child = execFile("sqlite3", [dbPath], { timeout: timeoutMs, maxBuffer: 16 * 1024 * 1024 }, (error, stdout, stderr) => {
+      if (error) {
+        reject(new Error(`${error.message}${stderr ? `; ${stderr}` : ""}`));
+        return;
+      }
+      resolve(stdout);
+    });
+    child.stdin.end(sql);
+  });
+}
+
 function runJsonBridge(scriptPath, payload, timeoutMs = 60000) {
   return new Promise((resolve, reject) => {
     execFile(PYTHON, [scriptPath], { timeout: timeoutMs, maxBuffer: 64 * 1024 * 1024 }, (error, stdout, stderr) => {
@@ -128,6 +147,10 @@ function runJsonBridge(scriptPath, payload, timeoutMs = 60000) {
 
 function sqlText(value = "") {
   return String(value || "").replace(/'/g, "''");
+}
+
+function sqlJson(value) {
+  return sqlText(JSON.stringify(value ?? null));
 }
 
 function groupBars(rows = []) {
@@ -199,9 +222,12 @@ function maxDrawdownFromReturns(returns = []) {
   let maxDrawdown = 0;
   let duration = 0;
   let maxDuration = 0;
+  let guardedReturnCount = 0;
   for (const value of returns) {
     if (!Number.isFinite(value)) continue;
-    equity *= 1 + value / 100;
+    const bounded = value <= -99.9 ? -99.9 : value;
+    guardedReturnCount += bounded !== value ? 1 : 0;
+    equity *= 1 + bounded / 100;
     if (equity >= peak) {
       peak = equity;
       duration = 0;
@@ -212,41 +238,93 @@ function maxDrawdownFromReturns(returns = []) {
       maxDuration = Math.max(maxDuration, duration);
     }
   }
-  return { pct: maxDrawdown, duration, maxDuration, recovered: duration === 0 };
+  return { pct: maxDrawdown, duration, maxDuration, recovered: duration === 0, guardedReturnCount };
+}
+
+export function historicalMaxDrawdownFromReturns(returns = []) {
+  return maxDrawdownFromReturns(returns);
 }
 
 function metric(value, n, source = "historical-backtest") {
   return { value: Number.isFinite(value) ? value : null, n, source };
 }
 
-function aggregateOutcomes(outcomes = [], primaryHorizon = 20) {
+function compoundReturnPct(values = []) {
+  const rows = values.filter(Number.isFinite);
+  if (!rows.length) return null;
+  let equity = 1;
+  for (const value of rows) equity *= 1 + Math.max(value, -99.9) / 100;
+  return (equity - 1) * 100;
+}
+
+function equityAndDrawdownCurve(dailyRows = []) {
+  let equity = 1;
+  let peak = 1;
+  return dailyRows
+    .filter((row) => Number.isFinite(pct(row.avgExcessPct)))
+    .map((row) => {
+      const value = Math.max(pct(row.avgExcessPct), -99.9);
+      equity *= 1 + value / 100;
+      peak = Math.max(peak, equity);
+      const drawdownPct = peak > 0 ? (equity / peak - 1) * 100 : null;
+      return {
+        date: row.date,
+        returnPct: value,
+        equity: Number(equity.toFixed(8)),
+        drawdownPct: Number.isFinite(drawdownPct) ? drawdownPct : null,
+        n: row.outcomeSamples || 0,
+      };
+    });
+}
+
+function aggregateOutcomes(outcomes = [], primaryHorizon = 20, dailyRows = []) {
   const rows = outcomes.filter((row) => row.horizonDays === primaryHorizon && row.outcomeUsable !== false);
   const excess = rows.map((row) => pct(row.excessPct)).filter(Number.isFinite);
   const raw = rows.map((row) => pct(row.rawReturnPct)).filter(Number.isFinite);
+  const benchmark = rows.map((row) => pct(row.benchmarkReturnPct)).filter(Number.isFinite);
   const wins = rows.filter((row) => row.outcome === "win").length;
   const losses = rows.filter((row) => row.outcome === "loss").length;
   const positive = excess.filter((value) => value > 0);
   const negative = excess.filter((value) => value < 0);
-  const dailyExcess = excess;
+  const dailyExcess = (dailyRows || []).map((row) => pct(row.avgExcessPct)).filter(Number.isFinite);
+  const dailyRaw = (dailyRows || []).map((row) => pct(row.portfolioReturnPct ?? row.avgRawReturnPct)).filter(Number.isFinite);
+  const dailyBenchmark = (dailyRows || []).map((row) => pct(row.benchmarkReturnPct ?? row.avgBenchmarkReturnPct)).filter(Number.isFinite);
   const avgExcess = mean(excess);
   const avgRaw = mean(raw);
-  const volatility = std(excess);
-  const downside = std(excess.filter((value) => value < 0));
-  const maxDrawdown = maxDrawdownFromReturns(excess);
-  const cagr = excess.length ? ((1 + (avgExcess || 0) / 100) ** Math.min(252 / Math.max(1, excess.length), 4) - 1) * 100 : null;
+  const avgBenchmark = mean(benchmark);
+  const portfolioAvg = mean(dailyExcess);
+  const volatility = std(dailyExcess);
+  const downside = std(dailyExcess.filter((value) => value < 0));
+  const maxDrawdown = maxDrawdownFromReturns(dailyExcess);
+  const totalExcessReturnPct = compoundReturnPct(dailyExcess);
+  const totalRawReturnPct = compoundReturnPct(dailyRaw);
+  const totalBenchmarkReturnPct = compoundReturnPct(dailyBenchmark);
+  const years = dailyExcess.length ? Math.max(dailyExcess.length / 252, 1 / 252) : null;
+  const cagr = Number.isFinite(totalExcessReturnPct) && years ? ((1 + totalExcessReturnPct / 100) ** (1 / years) - 1) * 100 : null;
   const profit = positive.reduce((sum, value) => sum + value, 0);
   const loss = Math.abs(negative.reduce((sum, value) => sum + value, 0));
   return {
     primaryHorizon,
     sampleCount: rows.length,
+    avgExcessPct: metric(avgExcess, rows.length),
+    totalReturnPct: metric(totalRawReturnPct, dailyRaw.length),
+    excessReturnPct: metric(totalExcessReturnPct, dailyExcess.length),
     cagr: metric(cagr, rows.length),
     excessVsSpy: metric(avgExcess, rows.length),
     avgRawReturnPct: metric(avgRaw, rows.length),
-    maxDrawdown: { ...metric(maxDrawdown.pct, rows.length), duration: maxDrawdown.maxDuration, recovered: maxDrawdown.recovered },
+    avgBenchmarkReturnPct: metric(avgBenchmark, rows.length),
+    portfolioDailyExcessPct: metric(portfolioAvg, dailyExcess.length),
+    benchmarkTotalReturnPct: metric(totalBenchmarkReturnPct, dailyBenchmark.length),
+    maxDrawdown: {
+      ...metric(maxDrawdown.pct, dailyExcess.length),
+      duration: maxDrawdown.maxDuration,
+      recovered: maxDrawdown.recovered,
+      guardedReturnCount: maxDrawdown.guardedReturnCount,
+    },
     calmar: metric(Number.isFinite(cagr) && maxDrawdown.pct < 0 ? cagr / Math.abs(maxDrawdown.pct) : null, rows.length),
-    sharpe: metric(Number.isFinite(avgExcess) && Number.isFinite(volatility) && volatility > 0 ? (avgExcess / volatility) * Math.sqrt(252 / Math.max(1, primaryHorizon)) : null, rows.length),
-    sortino: metric(Number.isFinite(avgExcess) && Number.isFinite(downside) && downside > 0 ? (avgExcess / downside) * Math.sqrt(252 / Math.max(1, primaryHorizon)) : null, rows.length),
-    volatility: metric(volatility, rows.length),
+    sharpe: metric(Number.isFinite(portfolioAvg) && Number.isFinite(volatility) && volatility > 0 ? (portfolioAvg / volatility) * Math.sqrt(252) : null, dailyExcess.length),
+    sortino: metric(Number.isFinite(portfolioAvg) && Number.isFinite(downside) && downside > 0 ? (portfolioAvg / downside) * Math.sqrt(252) : null, dailyExcess.length),
+    volatility: metric(volatility, dailyExcess.length),
     hitRate: metric(rows.length ? wins / rows.length : null, rows.length),
     payoff: metric(positive.length && negative.length ? mean(positive) / Math.abs(mean(negative)) : null, rows.length),
     expectancy: metric(avgExcess, rows.length),
@@ -262,21 +340,146 @@ function dailyTable(decisions = [], outcomes = [], primaryHorizon = 20) {
   const byDate = new Map();
   for (const decision of decisions) {
     const date = ymd(decision.signalDate || decision.generatedAt);
-    if (!byDate.has(date)) byDate.set(date, { date, decisions: 0, tickers: [], outcomeSamples: 0, avgExcessPct: null });
+    if (!byDate.has(date)) byDate.set(date, { date, decisions: 0, tickers: [], outcomeSamples: 0, avgExcessPct: null, avgRawReturnPct: null, avgBenchmarkReturnPct: null, _excess: [], _raw: [], _benchmark: [] });
     const row = byDate.get(date);
     row.decisions += 1;
     row.tickers.push(decision.ticker);
   }
   for (const outcome of outcomes.filter((row) => row.horizonDays === primaryHorizon && row.outcomeUsable !== false)) {
     const date = ymd(outcome.decisionAt);
-    if (!byDate.has(date)) byDate.set(date, { date, decisions: 0, tickers: [], outcomeSamples: 0, avgExcessPct: null });
+    if (!byDate.has(date)) byDate.set(date, { date, decisions: 0, tickers: [], outcomeSamples: 0, avgExcessPct: null, avgRawReturnPct: null, avgBenchmarkReturnPct: null, _excess: [], _raw: [], _benchmark: [] });
     const row = byDate.get(date);
     row.outcomeSamples += 1;
-    const values = outcomes
-      .filter((item) => ymd(item.decisionAt) === date && item.horizonDays === primaryHorizon && item.outcomeUsable !== false)
-      .map((item) => pct(item.excessPct))
-      .filter(Number.isFinite);
-    row.avgExcessPct = mean(values);
+    const excess = pct(outcome.excessPct);
+    const raw = pct(outcome.rawReturnPct);
+    const benchmark = pct(outcome.benchmarkReturnPct);
+    if (Number.isFinite(excess)) row._excess.push(excess);
+    if (Number.isFinite(raw)) row._raw.push(raw);
+    if (Number.isFinite(benchmark)) row._benchmark.push(benchmark);
+  }
+  return [...byDate.values()]
+    .map((row) => {
+      row.avgExcessPct = mean(row._excess);
+      row.avgRawReturnPct = mean(row._raw);
+      row.avgBenchmarkReturnPct = mean(row._benchmark);
+      delete row._excess;
+      delete row._raw;
+      delete row._benchmark;
+      return row;
+    })
+    .sort((a, b) => a.date.localeCompare(b.date));
+}
+
+function spyDailyReturnForDate(spyRows = [], date = "") {
+  const target = ymd(date);
+  const index = spyRows.findIndex((row) => row.date >= target);
+  if (index <= 0) return null;
+  const previous = spyRows[index - 1];
+  const current = spyRows[index];
+  if (!current || current.date !== target) return null;
+  return returnPct(previous.close, current.close, 0);
+}
+
+function portfolioDailyBook(decisions = [], byTicker = new Map(), spyRows = [], primaryHorizon = 20, roundTripCostBps = 0) {
+  const byDate = new Map();
+  const entryExitCostPct = (Number(roundTripCostBps) || 0) / 200;
+  for (const decision of decisions || []) {
+    const ticker = safeTicker(decision.ticker);
+    const rows = byTicker.get(ticker) || [];
+    const entryIndex = rows.findIndex((row) => row.date >= decision.entryDate);
+    if (entryIndex < 0) continue;
+    const exitIndex = Math.min(rows.length - 1, entryIndex + Math.max(1, Number(primaryHorizon || 1)) - 1);
+    for (let index = entryIndex; index <= exitIndex; index += 1) {
+      const row = rows[index];
+      const previousPrice = index === entryIndex ? pct(decision.entryPrice) : pct(rows[index - 1]?.close);
+      const currentPrice = pct(row.close);
+      let positionReturnPct = returnPct(previousPrice, currentPrice, 0);
+      if (!Number.isFinite(positionReturnPct)) continue;
+      if (index === entryIndex) positionReturnPct -= entryExitCostPct;
+      if (index === exitIndex) positionReturnPct -= entryExitCostPct;
+      const date = row.date;
+      if (!byDate.has(date)) {
+        byDate.set(date, {
+          date,
+          decisions: 0,
+          newDecisions: 0,
+          openPositions: 0,
+          tickers: [],
+          outcomeSamples: 0,
+          avgExcessPct: null,
+          avgRawReturnPct: null,
+          avgBenchmarkReturnPct: null,
+          portfolioReturnPct: null,
+          benchmarkReturnPct: null,
+          _positionReturns: [],
+        });
+      }
+      const daily = byDate.get(date);
+      daily._positionReturns.push(positionReturnPct);
+      daily.tickers.push(ticker);
+      daily.openPositions += 1;
+    }
+  }
+  for (const decision of decisions || []) {
+    const date = ymd(decision.signalDate || decision.generatedAt);
+    if (!byDate.has(date)) {
+      byDate.set(date, {
+        date,
+        decisions: 0,
+        newDecisions: 0,
+        openPositions: 0,
+        tickers: [],
+        outcomeSamples: 0,
+        avgExcessPct: null,
+        avgRawReturnPct: null,
+        avgBenchmarkReturnPct: null,
+        portfolioReturnPct: null,
+        benchmarkReturnPct: null,
+        _positionReturns: [],
+      });
+    }
+    byDate.get(date).newDecisions += 1;
+  }
+  return [...byDate.values()]
+    .map((row) => {
+      const portfolioReturnPct = mean(row._positionReturns);
+      const benchmarkReturnPct = spyDailyReturnForDate(spyRows, row.date);
+      const excess = Number.isFinite(portfolioReturnPct)
+        ? portfolioReturnPct - (Number.isFinite(benchmarkReturnPct) ? benchmarkReturnPct : 0)
+        : null;
+      row.decisions = row.openPositions;
+      row.tickers = [...new Set(row.tickers)].sort();
+      row.portfolioReturnPct = portfolioReturnPct;
+      row.benchmarkReturnPct = benchmarkReturnPct;
+      row.avgRawReturnPct = portfolioReturnPct;
+      row.avgBenchmarkReturnPct = benchmarkReturnPct;
+      row.avgExcessPct = excess;
+      delete row._positionReturns;
+      return row;
+    })
+    .sort((a, b) => a.date.localeCompare(b.date));
+}
+
+function mergeOutcomeSamplesIntoDaily(dailyRows = [], outcomes = [], primaryHorizon = 20) {
+  const byDate = new Map((dailyRows || []).map((row) => [row.date, { ...row }]));
+  for (const outcome of outcomes.filter((row) => row.horizonDays === primaryHorizon && row.outcomeUsable !== false)) {
+    const date = ymd(outcome.decisionAt);
+    if (!byDate.has(date)) {
+      byDate.set(date, {
+        date,
+        decisions: 0,
+        newDecisions: 0,
+        openPositions: 0,
+        tickers: [],
+        outcomeSamples: 0,
+        avgExcessPct: null,
+        avgRawReturnPct: null,
+        avgBenchmarkReturnPct: null,
+        portfolioReturnPct: null,
+        benchmarkReturnPct: null,
+      });
+    }
+    byDate.get(date).outcomeSamples += 1;
   }
   return [...byDate.values()].sort((a, b) => a.date.localeCompare(b.date));
 }
@@ -346,6 +549,92 @@ function factorStats(outcomes = []) {
   return stats;
 }
 
+function outcomeRegimeBucket(outcome = {}) {
+  const direct = outcome.regimeBucket || outcome.regime || outcome.regimeTag?.bucket;
+  if (direct) return String(direct);
+  const raw = outcome.factorSnapshot?.factors?.macroRegime?.raw || {};
+  return raw.bucket || raw.regime || raw.marketRegime || "unknown";
+}
+
+function quantileSpreadForFactor(outcomes = [], factorId = "") {
+  const rows = outcomes
+    .filter((row) => row.outcomeUsable !== false)
+    .map((outcome) => ({
+      score: pct(outcome.factorSnapshot?.factors?.[factorId]?.score),
+      excess: pct(outcome.excessPct),
+    }))
+    .filter((row) => Number.isFinite(row.score) && Number.isFinite(row.excess))
+    .sort((a, b) => a.score - b.score);
+  if (rows.length < 20) {
+    return { value: null, n: rows.length, source: "historical-backtest", status: "not-enough-cross-section" };
+  }
+  const bucket = Math.max(1, Math.floor(rows.length / 5));
+  const low = rows.slice(0, bucket).map((row) => row.excess);
+  const high = rows.slice(-bucket).map((row) => row.excess);
+  return {
+    value: (mean(high) ?? 0) - (mean(low) ?? 0),
+    n: rows.length,
+    source: "historical-backtest",
+    topQuantileAvgExcessPct: mean(high),
+    bottomQuantileAvgExcessPct: mean(low),
+  };
+}
+
+function icDecayForFactor(outcomes = [], factorId = "") {
+  const byHorizon = new Map();
+  for (const outcome of outcomes.filter((row) => row.outcomeUsable !== false)) {
+    const horizon = Number(outcome.horizonDays || 0);
+    if (!horizon) continue;
+    if (!byHorizon.has(horizon)) byHorizon.set(horizon, { scores: [], returns: [] });
+    const row = byHorizon.get(horizon);
+    row.scores.push(pct(outcome.factorSnapshot?.factors?.[factorId]?.score));
+    row.returns.push(pct(outcome.excessPct));
+  }
+  const curve = [...byHorizon.entries()]
+    .map(([horizonDays, row]) => ({
+      horizonDays,
+      rankIC: rankCorrelation(row.scores, row.returns),
+      n: row.scores.filter((value, index) => Number.isFinite(value) && Number.isFinite(row.returns[index])).length,
+    }))
+    .filter((row) => row.n >= 3)
+    .sort((a, b) => a.horizonDays - b.horizonDays);
+  if (curve.length < 2) {
+    return { value: null, n: curve.reduce((sum, row) => sum + row.n, 0), source: "historical-backtest", status: "not-enough-horizons", curve };
+  }
+  const first = curve[0];
+  const last = curve.at(-1);
+  return {
+    value: Number.isFinite(first.rankIC) && Number.isFinite(last.rankIC) ? last.rankIC - first.rankIC : null,
+    n: curve.reduce((sum, row) => sum + row.n, 0),
+    source: "historical-backtest",
+    status: "ok",
+    curve,
+  };
+}
+
+function regimeSplit(outcomes = []) {
+  const byRegime = new Map();
+  for (const outcome of outcomes.filter((row) => row.outcomeUsable !== false)) {
+    const regime = outcomeRegimeBucket(outcome);
+    if (!byRegime.has(regime)) byRegime.set(regime, []);
+    byRegime.get(regime).push(outcome);
+  }
+  return [...byRegime.entries()]
+    .map(([regime, rows]) => {
+      const excess = rows.map((row) => pct(row.excessPct)).filter(Number.isFinite);
+      const wins = rows.filter((row) => row.outcome === "win").length;
+      return {
+        regime,
+        n: rows.length,
+        avgExcessPct: mean(excess),
+        hitRate: rows.length ? wins / rows.length : null,
+        horizons: [...new Set(rows.map((row) => row.horizonDays).filter(Boolean))].sort((a, b) => a - b),
+        source: "historical-backtest",
+      };
+    })
+    .sort((a, b) => b.n - a.n);
+}
+
 function factorAnalysis(outcomes = []) {
   const stats = factorStats(outcomes);
   const rows = Object.values(stats);
@@ -363,13 +652,47 @@ function factorAnalysis(outcomes = []) {
     schemaVersion: "historical-factor-analysis-v1",
     factorStats: stats,
     rankIC: Object.fromEntries(rows.map((row) => [row.id, { value: row.rankIC, n: row.samples, source: "historical-backtest" }])),
-    quantileSpreads: Object.fromEntries(rows.map((row) => [row.id, { value: null, n: row.samples, source: "historical-backtest", status: "not-enough-cross-section" }])),
-    icDecay: Object.fromEntries(rows.map((row) => [row.id, { value: null, n: row.samples, source: "historical-backtest", status: "pending-more-horizons" }])),
+    quantileSpreads: Object.fromEntries(rows.map((row) => [row.id, quantileSpreadForFactor(usable, row.id)])),
+    icDecay: Object.fromEntries(rows.map((row) => [row.id, icDecayForFactor(usable, row.id)])),
+    regimeSplit: regimeSplit(usable),
     correlationMatrix,
   };
 }
 
-function weightOutputs(stats = {}, currentWeights = DEFAULT_WEIGHTS, options = {}) {
+function weightTrajectory(outcomes = [], currentWeights = DEFAULT_WEIGHTS, options = {}) {
+  const windowDays = Math.max(20, Number(options.weightWindowDays || 120));
+  const stepDays = Math.max(5, Number(options.weightStepDays || 20));
+  const dates = [...new Set(outcomes.map((row) => ymd(row.decisionAt)).filter(Boolean))].sort();
+  if (dates.length < 2) return [];
+  const windows = [];
+  for (let endIndex = Math.min(windowDays, dates.length) - 1; endIndex < dates.length; endIndex += stepDays) {
+    const startIndex = Math.max(0, endIndex - windowDays + 1);
+    const startDate = dates[startIndex];
+    const endDate = dates[endIndex];
+    const windowOutcomes = outcomes.filter((row) => {
+      const date = ymd(row.decisionAt);
+      return date >= startDate && date <= endDate && row.outcomeUsable !== false;
+    });
+    const stats = factorStats(windowOutcomes);
+    const learned = learnRecommendationFactorWeights(stats, {
+      currentWeights,
+      minSamples: options.minSamples || 20,
+      maxStepPct: options.maxStepPct || 1,
+      source: "historical-backtest-window",
+    });
+    windows.push({
+      startDate,
+      endDate,
+      n: windowOutcomes.length,
+      status: windowOutcomes.length >= (options.minSamples || 20) ? "ok" : "low-sample",
+      candidateWeights: learned.learnedWeights || {},
+      factorRankIC: Object.fromEntries(Object.entries(stats).map(([id, row]) => [id, { value: row.rankIC, n: row.samples, source: "historical-backtest-window" }])),
+    });
+  }
+  return windows;
+}
+
+function weightOutputs(stats = {}, currentWeights = DEFAULT_WEIGHTS, options = {}, outcomes = []) {
   const learned = learnRecommendationFactorWeights(stats, {
     currentWeights,
     minSamples: options.minSamples || 20,
@@ -406,6 +729,12 @@ function weightOutputs(stats = {}, currentWeights = DEFAULT_WEIGHTS, options = {
       note: "Historical weights are candidate strategy-version inputs only; live active weights require human promotion.",
     },
     referenceWeights: { source: "historical-backtest", label: "reference-only", weights: referenceWeights },
+    trajectory: {
+      schemaVersion: "historical-weight-trajectory-v1",
+      windowDays: Math.max(20, Number(options.weightWindowDays || 120)),
+      stepDays: Math.max(5, Number(options.weightStepDays || 20)),
+      windows: weightTrajectory(outcomes, currentWeights, options),
+    },
     verdicts,
   };
 }
@@ -431,8 +760,8 @@ function quantstatsPayload(run = {}) {
     schemaVersion: "quantstats-input-v1",
     daily: (run.daily || []).map((row) => ({
       date: row.date,
-      returnPct: row.avgExcessPct,
-      benchmarkReturnPct: 0,
+      returnPct: row.portfolioReturnPct ?? row.avgRawReturnPct ?? row.avgExcessPct,
+      benchmarkReturnPct: row.benchmarkReturnPct ?? row.avgBenchmarkReturnPct ?? 0,
     })),
     costs: {
       costBps: run.config?.costBps || 0,
@@ -463,6 +792,196 @@ function alphalensPayload(run = {}) {
     schemaVersion: "alphalens-input-v1",
     horizons: run.config?.horizons || DEFAULT_HORIZONS,
     observations: [...byKey.values()],
+  };
+}
+
+function historicalRunSchemaSql() {
+  return `
+CREATE TABLE IF NOT EXISTS historical_backtest_runs (
+  id TEXT PRIMARY KEY,
+  generated_at TEXT,
+  status TEXT,
+  decisions_count INTEGER,
+  outcomes_count INTEGER,
+  daily_count INTEGER,
+  summary_json TEXT NOT NULL,
+  metrics_json TEXT NOT NULL,
+  report_json TEXT NOT NULL,
+  json TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS historical_backtest_decisions (
+  run_id TEXT NOT NULL,
+  id TEXT NOT NULL,
+  ticker TEXT,
+  signal_date TEXT,
+  action_score REAL,
+  alpha_score REAL,
+  json TEXT NOT NULL,
+  PRIMARY KEY (run_id, id)
+);
+CREATE INDEX IF NOT EXISTS idx_historical_backtest_decisions_run_signal
+  ON historical_backtest_decisions(run_id, signal_date, ticker);
+CREATE TABLE IF NOT EXISTS historical_backtest_outcomes (
+  run_id TEXT NOT NULL,
+  decision_id TEXT NOT NULL,
+  ticker TEXT,
+  horizon_days INTEGER,
+  decision_at TEXT,
+  entry_date TEXT,
+  exit_date TEXT,
+  raw_return_pct REAL,
+  benchmark_return_pct REAL,
+  excess_pct REAL,
+  outcome TEXT,
+  outcome_quality_status TEXT,
+  regime TEXT,
+  json TEXT NOT NULL,
+  PRIMARY KEY (run_id, decision_id, horizon_days)
+);
+CREATE INDEX IF NOT EXISTS idx_historical_backtest_outcomes_run_horizon
+  ON historical_backtest_outcomes(run_id, horizon_days, decision_at);
+CREATE TABLE IF NOT EXISTS historical_decisions (
+  run_id TEXT NOT NULL,
+  id TEXT NOT NULL,
+  ticker TEXT,
+  signal_date TEXT,
+  action_score REAL,
+  alpha_score REAL,
+  json TEXT NOT NULL,
+  PRIMARY KEY (run_id, id)
+);
+CREATE INDEX IF NOT EXISTS idx_historical_decisions_run_signal
+  ON historical_decisions(run_id, signal_date, ticker);
+CREATE TABLE IF NOT EXISTS historical_outcomes (
+  run_id TEXT NOT NULL,
+  decision_id TEXT NOT NULL,
+  ticker TEXT,
+  horizon_days INTEGER,
+  decision_at TEXT,
+  entry_date TEXT,
+  exit_date TEXT,
+  raw_return_pct REAL,
+  benchmark_return_pct REAL,
+  excess_pct REAL,
+  outcome TEXT,
+  outcome_quality_status TEXT,
+  regime TEXT,
+  json TEXT NOT NULL,
+  PRIMARY KEY (run_id, decision_id, horizon_days)
+);
+CREATE INDEX IF NOT EXISTS idx_historical_outcomes_run_horizon
+  ON historical_outcomes(run_id, horizon_days, decision_at);
+CREATE TABLE IF NOT EXISTS historical_backtest_daily (
+  run_id TEXT NOT NULL,
+  date TEXT NOT NULL,
+  decisions INTEGER,
+  outcome_samples INTEGER,
+  avg_excess_pct REAL,
+  json TEXT NOT NULL,
+  PRIMARY KEY (run_id, date)
+);
+CREATE INDEX IF NOT EXISTS idx_historical_backtest_daily_run_date
+  ON historical_backtest_daily(run_id, date);
+`;
+}
+
+function historicalRunSummary(run = {}) {
+  return {
+    schemaVersion: "historical-backtest-run-summary-v1",
+    id: run.id,
+    generatedAt: run.generatedAt,
+    status: run.status,
+    scope: run.scope,
+    config: run.config,
+    strategyHash: run.strategyHash,
+    decisionCount: run.decisions?.length || run.detailCounts?.decisions || 0,
+    outcomeCount: run.outcomes?.length || run.detailCounts?.outcomes || 0,
+    dailyCount: run.daily?.length || run.detailCounts?.daily || 0,
+    metrics: run.metrics,
+    weightOutputs: run.weightOutputs,
+    factorAnalysis: run.factorAnalysis
+      ? {
+          schemaVersion: run.factorAnalysis.schemaVersion,
+          rankIC: run.factorAnalysis.rankIC,
+          quantileSpreads: run.factorAnalysis.quantileSpreads,
+          icDecay: run.factorAnalysis.icDecay,
+          regimeSplit: run.factorAnalysis.regimeSplit,
+        }
+      : null,
+    provenance: run.provenance,
+    caveats: run.caveats,
+  };
+}
+
+async function persistHistoricalBacktestRun(sqlitePath, run = {}, report = {}, timeoutMs = 60000) {
+  if (!sqlitePath || !run?.id) return { persisted: false, reason: "missing-sqlite-or-run-id" };
+  const summary = historicalRunSummary(run);
+  const compactJson = {
+    ...summary,
+    schemaVersion: run.schemaVersion,
+    metricEngines: run.metricEngines,
+    equityCurve: run.equityCurve || [],
+    drawdownCurve: run.drawdownCurve || [],
+  };
+  const statements = [
+    "PRAGMA busy_timeout=60000;",
+    historicalRunSchemaSql(),
+    "BEGIN;",
+    `DELETE FROM historical_backtest_decisions WHERE run_id='${sqlText(run.id)}';`,
+    `DELETE FROM historical_backtest_outcomes WHERE run_id='${sqlText(run.id)}';`,
+    `DELETE FROM historical_decisions WHERE run_id='${sqlText(run.id)}';`,
+    `DELETE FROM historical_outcomes WHERE run_id='${sqlText(run.id)}';`,
+    `DELETE FROM historical_backtest_daily WHERE run_id='${sqlText(run.id)}';`,
+    `DELETE FROM historical_backtest_runs WHERE id='${sqlText(run.id)}';`,
+    `INSERT INTO historical_backtest_runs(id, generated_at, status, decisions_count, outcomes_count, daily_count, summary_json, metrics_json, report_json, json)
+      VALUES ('${sqlText(run.id)}','${sqlText(run.generatedAt)}','${sqlText(run.status)}',${Number(run.decisions?.length || 0)},${Number(run.outcomes?.length || 0)},${Number(run.daily?.length || 0)},'${sqlJson(summary)}','${sqlJson(run.metrics || {})}','${sqlJson(report || {})}','${sqlJson(compactJson)}');`,
+  ];
+  for (const decision of run.decisions || []) {
+    const values = `('${sqlText(run.id)}','${sqlText(decision.id)}','${sqlText(decision.ticker)}','${sqlText(ymd(decision.signalDate || decision.generatedAt))}',${pct(decision.actionScore) ?? "NULL"},${pct(decision.alphaScore) ?? "NULL"},'${sqlJson(decision)}')`;
+    statements.push(`INSERT OR REPLACE INTO historical_backtest_decisions(run_id, id, ticker, signal_date, action_score, alpha_score, json) VALUES ${values};`);
+    statements.push(`INSERT OR REPLACE INTO historical_decisions(run_id, id, ticker, signal_date, action_score, alpha_score, json) VALUES ${values};`);
+  }
+  for (const outcome of run.outcomes || []) {
+    const values = `('${sqlText(run.id)}','${sqlText(outcome.decisionId)}','${sqlText(outcome.ticker)}',${Number(outcome.horizonDays || 0)},'${sqlText(ymd(outcome.decisionAt))}','${sqlText(outcome.entryDate)}','${sqlText(outcome.exitDate)}',${pct(outcome.rawReturnPct) ?? "NULL"},${pct(outcome.benchmarkReturnPct) ?? "NULL"},${pct(outcome.excessPct) ?? "NULL"},'${sqlText(outcome.outcome)}','${sqlText(outcome.outcomeQualityStatus)}','${sqlText(outcomeRegimeBucket(outcome))}','${sqlJson(outcome)}')`;
+    statements.push(`INSERT OR REPLACE INTO historical_backtest_outcomes(run_id, decision_id, ticker, horizon_days, decision_at, entry_date, exit_date, raw_return_pct, benchmark_return_pct, excess_pct, outcome, outcome_quality_status, regime, json) VALUES ${values};`);
+    statements.push(`INSERT OR REPLACE INTO historical_outcomes(run_id, decision_id, ticker, horizon_days, decision_at, entry_date, exit_date, raw_return_pct, benchmark_return_pct, excess_pct, outcome, outcome_quality_status, regime, json) VALUES ${values};`);
+  }
+  for (const row of run.daily || []) {
+    statements.push(
+      `INSERT OR REPLACE INTO historical_backtest_daily(run_id, date, decisions, outcome_samples, avg_excess_pct, json)
+       VALUES ('${sqlText(run.id)}','${sqlText(row.date)}',${Number(row.decisions || 0)},${Number(row.outcomeSamples || 0)},${pct(row.avgExcessPct) ?? "NULL"},'${sqlJson(row)}');`,
+    );
+  }
+  statements.push("COMMIT;");
+  await sqliteExec(sqlitePath, statements.join("\n"), timeoutMs);
+  return { persisted: true, runId: run.id };
+}
+
+function compactHistoricalRun(run = {}, options = {}) {
+  const limit = Math.max(0, Number(options.detailLimit ?? 20));
+  const decisionCount = run.decisions?.length || 0;
+  const outcomeCount = run.outcomes?.length || 0;
+  const dailyCount = run.daily?.length || 0;
+  return {
+    ...run,
+    detailPersisted: true,
+    detailCounts: {
+      decisions: decisionCount,
+      outcomes: outcomeCount,
+      daily: dailyCount,
+    },
+    decisions: limit ? (run.decisions || []).slice(0, limit) : [],
+    outcomes: limit ? (run.outcomes || []).slice(0, limit) : [],
+    daily: limit ? (run.daily || []).slice(-limit) : [],
+    pagination: {
+      schemaVersion: "historical-backtest-pagination-v1",
+      detailLimit: limit,
+      endpoints: {
+        decisions: `/api/recommender/historical-backtest/${encodeURIComponent(run.id)}/details?kind=decisions&page=1&pageSize=100`,
+        outcomes: `/api/recommender/historical-backtest/${encodeURIComponent(run.id)}/details?kind=outcomes&page=1&pageSize=100`,
+        daily: `/api/recommender/historical-backtest/${encodeURIComponent(run.id)}/details?kind=daily&page=1&pageSize=100`,
+      },
+    },
   };
 }
 
@@ -607,6 +1126,7 @@ export function runHistoricalWalkForwardFromRows({ bars = [], regimes = [], conf
           excessPct: excess,
           horizonDays: horizon,
         });
+        const regimeBucket = outcomeRegimeBucket({ factorSnapshot: decision.factorSnapshot });
         outcomes.push({
           schemaVersion: "historical-backtest-outcome-v1",
           decisionId: decision.id,
@@ -628,6 +1148,7 @@ export function runHistoricalWalkForwardFromRows({ bars = [], regimes = [], conf
           outcomeQualityStatus: quality.status,
           outcomeQualityReasons: quality.reasons,
           outcomeUsable: quality.usable,
+          regimeBucket,
           factorSnapshot: decision.factorSnapshot,
           actionScore: decision.actionScore,
           alphaScore: decision.alphaScore,
@@ -638,11 +1159,16 @@ export function runHistoricalWalkForwardFromRows({ bars = [], regimes = [], conf
     }
   }
   const stats = factorStats(outcomes);
-  const metrics = aggregateOutcomes(outcomes, runConfig.primaryHorizon);
-  const daily = dailyTable(decisions, outcomes, runConfig.primaryHorizon);
+  const daily = mergeOutcomeSamplesIntoDaily(
+    portfolioDailyBook(decisions, byTicker, spyRows, runConfig.primaryHorizon, roundTripCostBps),
+    outcomes,
+    runConfig.primaryHorizon,
+  );
+  const metrics = aggregateOutcomes(outcomes, runConfig.primaryHorizon, daily);
   const periods = periodTable(outcomes, runConfig.primaryHorizon);
   const factorPack = factorAnalysis(outcomes);
-  const weights = weightOutputs(stats, DEFAULT_WEIGHTS, runConfig);
+  const weights = weightOutputs(stats, DEFAULT_WEIGHTS, runConfig, outcomes);
+  const equityCurve = equityAndDrawdownCurve(daily);
   const run = {
     schemaVersion: "historical-walk-forward-run-v1",
     id: `hist-bt-${Date.now()}-${strategyHash.slice(0, 8)}`,
@@ -662,6 +1188,8 @@ export function runHistoricalWalkForwardFromRows({ bars = [], regimes = [], conf
     decisions,
     outcomes,
     daily,
+    equityCurve,
+    drawdownCurve: equityCurve.map((row) => ({ date: row.date, drawdownPct: row.drawdownPct, n: row.n })),
     periods,
     metrics: {
       ...metrics,
@@ -675,6 +1203,7 @@ export function runHistoricalWalkForwardFromRows({ bars = [], regimes = [], conf
       exposure: metric(daily.length ? mean(daily.map((row) => Math.min(1, (row.decisions || 0) / runConfig.topN))) : null, daily.length),
     },
     factorAnalysis: factorPack,
+    factorStats: factorPack.factorStats,
     weightOutputs: weights,
     provenance: {
       schemaVersion: "historical-backtest-provenance-v1",
@@ -725,6 +1254,16 @@ export async function runHistoricalWalkForwardFromSqlite({ sqlitePath, config = 
     const result = runHistoricalWalkForwardFromRows({ bars: [], regimes: [], config });
     await applyMetricBridges(result.run, config);
     result.report = buildReport(result.run);
+    result.run.persistence = await persistHistoricalBacktestRun(
+      sqlitePath,
+      result.run,
+      result.report,
+      Math.max(Number(config.sqliteTimeoutMs || 30000), 60000),
+    ).catch((error) => ({ persisted: false, error: error.message }));
+    if (config.compactResponse !== false) {
+      result.run = compactHistoricalRun(result.run, { detailLimit: config.detailLimit ?? 20 });
+      result.report = buildReport(result.run);
+    }
     return result;
   }
   const tickerList = tickers.map((ticker) => `'${sqlText(ticker)}'`).join(",");
@@ -753,7 +1292,72 @@ export async function runHistoricalWalkForwardFromSqlite({ sqlitePath, config = 
   const result = runHistoricalWalkForwardFromRows({ bars, regimes, config: { ...config, pitFundamentals, pitFundamentalsError } });
   await applyMetricBridges(result.run, config);
   result.report = buildReport(result.run);
+  const persistence = await persistHistoricalBacktestRun(
+    sqlitePath,
+    result.run,
+    result.report,
+    Math.max(Number(config.sqliteTimeoutMs || 30000), 60000),
+  ).catch((error) => ({ persisted: false, error: error.message }));
+  result.run.persistence = persistence;
+  if (config.compactResponse !== false) {
+    result.run = compactHistoricalRun(result.run, { detailLimit: config.detailLimit ?? 20 });
+    result.report = buildReport(result.run);
+  }
   return result;
+}
+
+export async function historicalBacktestDetailsFromSqlite({ sqlitePath, runId, kind = "outcomes", page = 1, pageSize = 100, offset = null, limit = null, horizonDays = null } = {}) {
+  if (!sqlitePath) throw new Error("sqlitePath is required");
+  const safeRunId = sqlText(runId);
+  const safeKind = String(kind || "outcomes").toLowerCase();
+  const size = Math.max(1, Math.min(500, Number(limit || pageSize || 100)));
+  const requestedOffset = offset !== null && offset !== undefined && String(offset).trim() !== "" ? Math.max(0, Number(offset)) : null;
+  const currentPage = requestedOffset === null ? Math.max(1, Number(page || 1)) : Math.floor(requestedOffset / size) + 1;
+  const rowOffset = requestedOffset === null ? (currentPage - 1) * size : requestedOffset;
+  const requestedHorizon = horizonDays !== null && horizonDays !== undefined && String(horizonDays).trim() !== "" ? Number(horizonDays) : null;
+  const tables = {
+    decisions: {
+      table: "historical_backtest_decisions",
+      order: "signal_date, ticker",
+      where: `run_id='${safeRunId}'`,
+    },
+    outcomes: {
+      table: "historical_backtest_outcomes",
+      order: "decision_at, ticker, horizon_days",
+      where: [`run_id='${safeRunId}'`, Number.isFinite(requestedHorizon) ? `horizon_days=${requestedHorizon}` : ""].filter(Boolean).join(" AND "),
+    },
+    daily: {
+      table: "historical_backtest_daily",
+      order: "date",
+      where: `run_id='${safeRunId}'`,
+    },
+  };
+  const spec = tables[safeKind];
+  if (!spec) throw new Error(`Unsupported historical detail kind: ${kind}`);
+  const countRows = await sqliteJson(sqlitePath, `SELECT COUNT(*) AS total FROM ${spec.table} WHERE ${spec.where};`);
+  const total = Number(countRows?.[0]?.total || 0);
+  const rows = await sqliteJson(
+    sqlitePath,
+    `SELECT json FROM ${spec.table} WHERE ${spec.where} ORDER BY ${spec.order} LIMIT ${size} OFFSET ${rowOffset};`,
+  );
+  return {
+    schemaVersion: "historical-backtest-details-page-v1",
+    runId,
+    kind: safeKind,
+    page: currentPage,
+    offset: rowOffset,
+    limit: size,
+    pageSize: size,
+    total,
+    totalPages: Math.ceil(total / size),
+    rows: rows.map((row) => {
+      try {
+        return JSON.parse(row.json || "{}");
+      } catch (error) {
+        return { parseError: true, error: error.message, raw: row.json };
+      }
+    }),
+  };
 }
 
 export function historicalBacktestReport(run = {}) {

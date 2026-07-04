@@ -51,6 +51,7 @@ import {
 } from "./server/all_stock/debate_gate.mjs";
 import { intradayWatcherConfigFromEnv, runIntradayWatcherOnce } from "./server/intraday_watcher.mjs";
 import {
+  historicalBacktestDetailsFromSqlite,
   historicalBacktestReport,
   runHistoricalWalkForwardFromSqlite,
 } from "./server/historical_backtest.mjs";
@@ -96,6 +97,23 @@ loadEnvFile(ENV_FILE);
 const DATA_DIR = path.join(__dirname, "data");
 const PUBLIC_DIR = path.join(__dirname, "public");
 const DB_FILE = path.join(DATA_DIR, "store.json");
+const UZI_DEFAULT_REPO_DIR = "/Users/a/.codex/vendor/UZI-Skill";
+const UZI_ENABLED = parseBoolean(process.env.UZI_ENABLED, true);
+const UZI_REPO_DIR = process.env.UZI_REPO_DIR || UZI_DEFAULT_REPO_DIR;
+const UZI_DEFAULT_PYTHON = path.join(UZI_REPO_DIR, ".venv", "bin", "python");
+const UZI_PYTHON_COMMAND =
+  process.env.UZI_PYTHON_COMMAND ||
+  (existsSync(UZI_DEFAULT_PYTHON)
+    ? UZI_DEFAULT_PYTHON
+    : existsSync(path.join(__dirname, ".venv-openbb", "bin", "python"))
+    ? path.join(__dirname, ".venv-openbb", "bin", "python")
+    : "python3");
+const UZI_TIMEOUT_MS = Number(process.env.UZI_TIMEOUT_MS || 20 * 60 * 1000);
+const UZI_DEFAULT_DEPTH = process.env.UZI_DEFAULT_DEPTH || "lite";
+const UZI_REPORT_DIR = path.resolve(
+  __dirname,
+  process.env.UZI_REPORT_DIR || path.join("data", "uzi-reports"),
+);
 const COMPANY_TICKERS_FILE = path.join(DATA_DIR, "company_tickers.json");
 const NASDAQ_SYMBOLS_FILE = path.join(DATA_DIR, "nasdaq_symbols.json");
 const US_STOCK_STRATEGIES_FILE = path.join(__dirname, "strategies", "us_stock_strategies.json");
@@ -23537,6 +23555,132 @@ function buildStockDeepDivePayload(db = {}, ticker = "") {
   };
 }
 
+function sanitizeUziDepth(value = UZI_DEFAULT_DEPTH) {
+  const depth = String(value || UZI_DEFAULT_DEPTH || "lite").trim().toLowerCase();
+  return ["lite", "medium", "deep"].includes(depth) ? depth : "lite";
+}
+
+function tickerForUzi(ticker = "") {
+  const symbol = safeTicker(ticker);
+  if (!symbol) return "";
+  return symbol.endsWith(".US") ? symbol.replace(/\.US$/, "") : symbol;
+}
+
+function uziReportId(ticker = "") {
+  const stamp = new Date().toISOString().replace(/[-:.TZ]/g, "").slice(0, 14);
+  return `${safeTicker(ticker) || "TICKER"}-${stamp}`.replace(/[^A-Z0-9._-]/gi, "_");
+}
+
+function uziReportUrl(reportId = "", file = "index.html") {
+  const id = String(reportId || "").replace(/[^A-Za-z0-9._-]/g, "");
+  const safeFile = String(file || "index.html").replace(/[^A-Za-z0-9._-]/g, "");
+  return `/api/uzi/report?id=${encodeURIComponent(id)}&file=${encodeURIComponent(safeFile || "index.html")}`;
+}
+
+function normalizeUziMeta(meta = {}, fallback = {}) {
+  const reportId = fallback.reportId || "";
+  const oneLiner = normalizeDisplayText(meta.one_liner || meta.oneLiner || "");
+  return {
+    schemaVersion: "uzi-analysis-v1",
+    provider: "UZI-Skill",
+    status: "ok",
+    ticker: safeTicker(fallback.ticker || meta.ticker || ""),
+    uziTicker: fallback.uziTicker || meta.ticker || "",
+    depth: sanitizeUziDepth(meta.depth || fallback.depth),
+    generatedAt: meta.generated_at || nowIso(),
+    reportId,
+    reportUrl: uziReportUrl(reportId, meta.index || "index.html"),
+    metaUrl: uziReportUrl(reportId, "report.meta.json"),
+    sizeKb: numberOrNull(meta.size_kb),
+    oneLiner,
+    summary: oneLiner || "UZI 已生成个股深度分析报告，请打开 HTML 查看 22 维数据与评审团观点。",
+    capabilities: [
+      "22 维数据采集",
+      "66 位投资者/流派评审",
+      "DCF/Comps/LBO/IC Memo 等机构方法",
+      "杀猪盘/风险检查",
+    ],
+    sourceRisk:
+      "UZI-Skill 是外部专项分析引擎，本项目只展示其报告和摘要；UZI 输出不会写入 Market Pulse AI 的因子分、买卖闸门或策略权重。",
+  };
+}
+
+function uziReportContentType(file = "") {
+  if (file.endsWith(".html")) return "text/html; charset=utf-8";
+  if (file.endsWith(".json")) return "application/json; charset=utf-8";
+  if (file.endsWith(".txt")) return "text/plain; charset=utf-8";
+  if (file.endsWith(".png")) return "image/png";
+  if (file.endsWith(".jpg") || file.endsWith(".jpeg")) return "image/jpeg";
+  if (file.endsWith(".svg")) return "image/svg+xml";
+  return "application/octet-stream";
+}
+
+async function readUziReportFile(reportId = "", file = "index.html") {
+  const id = String(reportId || "").replace(/[^A-Za-z0-9._-]/g, "");
+  const safeFile = String(file || "index.html").replace(/[^A-Za-z0-9._-]/g, "");
+  if (!id || !safeFile) throw new Error("缺少 UZI 报告参数。");
+  const root = path.resolve(UZI_REPORT_DIR);
+  const filePath = path.resolve(root, id, safeFile);
+  if (!filePath.startsWith(`${root}${path.sep}`)) throw new Error("非法 UZI 报告路径。");
+  return {
+    filePath,
+    body: await readFile(filePath),
+    type: uziReportContentType(safeFile),
+  };
+}
+
+async function runUziAnalysis(ticker, options = {}) {
+  const symbol = safeTicker(ticker);
+  if (!symbol) throw new Error("请输入 ticker。");
+  if (!UZI_ENABLED) throw new Error("UZI_ENABLED=false，UZI 集成未启用。");
+  const runFile = path.join(UZI_REPO_DIR, "run.py");
+  if (!existsSync(runFile)) {
+    throw new Error(`未找到 UZI-Skill run.py：${runFile}。请确认 UZI_REPO_DIR 指向完整 clone。`);
+  }
+  const depth = sanitizeUziDepth(options.depth);
+  const uziTicker = tickerForUzi(symbol);
+  const reportId = uziReportId(symbol);
+  const outputDir = path.join(UZI_REPORT_DIR, reportId);
+  await mkdir(outputDir, { recursive: true });
+  const args = [
+    runFile,
+    uziTicker,
+    "--no-browser",
+    "--depth",
+    depth,
+    "--output-dir",
+    outputDir,
+  ];
+  const startedAt = Date.now();
+  const stdout = await runTextCliProcess(UZI_PYTHON_COMMAND, args, UZI_TIMEOUT_MS, {
+    cwd: UZI_REPO_DIR,
+    env: {
+      UZI_NO_UPDATE_CHECK: "1",
+      UZI_NO_AUTO_OPEN: "1",
+      PYTHONIOENCODING: "utf-8",
+      ...(options.env || {}),
+    },
+  });
+  const metaPath = path.join(outputDir, "report.meta.json");
+  let meta = {};
+  try {
+    meta = JSON.parse(await readFile(metaPath, "utf-8"));
+  } catch {
+    meta = {
+      ticker: uziTicker,
+      depth,
+      generated_at: nowIso(),
+      index: "index.html",
+      one_liner: "",
+    };
+  }
+  return {
+    ...normalizeUziMeta(meta, { ticker: symbol, uziTicker, depth, reportId }),
+    durationMs: Date.now() - startedAt,
+    stdoutTail: String(stdout || "").split(/\r?\n/).filter(Boolean).slice(-18),
+  };
+}
+
 function sameYmd(a = "", b = "") {
   const ay = String(a || "").slice(0, 10);
   const by = String(b || "").slice(0, 10);
@@ -37700,6 +37844,8 @@ async function handleApi(req, res, url) {
           slippageBps: body.slippageBps || url.searchParams.get("slippageBps"),
           sqliteTimeoutMs: body.sqliteTimeoutMs || url.searchParams.get("sqliteTimeoutMs"),
           bridgeTimeoutMs: body.bridgeTimeoutMs || url.searchParams.get("bridgeTimeoutMs"),
+          detailLimit: body.detailLimit || url.searchParams.get("detailLimit"),
+          compactResponse: body.compactResponse === false || url.searchParams.get("compactResponse") === "false" ? false : true,
         },
       });
       const db = await ensureStore();
@@ -37755,8 +37901,8 @@ async function handleApi(req, res, url) {
         payload: {
           runId: result.run.id,
           status: result.run.status,
-          decisions: result.run.decisions?.length || 0,
-          outcomes: result.run.outcomes?.length || 0,
+          decisions: result.run.detailCounts?.decisions || result.run.decisions?.length || 0,
+          outcomes: result.run.detailCounts?.outcomes || result.run.outcomes?.length || 0,
           sampleCount: result.run.metrics?.sampleCount || 0,
           source: "historical-backtest",
           candidateStrategyVersionId: historicalCandidate?.id || "",
@@ -37769,6 +37915,25 @@ async function handleApi(req, res, url) {
         run: result.run,
         report: result.report,
       });
+    } catch (error) {
+      return sendJson(res, { error: errorZh(error.message) }, 502);
+    }
+  }
+
+  if (req.method === "GET" && url.pathname.startsWith("/api/recommender/historical-backtest/") && url.pathname.endsWith("/details")) {
+    const id = decodeURIComponent(url.pathname.replace("/api/recommender/historical-backtest/", "").replace(/\/details$/, ""));
+    try {
+      const page = await historicalBacktestDetailsFromSqlite({
+        sqlitePath: SQLITE_DB_FILE,
+        runId: id,
+        kind: url.searchParams.get("kind") || "outcomes",
+        page: url.searchParams.get("page") || 1,
+        pageSize: url.searchParams.get("pageSize") || 100,
+        offset: url.searchParams.get("offset"),
+        limit: url.searchParams.get("limit"),
+        horizonDays: url.searchParams.get("horizonDays"),
+      });
+      return sendJson(res, page);
     } catch (error) {
       return sendJson(res, { error: errorZh(error.message) }, 502);
     }
@@ -37805,6 +37970,56 @@ async function handleApi(req, res, url) {
   if (req.method === "GET" && url.pathname === "/api/recommender/live-parity") {
     const db = await ensureStore();
     return sendJson(res, { liveParity: buildRecommenderLiveParityPayload(db) });
+  }
+
+  if (req.method === "GET" && url.pathname === "/api/uzi/report") {
+    try {
+      const payload = await readUziReportFile(url.searchParams.get("id"), url.searchParams.get("file") || "index.html");
+      res.writeHead(200, {
+        "Content-Type": payload.type,
+        "Cache-Control": "no-store",
+      });
+      return res.end(payload.body);
+    } catch (error) {
+      return sendJson(res, { error: errorZh(error.message), provider: "UZI-Skill" }, 404);
+    }
+  }
+
+  if ((req.method === "GET" || req.method === "POST") && url.pathname === "/api/uzi/analyze") {
+    const body = req.method === "POST" ? await readBody(req).catch(() => ({})) : {};
+    const ticker = safeTicker(body.ticker || url.searchParams.get("ticker"));
+    if (!ticker) return sendJson(res, { error: "请输入 ticker。", provider: "UZI-Skill" }, 400);
+    try {
+      const analysis = await runUziAnalysis(ticker, {
+        depth: body.depth || url.searchParams.get("depth") || UZI_DEFAULT_DEPTH,
+      });
+      return sendJson(res, {
+        uziAnalysis: analysis,
+        config: {
+          enabled: UZI_ENABLED,
+          repoDir: UZI_REPO_DIR,
+          pythonCommand: UZI_PYTHON_COMMAND,
+          defaultDepth: UZI_DEFAULT_DEPTH,
+          timeoutMs: UZI_TIMEOUT_MS,
+        },
+      });
+    } catch (error) {
+      return sendJson(
+        res,
+        {
+          error: errorZh(error.message),
+          provider: "UZI-Skill",
+          config: {
+            enabled: UZI_ENABLED,
+            repoDir: UZI_REPO_DIR,
+            pythonCommand: UZI_PYTHON_COMMAND,
+            defaultDepth: UZI_DEFAULT_DEPTH,
+            timeoutMs: UZI_TIMEOUT_MS,
+          },
+        },
+        502,
+      );
+    }
   }
 
   if ((req.method === "GET" || req.method === "POST") && url.pathname === "/api/stocks/deep-dive") {

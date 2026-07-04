@@ -13,6 +13,7 @@ import argparse
 import csv
 import json
 import os
+import shutil
 import sqlite3
 import subprocess
 import sys
@@ -28,6 +29,7 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_DB = REPO_ROOT / "data" / "market_pulse.sqlite"
 DEFAULT_STORE = REPO_ROOT / "data" / "store.json"
 DEFAULT_BRIDGE = REPO_ROOT / "scripts" / "akshare_bridge.py"
+DEFAULT_IBKR_BRIDGE = REPO_ROOT / "scripts" / "ibkr_gateway_bridge.py"
 FRED_SERIES = ("DGS10", "DGS2", "T10Y2Y", "BAMLC0A0CM", "T10YIE", "VIXCLS")
 
 
@@ -287,6 +289,33 @@ def run_json_command(command: list[str], timeout: int, cwd: Path = REPO_ROOT, in
     return payload
 
 
+def run_text_command(command: list[str], timeout: int, cwd: Path = REPO_ROOT) -> str:
+    completed = subprocess.run(
+        command,
+        text=True,
+        cwd=str(cwd),
+        capture_output=True,
+        timeout=timeout,
+        check=False,
+    )
+    if completed.returncode != 0:
+        raise RuntimeError(f"command failed ({completed.returncode}): {' '.join(command[:4])}; stderr={completed.stderr[-800:]}")
+    return completed.stdout
+
+
+def resolve_command(value: str, default_names: tuple[str, ...] = ()) -> str:
+    raw = text(value)
+    if raw:
+        expanded = os.path.expanduser(raw)
+        if Path(expanded).exists() or shutil.which(expanded):
+            return expanded
+    for name in default_names:
+        found = shutil.which(name)
+        if found:
+            return found
+    raise RuntimeError(f"command not found: {value or '/'.join(default_names)}")
+
+
 def normalize_rows(ticker: str, rows: list[dict[str, Any]], source: str) -> list[dict[str, Any]]:
     out: list[dict[str, Any]] = []
     for row in rows:
@@ -337,6 +366,136 @@ def fetch_akshare_bars(args: argparse.Namespace, ticker: str) -> tuple[list[dict
     if payload.get("meta", {}).get("fallbackUsed"):
         source = f"akshare:{payload['meta']['fallbackUsed']}"
     return normalize_rows(ticker, payload.get("rows") or [], source), payload.get("meta") or {}
+
+
+def longbridge_symbol(ticker: str) -> str:
+    symbol = safe_ticker(ticker)
+    if not symbol:
+        raise RuntimeError("empty ticker")
+    return symbol if "." in symbol else f"{symbol}.US"
+
+
+def parse_longbridge_kline_payload(ticker: str, payload_text: str) -> list[dict[str, Any]]:
+    payload = json.loads(payload_text)
+    rows = payload.get("rows") if isinstance(payload, dict) else payload
+    if not isinstance(rows, list):
+        raise RuntimeError("Longbridge kline JSON was not a list")
+    normalized = []
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        normalized.append(
+            {
+                "date": row.get("date") or row.get("time") or row.get("timestamp"),
+                "open": row.get("open"),
+                "high": row.get("high"),
+                "low": row.get("low"),
+                "close": row.get("close"),
+                "volume": row.get("volume"),
+            }
+        )
+    return normalize_rows(ticker, normalized, "longbridge:kline")
+
+
+def fetch_longbridge_bars(args: argparse.Namespace, ticker: str) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    command = resolve_command(args.longbridge_command, ("longbridge",))
+    symbol = longbridge_symbol(ticker)
+    errors: list[str] = []
+    duration_days = max(1, (datetime.strptime(args.end, "%Y%m%d").date() - datetime.strptime(args.start, "%Y%m%d").date()).days + 1)
+    recent_counts = []
+    estimated_trading_rows = max(30, int(duration_days * 0.75) + 10)
+    for count in (min(args.limit_bars, 1000, estimated_trading_rows), 1000, 500, 200, 100, 30):
+        if count > 0 and count not in recent_counts:
+            recent_counts.append(count)
+    candidates = [
+        [
+            command,
+            "kline",
+            "history",
+            symbol,
+            "--period",
+            "day",
+            "--start",
+            args.start_ymd,
+            "--end",
+            args.end_ymd,
+            "--adjust",
+            "forward",
+            "--format",
+            "json",
+        ],
+    ]
+    candidates.extend([
+        [
+            command,
+            "kline",
+            symbol,
+            "--period",
+            "day",
+            "--count",
+            str(count),
+            "--adjust",
+            "forward",
+            "--format",
+            "json",
+        ]
+        for count in recent_counts
+    ])
+    for candidate in candidates:
+        try:
+            rows = parse_longbridge_kline_payload(ticker, run_text_command(candidate, args.fetch_timeout))
+            rows = [row for row in rows if args.start_ymd <= row["date"] <= args.end_ymd]
+            if rows:
+                return rows[-args.limit_bars :], {"source": "longbridge:kline", "rowCount": len(rows), "errors": errors}
+        except Exception as exc:
+            errors.append(f"{Path(candidate[0]).name}:{candidate[1]}:{type(exc).__name__}:{exc}")
+    raise RuntimeError("; ".join(errors) or "Longbridge returned no kline rows")
+
+
+def ibkr_duration_for_days(days: int) -> str:
+    if days >= 365:
+        return f"{max(1, round(days / 365))} Y"
+    if days >= 30:
+        return f"{max(1, round(days / 30))} M"
+    return f"{max(1, days)} D"
+
+
+def fetch_ibkr_bars(args: argparse.Namespace, ticker: str) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    if str(args.ibkr_enabled).lower() not in {"1", "true", "yes", "on"}:
+        raise RuntimeError("IBKR historical fetcher disabled; set HISTORICAL_IBKR_ENABLED=1 or --ibkr-enabled 1")
+    duration_days = max(1, (datetime.strptime(args.end, "%Y%m%d").date() - datetime.strptime(args.start, "%Y%m%d").date()).days + 1)
+    payload = run_json_command(
+        [
+            sys.executable,
+            str(args.ibkr_bridge),
+            "historical",
+            "--host",
+            args.ibkr_host,
+            "--port",
+            str(args.ibkr_port),
+            "--client-id",
+            str(args.ibkr_client_id),
+            "--timeout",
+            str(max(4, args.ibkr_timeout)),
+            "--symbols",
+            safe_ticker(ticker),
+            "--duration",
+            ibkr_duration_for_days(duration_days),
+            "--bar-size",
+            "1 day",
+            "--market-data-type",
+            str(args.ibkr_market_data_type),
+        ],
+        timeout=max(args.fetch_timeout, int(args.ibkr_timeout) + 5),
+    )
+    rows = []
+    for item in payload.get("historical") or []:
+        if safe_ticker(item.get("symbol")) == safe_ticker(ticker):
+            rows.extend(item.get("bars") or [])
+    normalized = [row for row in normalize_rows(ticker, rows, "ibkr:socket-historical") if args.start_ymd <= row["date"] <= args.end_ymd]
+    if not normalized:
+        raise RuntimeError(f"IBKR returned no historical bars; errors={payload.get('errors') or []}")
+    return normalized[-args.limit_bars :], {"source": "ibkr:socket-historical", "rowCount": len(normalized), "errors": payload.get("errors") or []}
 
 
 def fetch_finnhub_bars(ticker: str, start: str, end: str, api_key: str, timeout: int) -> list[dict[str, Any]]:
@@ -397,28 +556,49 @@ def fetch_alpha_vantage_bars(ticker: str, api_key: str, timeout: int) -> list[di
 
 def fetch_bars(args: argparse.Namespace, ticker: str) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     errors: list[str] = []
-    try:
-        rows, meta = fetch_akshare_bars(args, ticker)
-        if rows:
-            return rows, {"source": rows[0]["source"], "rowCount": len(rows), "akshareMeta": meta, "errors": errors}
-    except Exception as exc:
-        errors.append(f"akshare:{type(exc).__name__}:{exc}")
-    finnhub_key = os.environ.get("FINNHUB_API_KEY") or os.environ.get("FINNHUB_TOKEN")
-    if finnhub_key:
-        try:
-            rows = fetch_finnhub_bars(ticker, args.start, args.end, finnhub_key, args.fetch_timeout)
-            if rows:
-                return rows[-args.limit_bars :], {"source": "finnhub:candle", "rowCount": len(rows), "errors": errors}
-        except Exception as exc:
-            errors.append(f"finnhub:{type(exc).__name__}:{exc}")
-    alpha_key = os.environ.get("ALPHAVANTAGE_API_KEY") or os.environ.get("ALPHA_VANTAGE_API_KEY")
-    if alpha_key:
-        try:
-            rows = [row for row in fetch_alpha_vantage_bars(ticker, alpha_key, args.fetch_timeout) if args.start[:4] <= row["date"][:4] <= args.end[:4]]
-            if rows:
-                return rows[-args.limit_bars :], {"source": "alphavantage:daily_adjusted", "rowCount": len(rows), "errors": errors}
-        except Exception as exc:
-            errors.append(f"alphavantage:{type(exc).__name__}:{exc}")
+    providers = [item.strip().lower() for item in text(args.provider_order).split(",") if item.strip()]
+    for provider in providers:
+        if provider == "longbridge":
+            try:
+                rows, meta = fetch_longbridge_bars(args, ticker)
+                if rows:
+                    return rows, {**meta, "errors": errors + (meta.get("errors") or [])}
+            except Exception as exc:
+                errors.append(f"longbridge:{type(exc).__name__}:{exc}")
+        elif provider == "ibkr":
+            try:
+                rows, meta = fetch_ibkr_bars(args, ticker)
+                if rows:
+                    return rows, {**meta, "errors": errors + (meta.get("errors") or [])}
+            except Exception as exc:
+                errors.append(f"ibkr:{type(exc).__name__}:{exc}")
+        elif provider == "akshare":
+            try:
+                rows, meta = fetch_akshare_bars(args, ticker)
+                if rows:
+                    return rows, {"source": rows[0]["source"], "rowCount": len(rows), "akshareMeta": meta, "errors": errors}
+            except Exception as exc:
+                errors.append(f"akshare:{type(exc).__name__}:{exc}")
+        elif provider == "finnhub":
+            finnhub_key = os.environ.get("FINNHUB_API_KEY") or os.environ.get("FINNHUB_TOKEN")
+            if finnhub_key:
+                try:
+                    rows = fetch_finnhub_bars(ticker, args.start, args.end, finnhub_key, args.fetch_timeout)
+                    if rows:
+                        return rows[-args.limit_bars :], {"source": "finnhub:candle", "rowCount": len(rows), "errors": errors}
+                except Exception as exc:
+                    errors.append(f"finnhub:{type(exc).__name__}:{exc}")
+        elif provider in {"alphavantage", "alpha_vantage", "av"}:
+            alpha_key = os.environ.get("ALPHAVANTAGE_API_KEY") or os.environ.get("ALPHA_VANTAGE_API_KEY")
+            if alpha_key:
+                try:
+                    rows = [row for row in fetch_alpha_vantage_bars(ticker, alpha_key, args.fetch_timeout) if args.start[:4] <= row["date"][:4] <= args.end[:4]]
+                    if rows:
+                        return rows[-args.limit_bars :], {"source": "alphavantage:daily_adjusted", "rowCount": len(rows), "errors": errors}
+                except Exception as exc:
+                    errors.append(f"alphavantage:{type(exc).__name__}:{exc}")
+        else:
+            errors.append(f"unknown-provider:{provider}")
     raise RuntimeError("; ".join(errors) or "no historical provider returned rows")
 
 
@@ -436,8 +616,31 @@ def insert_bars(conn: sqlite3.Connection, rows: list[dict[str, Any]]) -> int:
     return conn.total_changes - before
 
 
+def fetch_url_via_node_or_curl(url: str, timeout: int) -> bytes:
+    node_script = """
+const url = process.argv[1];
+const timeoutMs = Number(process.argv[2] || 30000);
+const controller = new AbortController();
+const timer = setTimeout(() => controller.abort(new Error(`timeout ${timeoutMs}ms`)), timeoutMs);
+try {
+  const response = await fetch(url, { signal: controller.signal, headers: { "user-agent": "MarketPulseAI/1.0" } });
+  if (!response.ok) throw new Error(`HTTP ${response.status}`);
+  process.stdout.write(await response.text());
+} finally {
+  clearTimeout(timer);
+}
+"""
+    try:
+        return run_text_command(["node", "--input-type=module", "-e", node_script, url, str(timeout * 1000)], timeout=timeout + 5).encode("utf-8")
+    except Exception:
+        curl = shutil.which("curl")
+        if curl:
+            return run_text_command([curl, "-fsSL", "--max-time", str(timeout), url], timeout=timeout + 5).encode("utf-8")
+        return fetch_url(url, timeout=timeout)
+
+
 def fred_csv(series_id: str, timeout: int) -> list[dict[str, Any]]:
-    payload = fetch_url(f"https://fred.stlouisfed.org/graph/fredgraph.csv?id={series_id}", timeout=timeout)
+    payload = fetch_url_via_node_or_curl(f"https://fred.stlouisfed.org/graph/fredgraph.csv?id={series_id}", timeout=timeout)
     out = []
     for row in csv.DictReader(payload.decode("utf-8", errors="ignore").splitlines()):
         day = ymd(row.get("observation_date") or row.get("DATE") or row.get("date"))
@@ -554,6 +757,15 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--db", default=str(DEFAULT_DB))
     parser.add_argument("--store-json", default=str(DEFAULT_STORE))
     parser.add_argument("--akshare-bridge", default=str(DEFAULT_BRIDGE))
+    parser.add_argument("--ibkr-bridge", default=str(DEFAULT_IBKR_BRIDGE))
+    parser.add_argument("--provider-order", default=os.environ.get("HISTORICAL_PROVIDER_ORDER", "longbridge,ibkr,akshare,finnhub,alphavantage"))
+    parser.add_argument("--longbridge-command", default=os.environ.get("LONGBRIDGE_CLI", "longbridge"))
+    parser.add_argument("--ibkr-enabled", default=os.environ.get("HISTORICAL_IBKR_ENABLED", "0"))
+    parser.add_argument("--ibkr-host", default=os.environ.get("IBKR_SOCKET_HOST", "127.0.0.1"))
+    parser.add_argument("--ibkr-port", type=int, default=int(os.environ.get("IBKR_SOCKET_PORT", "4001") or 4001))
+    parser.add_argument("--ibkr-client-id", type=int, default=int(os.environ.get("IBKR_HISTORICAL_CLIENT_ID", "177") or 177))
+    parser.add_argument("--ibkr-timeout", type=int, default=int(os.environ.get("IBKR_HISTORICAL_TIMEOUT", "45") or 45))
+    parser.add_argument("--ibkr-market-data-type", type=int, default=int(os.environ.get("IBKR_MARKET_DATA_TYPE", "3") or 3))
     parser.add_argument("--tickers", default="")
     parser.add_argument("--max-tickers", type=int, default=0)
     parser.add_argument("--days", type=int, default=365 * 6)
@@ -577,6 +789,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     args.db = str(Path(args.db))
     args.store_json = str(Path(args.store_json))
     args.akshare_bridge = str(Path(args.akshare_bridge))
+    args.ibkr_bridge = str(Path(args.ibkr_bridge))
     return args
 
 
@@ -629,4 +842,3 @@ def main(argv: list[str] | None = None) -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-

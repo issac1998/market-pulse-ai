@@ -35,7 +35,7 @@ import {
   normalizeHistoricalBars,
 } from "../lib/historical_features.mjs";
 import { runIntradayWatcherOnce } from "../server/intraday_watcher.mjs";
-import { runHistoricalWalkForwardFromRows } from "../server/historical_backtest.mjs";
+import { historicalMaxDrawdownFromReturns, runHistoricalWalkForwardFromRows } from "../server/historical_backtest.mjs";
 import { proxyFetchResponse } from "../server/network_fetch.mjs";
 import {
   activeStrategyVersion,
@@ -527,6 +527,13 @@ const historicalWalkForward = runHistoricalWalkForwardFromRows({
   regimes: [{ date: "2026-01-01", bucket: "宏观顺风", risk_score: 38 }],
   config: { minLookback: 20, maxDates: 4, topN: 2, horizons: [1, 3], primaryHorizon: 1, costBps: 1, slippageBps: 1 },
 });
+const handComputedDrawdown = historicalMaxDrawdownFromReturns([10, -5, -5, 2, 4, -1, 3, -2, 1, 1]);
+assertApprox(
+  handComputedDrawdown.pct,
+  -9.750000000000004,
+  1e-12,
+  "Historical MaxDD fixture should match the exact hand-computed 10-day equity path",
+);
 assert.equal(historicalWalkForward.run.status, "ok", "Historical walk-forward fixture should produce a runnable backtest");
 assert.ok(historicalWalkForward.run.decisions.length > 0, "Historical walk-forward should freeze pseudo-decisions");
 assert.ok(
@@ -534,6 +541,14 @@ assert.ok(
   "Historical pseudo-decisions should be labeled separately from live decisions",
 );
 assert.ok(historicalWalkForward.run.outcomes.length > 0, "Historical walk-forward should compute outcomes");
+assert.ok(
+  historicalWalkForward.run.daily.some((row) => Number.isFinite(row.portfolioReturnPct)),
+  "Historical daily book should expose equal-weight open-position portfolio returns",
+);
+assert.ok(
+  historicalWalkForward.run.metrics.maxDrawdown.value > -100,
+  "Historical MaxDD should be computed from the daily equity book and not collapse to -100%",
+);
 assert.equal(
   historicalWalkForward.run.metrics.hitRate.n,
   historicalWalkForward.run.metrics.sampleCount,
