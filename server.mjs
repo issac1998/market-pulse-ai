@@ -26,6 +26,7 @@ import {
 } from "./lib/market_core.mjs";
 import {
   DEFAULT_RECOMMENDER_FACTOR_WEIGHTS,
+  applyCrossSectionalNormalization,
   buildBenchmarkBasket as buildBenchmarkBasketCore,
   classifyOutcomeQuality as classifyRecommendationOutcomeQuality,
   estimateThesisHit,
@@ -20759,7 +20760,7 @@ function factorQuality(raw = {}, source = []) {
 }
 
 function factorRow(id, label, raw = {}, score = 50, source = [], missingReason = "") {
-  const normalizedScore = Number.isFinite(score) ? clampScore(Math.round(score)) : 50;
+  const normalizedScore = Number.isFinite(score) ? clampScore(score) : 50;
   const sources = [...new Set((source || []).map(normalizeDisplayText).filter(Boolean))];
   const quality = factorQuality(raw, sources);
   return {
@@ -20928,8 +20929,7 @@ function scoreEarningsRevisionFactor(ctx = {}) {
       (Number.isFinite(buyRatio) ? buyRatio * 22 : 0) -
       (Number.isFinite(sellRatio) ? sellRatio * 26 : 0) +
       (/buy|strong|增持|买入|跑赢/i.test(recommendation) ? 8 : 0) -
-      (/sell|under|减持|卖出|跑输/i.test(recommendation) ? 10 : 0) +
-      (Number.isFinite(epsEstimate) || Number.isFinite(forecastMean) ? 5 : 0),
+      (/sell|under|减持|卖出|跑输/i.test(recommendation) ? 10 : 0),
   );
   return factorRow(
     "earningsRevision",
@@ -20987,7 +20987,6 @@ function scoreIndustryChainFactor(ctx = {}) {
   const downstreamAvgChange = numberOrNull(pack.relative?.downstreamAvgChangePercent);
   const score = clampScore(
     50 +
-      (summary ? 8 : 0) +
       (Number.isFinite(relativeChange) ? Math.max(-12, Math.min(12, relativeChange * 1.2)) : 0) +
       (Number.isFinite(downstreamAvgChange) ? Math.max(-8, Math.min(8, downstreamAvgChange)) : 0),
   );
@@ -21022,17 +21021,20 @@ function scoreOptionsFlowFactor(ctx = {}) {
   const ivRank = firstFiniteNumber(options.summary?.ivRank, options.ivRank);
   const unusualCount = numberOrNull(options.summary?.unusualCount || options.unusualCount);
   const capitalFlow = firstFiniteNumber(micro.summary?.netInflow, micro.netInflow);
+  const avgDollarVolume20d = latestChartAvgDollarVolume(ctx.technical?.chart, 20);
+  const flowRatio = Number.isFinite(capitalFlow) && Number.isFinite(avgDollarVolume20d) && avgDollarVolume20d > 0
+    ? capitalFlow / avgDollarVolume20d
+    : null;
   const score = clampScore(
     50 +
-      (Number.isFinite(contractCount) && contractCount > 0 ? 6 : 0) +
       (Number.isFinite(unusualCount) ? Math.min(12, unusualCount * 3) : 0) -
       (Number.isFinite(ivRank) && ivRank > 75 ? 7 : 0) +
-      (Number.isFinite(capitalFlow) ? Math.max(-8, Math.min(8, capitalFlow / 1_000_000)) : 0),
+      (Number.isFinite(flowRatio) ? Math.max(-8, Math.min(8, flowRatio * 160)) : 0),
   );
   return factorRow(
     "optionsFlow",
     "期权/盘口/资金流",
-    { contractCount, ivRank, unusualCount, capitalFlow },
+    { contractCount, ivRank, unusualCount, capitalFlow, avgDollarVolume20d, flowRatio },
     score,
     [options.provider, micro.provider, "options/microstructure"].filter(Boolean),
     "缺少期权链、IV、盘口或盘中资金流。",
@@ -21077,8 +21079,7 @@ function scoreSocialAttentionFactor(ctx = {}) {
   const score = clampScore(
     50 +
       (Number.isFinite(mentions) ? Math.min(12, Math.log10(Math.max(mentions, 1)) * 5) : 0) +
-      (Number.isFinite(mentionDelta) ? Math.max(-6, Math.min(10, mentionDelta / 20)) : 0) +
-      (hasReason ? 8 : 0),
+      (Number.isFinite(mentionDelta) ? Math.max(-6, Math.min(10, mentionDelta / 20)) : 0),
   );
   return factorRow(
     "socialAttention",
@@ -21129,7 +21130,8 @@ function buildFactorSnapshot(run = {}, ticker = "", ctx = null) {
     ),
   );
   return {
-    schemaVersion: "factor-snapshot-v1",
+    schemaVersion: "factor-snapshot-v2",
+    scoreSchema: "factor-snapshot-v2",
     id: compactId(`factor-${symbol}`),
     ticker: symbol,
     asOf: run.completedAt || run.generatedAt || nowIso(),
@@ -21143,25 +21145,12 @@ function buildFactorSnapshot(run = {}, ticker = "", ctx = null) {
 
 function buildFactorSnapshotForRun(run = {}, tickers = []) {
   const symbols = [...new Set((tickers || []).map(safeTicker).filter(Boolean))];
-  return symbols.map((ticker) => buildFactorSnapshot(run, ticker)).filter(Boolean);
-}
-
-function dataQualityMultiplier(score) {
-  const value = numberOrNull(score) ?? 0;
-  if (value >= 85) return 1;
-  if (value >= 70) return 0.92;
-  if (value >= 55) return 0.78;
-  return 0.55;
-}
-
-function regimeMultiplierFromSnapshot(snapshot = {}) {
-  const macro = snapshot.factors?.macroRegime;
-  const marketRisk = numberOrNull(macro?.raw?.marketRisk);
-  if (!Number.isFinite(marketRisk)) return 1;
-  if (marketRisk < 45) return 1.05;
-  if (marketRisk < 65) return 1;
-  if (marketRisk < 80) return 0.85;
-  return 0.65;
+  const snapshots = symbols.map((ticker) => buildFactorSnapshot(run, ticker)).filter(Boolean);
+  return applyCrossSectionalNormalization(snapshots, {
+    minCrossSection: 30,
+    lowerPct: 1,
+    upperPct: 99,
+  }).snapshots;
 }
 
 function buildDataQualityAudit(factorSnapshot = {}) {
@@ -21802,7 +21791,7 @@ function buildAllStockAgentEvaluation(run = {}, tickerPoolItem = {}, state = {},
   const hasRealPosition = Boolean(ctx.position);
   const hasPosition = hasAgentPosition || hasRealPosition;
   const price = numberOrNull(ctx.quote?.price ?? ctx.technical?.latestClose ?? ctx.row?.quote?.price);
-  const factorSnapshot = buildFactorSnapshot(run, ticker, ctx);
+  const factorSnapshot = options.factorSnapshotMap?.get(ticker) || buildFactorSnapshot(run, ticker, ctx);
   const dataQualityAudit = buildDataQualityAudit(factorSnapshot);
   const portfolioFit = buildPortfolioFitScore(ticker, { ...ctx, factorSnapshot }, state, run, {
     hasPosition,
@@ -23033,11 +23022,16 @@ async function runAllStockAgentForRun(db, sourceRun, trigger = "manual", options
     weights: activeFactorWeights,
   });
   strategyVersion = activeStrategyVersion(state.strategyVersions) || skillStrategyVersion;
+  const factorSnapshotMap = new Map(
+    buildFactorSnapshotForRun(source, universe.map((item) => item.ticker))
+      .map((snapshot) => [safeTicker(snapshot.ticker), snapshot]),
+  );
   const evaluations = universe
     .map((item) => buildAllStockAgentEvaluation(source, item, state, skill, {
       factorWeights: activeFactorWeights,
       strategyVersion,
       regimeTag,
+      factorSnapshotMap,
     }))
     .filter(Boolean)
     .sort((a, b) => {
@@ -24093,6 +24087,7 @@ function allStockAgentBacktestFactorStats(outcomes = []) {
         hitRate: 0,
         scores: [],
         returns: [],
+        schemaMix: {},
       };
       row.samples += 1;
       row.wins += outcome.outcome === "win" || value > ALL_STOCK_AGENT_OUTCOME_DEADBAND_PCT ? 1 : 0;
@@ -24103,6 +24098,8 @@ function allStockAgentBacktestFactorStats(outcomes = []) {
       row.hitRate = row.wins / row.samples;
       row.scores.push(score);
       row.returns.push(value);
+      const scoreSchema = outcome.scoreSchema || outcome.factorSnapshot?.scoreSchema || outcome.factorSnapshot?.schemaVersion || "unknown";
+      row.schemaMix[scoreSchema] = (row.schemaMix[scoreSchema] || 0) + 1;
       stats[id] = row;
     }
   }
@@ -24304,8 +24301,12 @@ function runAllStockAgentBacktest(db = {}, options = {}) {
     const run = runFromStockHistoryRows(group.rows, group.date);
     const regimeTag = allStockAgentRegimeTagFromRun(run);
     const universe = allStockAgentTickerPool(run, db, state, skill, null);
+    const factorSnapshotMap = new Map(
+      buildFactorSnapshotForRun(run, universe.map((item) => item.ticker))
+        .map((snapshot) => [safeTicker(snapshot.ticker), snapshot]),
+    );
     const evaluations = universe
-      .map((item) => buildAllStockAgentEvaluation(run, item, state, skill, { factorWeights, strategyVersion, regimeTag }))
+      .map((item) => buildAllStockAgentEvaluation(run, item, state, skill, { factorWeights, strategyVersion, regimeTag, factorSnapshotMap }))
       .filter(Boolean)
       .sort((a, b) => Number(b.buyEligible) - Number(a.buyEligible) || (b.buyScore || 0) - (a.buyScore || 0) || (b.actionScore || 0) - (a.actionScore || 0));
     const buyLimit = Math.min(ALL_STOCK_AGENT_BUY_LIMIT, Number(skill.settings?.buyLimit) || ALL_STOCK_AGENT_BUY_LIMIT);
@@ -31039,6 +31040,14 @@ function latestChartReturn(chart = [], days = 5) {
   const previous = rows[rows.length - 1 - days].close;
   if (!Number.isFinite(latest) || !Number.isFinite(previous) || previous <= 0) return null;
   return ((latest - previous) / previous) * 100;
+}
+
+function latestChartAvgDollarVolume(chart = [], days = 20) {
+  const rows = (chart || [])
+    .filter((item) => Number.isFinite(numberOrNull(item?.close)) && Number.isFinite(numberOrNull(item?.volume)))
+    .slice(-Math.max(1, Number(days) || 20));
+  if (!rows.length) return null;
+  return rows.reduce((sum, item) => sum + numberOrNull(item.close) * numberOrNull(item.volume), 0) / rows.length;
 }
 
 function scoreTickerFactors({ ticker, quote, technical, fundamental, socialHot, analysisScore, news, position, marketOverview }) {

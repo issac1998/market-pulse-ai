@@ -880,3 +880,65 @@ responseBytes=346718
 Contradictions:
 
 - None for WP10. The spec expected the populated 40k-bar / 45-ticker corpus, which is present in `data/market_pulse.sqlite`.
+
+---
+
+## WP11 — Cross-Sectional Normalization + De-Bias — 2026-07-05
+
+Implemented Round 2 WP11.
+
+Changes:
+
+- Added shared `applyCrossSectionalNormalization()` in `lib/recommender_core.mjs`; live and historical call sites now use the same percentile-rank normalizer with 1/99 winsorization and static-baseline fallback below 30 valid names.
+- Removed upstream factor-score rounding from `normalizeFactorValue`, live `factorRow`, and historical factor feature assembly so factor scores remain continuous floats for rankIC/statistics.
+- Upgraded factor snapshots to `factor-snapshot-v2` and recommendation scores to `recommendation-score-v2`; live and historical outcomes now carry `scoreSchema`, and factor stats now report `schemaMix`.
+- Removed the four availability bonuses: options contract count, social reason presence, earnings estimates presence, and industry-chain summary presence no longer boost scores by themselves.
+- Added per-factor quality shrinkage inside `scoreRecommendationFromFactorSnapshot`; missing/low-quality factors shrink toward neutral 50 before weighting.
+- Softened total data-quality multiplier tiers to `{>=85:1, >=70:.96, >=55:.89, else:.775}`.
+- Re-scaled options-flow capital flow to `(netInflow / avgDollarVolume20d) * 160`, clipped to `[-8,+8]`; unavailable ADV now contributes nothing instead of using the old million-dollar divisor.
+- Removed the unused local data-quality/regime multiplier duplicate from `server.mjs`, leaving `lib/recommender_core.mjs` as the single scoring implementation.
+
+Verification:
+
+```text
+$ node --check lib/recommender_core.mjs && node --check lib/historical_features.mjs && node --check server/historical_backtest.mjs && node --check server.mjs && node --check scripts/core_regression_tests.mjs
+pass
+
+$ node scripts/core_regression_tests.mjs
+core_regression_tests: ok
+
+$ ALL_STOCK_AGENT_PREFETCH_ENABLED=false BRIDGE_PYTHON=.venv-bridges/bin/python NODE_OPTIONS=--max-old-space-size=4096 node server.mjs
+Market Pulse AI running at http://localhost:5173
+
+$ curl -sS --max-time 180 -X POST http://localhost:5173/api/all-stock-agent/run -H 'content-type: application/json' --data '{"trigger":"wp11-smoke-light"}' ...
+{
+  "runId": "1783203528067-all-stock-agent",
+  "evaluations": 80,
+  "totalFactors": 800,
+  "crossSectionalRank": 800,
+  "fallback": 0,
+  "pct": 1
+}
+
+$ node scripts/generate_route_inventory.mjs && node scripts/generate_route_inventory.mjs --check
+{"status":"ok","routes":75,"uiFetches":43,"storeKeys":25}
+{"status":"ok","routes":75,"uiFetches":43,"storeKeys":25}
+```
+
+Regression fixtures added:
+
+- Uniform +10 shift across a 40-ticker universe leaves cross-sectional scores unchanged.
+- Missing options data shrinks `optionsFlow` contribution to 0.
+- Tie fraction at exactly 50 is below 5%.
+- Same cross-section through the shared live/historical normalizer yields identical scores.
+- Historical factor snapshots now assert `recommendation-score-v2`.
+
+Notes:
+
+- A first full `/api/all-stock-agent/run` with normal prefetch enabled exceeded the 240s curl limit and blocked `/api/state`; the WP11 live method check was therefore rerun with `ALL_STOCK_AGENT_PREFETCH_ENABLED=false` to exercise the live scoring path without bulk data prefetch. The live normalization result was 100% `cross-sectional-rank`, above the >=90% requirement.
+- Route inventory was regenerated and verified; route counts were unchanged.
+- No Python files touched in WP11.
+
+Contradictions:
+
+- None for WP11.

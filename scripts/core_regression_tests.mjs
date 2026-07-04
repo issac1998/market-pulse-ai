@@ -17,6 +17,7 @@ import {
 import {
   buildBenchmarkBasket,
   classifyOutcomeQuality,
+  applyCrossSectionalNormalization,
   learnRecommendationFactorWeights,
   normalizeRecommendationFactorWeights,
   normalizeFactorValue,
@@ -171,6 +172,63 @@ const normalizedMomentum = normalizeFactorValue("momentum", 72, {
 assert.equal(normalizedMomentum.method, "factor-peer-baseline", "Factor normalization should use peer baseline when no live median/MAD exists");
 assert.ok(normalizedMomentum.score > 60, "Strong raw momentum should stay above neutral after normalization");
 
+const syntheticFactorUniverse = Array.from({ length: 40 }, (_, index) => ({
+  ticker: `T${index}`,
+  factors: {
+    momentum: {
+      label: "Momentum",
+      score: 20 + index,
+      heuristicScore: 20 + index,
+      quality: 100,
+    },
+    optionsFlow: {
+      label: "Options",
+      score: 50 + index / 10,
+      heuristicScore: 50 + index / 10,
+      quality: 100,
+    },
+  },
+  dataQualityScore: 90,
+}));
+const shiftedFactorUniverse = syntheticFactorUniverse.map((row) => ({
+  ...row,
+  factors: Object.fromEntries(
+    Object.entries(row.factors).map(([id, factor]) => [
+      id,
+      {
+        ...factor,
+        score: factor.score + 10,
+        heuristicScore: factor.heuristicScore + 10,
+      },
+    ]),
+  ),
+}));
+const normalizedSynthetic = applyCrossSectionalNormalization(syntheticFactorUniverse).snapshots;
+const normalizedShifted = applyCrossSectionalNormalization(shiftedFactorUniverse).snapshots;
+for (const [index, row] of normalizedSynthetic.entries()) {
+  assert.equal(
+    row.factors.momentum.normalization.method,
+    "cross-sectional-rank",
+    "40-ticker universe should use cross-sectional rank normalization",
+  );
+  assertApprox(
+    row.factors.momentum.score,
+    normalizedShifted[index].factors.momentum.score,
+    1e-9,
+    "Uniform +10 factor shift should not change percentile score",
+  );
+}
+const fiftyTieFraction =
+  normalizedSynthetic.filter((row) => Math.abs(row.factors.momentum.score - 50) < 1e-9).length /
+  normalizedSynthetic.length;
+assert.ok(fiftyTieFraction < 0.05, "Cross-sectional rank should not collapse many names to exactly 50");
+const normalizedSyntheticAgain = applyCrossSectionalNormalization(JSON.parse(JSON.stringify(syntheticFactorUniverse))).snapshots;
+assert.deepEqual(
+  normalizedSynthetic.map((row) => row.factors.momentum.score),
+  normalizedSyntheticAgain.map((row) => row.factors.momentum.score),
+  "Same cross-section through the shared live/historical normalizer should produce identical scores",
+);
+
 const recommendationScore = scoreRecommendationFromFactorSnapshot(
   {
     dataQualityScore: 88,
@@ -192,6 +250,16 @@ const recommendationScore = scoreRecommendationFromFactorSnapshot(
 assert.ok(recommendationScore.alphaScore > 60, "Positive factor mix should produce alpha score above neutral");
 assert.ok(recommendationScore.actionScore >= recommendationScore.alphaScore, "Risk-on regime and portfolio fit should not reduce action score");
 assert.ok(recommendationScore.topPositiveFactors.length > 0, "Recommendation score should expose positive factor contributions");
+const optionContributionWithData = scoreRecommendationFromFactorSnapshot(
+  { dataQualityScore: 100, factors: { optionsFlow: { label: "Options", score: 50, quality: 100 } } },
+  { weights: { optionsFlow: 1 } },
+).contributions.find((item) => item.id === "optionsFlow");
+const optionContributionMissing = scoreRecommendationFromFactorSnapshot(
+  { dataQualityScore: 100, factors: { optionsFlow: { label: "Options", score: 80, quality: 0 } } },
+  { weights: { optionsFlow: 1 } },
+).contributions.find((item) => item.id === "optionsFlow");
+assert.equal(optionContributionWithData.contribution, 0, "Neutral optionsFlow data should contribute 0");
+assert.equal(optionContributionMissing.contribution, 0, "Missing optionsFlow data should shrink contribution to 0");
 
 const normalizedWeights = normalizeRecommendationFactorWeights({ momentum: 2, qualityGrowth: 1 });
 assert.ok(Math.abs(Object.values(normalizedWeights).reduce((sum, value) => sum + value, 0) - 1) < 1e-9, "Factor weights should normalize to 1");
@@ -476,7 +544,7 @@ assert.equal(
 );
 assert.equal(
   historicalSnapshot.recommendationScore.schemaVersion,
-  "recommendation-score-v1",
+  "recommendation-score-v2",
   "Historical factor snapshots must score through recommender_core",
 );
 assert.ok(

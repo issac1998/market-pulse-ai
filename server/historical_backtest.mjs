@@ -6,9 +6,11 @@ import { fileURLToPath } from "node:url";
 import { buildFactorSnapshotAsOf, normalizeHistoricalBars } from "../lib/historical_features.mjs";
 import {
   classifyOutcomeQuality,
+  applyCrossSectionalNormalization,
   learnRecommendationFactorWeights,
   normalizeRecommendationFactorWeights,
   outcomeFromExcess,
+  scoreRecommendationFromFactorSnapshot,
   winsorizeSeries,
 } from "../lib/recommender_core.mjs";
 import { numberOrNull } from "../lib/market_core.mjs";
@@ -521,6 +523,7 @@ function factorStats(outcomes = []) {
         avgScore: 0,
         scores: [],
         returns: [],
+        schemaMix: {},
       };
       row.samples += 1;
       row.wins += outcome.outcome === "win" ? 1 : 0;
@@ -529,6 +532,8 @@ function factorStats(outcomes = []) {
       row.avgScore = ((row.avgScore * (row.samples - 1)) + score) / row.samples;
       row.scores.push(score);
       row.returns.push(value);
+      const scoreSchema = outcome.scoreSchema || outcome.factorSnapshot?.scoreSchema || outcome.factorSnapshot?.schemaVersion || "unknown";
+      row.schemaMix[scoreSchema] = (row.schemaMix[scoreSchema] || 0) + 1;
       stats[id] = row;
     }
   }
@@ -1082,6 +1087,15 @@ export function runHistoricalWalkForwardFromRows({ bars = [], regimes = [], conf
       });
       scored.push({ ticker, factorSnapshot, recommendationScore, latestBar: eligibleBars.at(-1) });
     }
+    const normalizedSnapshots = applyCrossSectionalNormalization(scored.map((item) => item.factorSnapshot), {
+      minCrossSection: 30,
+      lowerPct: 1,
+      upperPct: 99,
+    }).snapshots;
+    scored.forEach((item, index) => {
+      item.factorSnapshot = normalizedSnapshots[index] || item.factorSnapshot;
+      item.recommendationScore = scoreRecommendationFromFactorSnapshot(item.factorSnapshot, { weights: DEFAULT_WEIGHTS });
+    });
     scored.sort((a, b) => b.recommendationScore.actionScore - a.recommendationScore.actionScore || b.recommendationScore.alphaScore - a.recommendationScore.alphaScore);
     for (const item of scored.slice(0, runConfig.topN)) {
       const rows = byTicker.get(item.ticker) || [];
@@ -1149,6 +1163,7 @@ export function runHistoricalWalkForwardFromRows({ bars = [], regimes = [], conf
           outcomeQualityReasons: quality.reasons,
           outcomeUsable: quality.usable,
           regimeBucket,
+          scoreSchema: decision.factorSnapshot.schemaVersion || decision.factorSnapshot.scoreSchema || "",
           factorSnapshot: decision.factorSnapshot,
           actionScore: decision.actionScore,
           alphaScore: decision.alphaScore,
