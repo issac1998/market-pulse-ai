@@ -50,6 +50,10 @@ import {
   applyAllStockAgentShadowGates,
 } from "./server/all_stock/debate_gate.mjs";
 import { intradayWatcherConfigFromEnv, runIntradayWatcherOnce } from "./server/intraday_watcher.mjs";
+import {
+  historicalBacktestReport,
+  runHistoricalWalkForwardFromSqlite,
+} from "./server/historical_backtest.mjs";
 import { runJsonCli as runJsonCliProcess, runTextCli as runTextCliProcess } from "./server/cli_process.mjs";
 import { addressOnly, probeSmtpEmail, sendResendEmail, sendSmtpEmail } from "./server/email_delivery.mjs";
 import { loadEnvFile, parseBoolean, splitList } from "./server/env_utils.mjs";
@@ -3396,6 +3400,7 @@ function compactStoreForSave(db = {}) {
     alerts: Array.isArray(db.alerts) ? db.alerts.slice(0, 200) : [],
     signalHistory: Array.isArray(db.signalHistory) ? db.signalHistory.slice(0, 1000) : [],
     consensusSnapshots: Array.isArray(db.consensusSnapshots) ? db.consensusSnapshots.slice(0, 2000) : [],
+    historicalBacktests: Array.isArray(db.historicalBacktests) ? db.historicalBacktests.slice(0, 50) : [],
     intradayWatcher: db.intradayWatcher && typeof db.intradayWatcher === "object" ? db.intradayWatcher : {},
     pushDeliveryState: db.pushDeliveryState && typeof db.pushDeliveryState === "object" ? db.pushDeliveryState : {},
     intradayExplain: db.intradayExplain && typeof db.intradayExplain === "object" ? db.intradayExplain : {},
@@ -3653,6 +3658,7 @@ async function ensureStore() {
       ibkrSyncLog: Array.isArray(db.ibkrSyncLog) ? db.ibkrSyncLog : [],
       akshareGlobalNewsLog: Array.isArray(db.akshareGlobalNewsLog) ? db.akshareGlobalNewsLog : [],
       consensusSnapshots: Array.isArray(db.consensusSnapshots) ? db.consensusSnapshots : [],
+      historicalBacktests: Array.isArray(db.historicalBacktests) ? db.historicalBacktests : [],
       intradayWatcher: db.intradayWatcher && typeof db.intradayWatcher === "object" ? db.intradayWatcher : {},
       pushDeliveryState: db.pushDeliveryState && typeof db.pushDeliveryState === "object" ? db.pushDeliveryState : {},
       intradayExplain: db.intradayExplain && typeof db.intradayExplain === "object" ? db.intradayExplain : {},
@@ -3693,6 +3699,7 @@ async function ensureStore() {
       ibkrSyncLog: [],
       akshareGlobalNewsLog: [],
       consensusSnapshots: [],
+      historicalBacktests: [],
       intradayWatcher: {},
       pushDeliveryState: {},
       intradayExplain: {},
@@ -37479,6 +37486,63 @@ async function handleApi(req, res, url) {
       modelVersion: body.modelVersion || url.searchParams.get("modelVersion") || "current",
       backtest,
     });
+  }
+
+  if (req.method === "POST" && url.pathname === "/api/recommender/historical-backtest") {
+    const body = await readBody(req).catch(() => ({}));
+    try {
+      const result = await runHistoricalWalkForwardFromSqlite({
+        sqlitePath: SQLITE_DB_FILE,
+        config: {
+          startDate: body.startDate || url.searchParams.get("startDate"),
+          endDate: body.endDate || url.searchParams.get("endDate"),
+          maxTickers: body.maxTickers || url.searchParams.get("maxTickers"),
+          maxDates: body.maxDates || url.searchParams.get("maxDates"),
+          topN: body.topN || url.searchParams.get("topN"),
+          minLookback: body.minLookback || url.searchParams.get("minLookback"),
+          horizons: Array.isArray(body.horizons)
+            ? body.horizons
+            : String(body.horizons || url.searchParams.get("horizons") || "")
+                .split(",")
+                .map((item) => item.trim())
+                .filter(Boolean),
+          primaryHorizon: body.primaryHorizon || url.searchParams.get("primaryHorizon"),
+          costBps: body.costBps || url.searchParams.get("costBps"),
+          slippageBps: body.slippageBps || url.searchParams.get("slippageBps"),
+          sqliteTimeoutMs: body.sqliteTimeoutMs || url.searchParams.get("sqliteTimeoutMs"),
+        },
+      });
+      const db = await ensureStore();
+      db.historicalBacktests = [result.run, ...(db.historicalBacktests || []).filter((item) => item.id !== result.run.id)].slice(0, 50);
+      appendAuditEventRecord(db, {
+        eventType: "historical_backtest.run",
+        severity: result.run.status === "ok" ? "info" : "warn",
+        payload: {
+          runId: result.run.id,
+          status: result.run.status,
+          decisions: result.run.decisions?.length || 0,
+          outcomes: result.run.outcomes?.length || 0,
+          sampleCount: result.run.metrics?.sampleCount || 0,
+          source: "historical-backtest",
+        },
+      });
+      await saveStore(db);
+      return sendJson(res, {
+        schemaVersion: "historical-backtest-response-v1",
+        run: result.run,
+        report: result.report,
+      });
+    } catch (error) {
+      return sendJson(res, { error: errorZh(error.message) }, 502);
+    }
+  }
+
+  if (req.method === "GET" && url.pathname.startsWith("/api/recommender/historical-backtest/") && url.pathname.endsWith("/report")) {
+    const id = decodeURIComponent(url.pathname.replace("/api/recommender/historical-backtest/", "").replace(/\/report$/, ""));
+    const db = await ensureStore();
+    const run = (db.historicalBacktests || []).find((item) => item.id === id) || null;
+    if (!run) return sendJson(res, { error: "未找到该历史回测 run。" }, 404);
+    return sendJson(res, { report: historicalBacktestReport(run) });
   }
 
   if (req.method === "GET" && url.pathname === "/api/recommendations/today") {

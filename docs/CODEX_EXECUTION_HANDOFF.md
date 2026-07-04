@@ -52,7 +52,7 @@ Scope here: W1 watcher + W3 triage + W4 push + W5 move→reason + W6 novelty + W
 - **D4 Alpha158 subset (~24 features, OHLCV-only, in-house)**: k-bar shape family (KMID/KLEN/KUP/KLOW/KSFT); ROC/MA/STD over windows [5,20,60]; RSV, RANK, IMAX/IMIN; CORR(close,volume); CNTP/CNTN; WVMA. These feed the momentum/technical factor group's raw inputs; identical formulas live-side and historical-side with parity fixtures (same input → same value in both paths).
 - **Verify**: 5 tickers × 3 dates spot-checked vs provider closes; parity fixtures green; corpus build logs row counts per source.
 
-## ☐ WP4 — Historical walk-forward + backtest report (spec: §7, unlocks §10)
+## ☑ WP4 — Historical walk-forward + backtest report (spec: §7, unlocks §10)
 
 - Extend `runAllStockAgentBacktest` (or add `runHistoricalWalkForward`) sourcing from `historical_bars`: frozen pseudo-decisions (`decisionSource:"historical-backtest"`, own tables/labels, never blended with live), entry next-open after signal, cost/slippage bps config stored with the run, outcomes T+1/3/5/10/20/60 vs SPY + sector basket, regime-tagged from `historical_regimes`.
 - Weights outputs (§7.1): candidate weights per walk-forward window via `learnRecommendationFactorWeights` (same caps); unconstrained rankIC-proportional reference weights labeled `reference-only`; weight-trajectory stability data; per-factor verdicts (keep / floor / needs-more-samples) with `n`.

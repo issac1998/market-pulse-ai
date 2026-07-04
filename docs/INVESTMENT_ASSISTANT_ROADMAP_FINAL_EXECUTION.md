@@ -250,3 +250,68 @@ tier1-latest|1|0|Universe is current S&P 500 + Nasdaq 100 + observed project tic
 - The WP3 data-source verification item "5 tickers × 3 dates spot-checked vs provider closes" could not be completed in this environment. After installing AkShare, both the direct Eastmoney path and AkShare `stock_us_hist` returned `RemoteDisconnected`; the configured Finnhub key returned HTTP 403 for candles; no Alpha Vantage key is configured.
 - FRED CSV downloads for `DGS10`, `DGS2`, `T10Y2Y`, `BAMLC0A0CM`, `T10YIE`, and `VIXCLS` timed out under the short verification timeout. The script records the failure and exits cleanly; it does not fabricate historical regimes.
 - I did not add an unrequested Yahoo/Stooq/Longbridge historical fallback because the handoff explicitly names AkShare plus Finnhub/Alpha Vantage, and the contradiction protocol says not to substitute a new design silently.
+
+## WP4 — Historical Walk-Forward + Backtest Report
+
+### What Changed
+
+- Added `server/historical_backtest.mjs` with a pure `runHistoricalWalkForwardFromRows` engine and a SQLite entrypoint `runHistoricalWalkForwardFromSqlite`.
+- The engine reads `historical_bars` / `historical_regimes`, builds as-of factor snapshots through `lib/historical_features.mjs`, then scores through `scoreRecommendationFromFactorSnapshot` in `lib/recommender_core.mjs`.
+- Historical decisions are frozen pseudo-decisions labeled `decisionSource:"historical-backtest"` and never blend with live recommendation decisions.
+- Entry uses next-open after the signal date; exits use horizon close; outcomes are computed for configurable horizons vs SPY benchmark, with cost/slippage bps stored in the frozen run config.
+- Added report/provenance output: engine, factor data source, universe caveat, strategy hash, friction label, config, factor analysis, candidate-only weight output, and Chinese deterministic narrative derived from the frozen JSON.
+- Added store key `historicalBacktests` and routes:
+  - `POST /api/recommender/historical-backtest`
+  - `GET /api/recommender/historical-backtest/:id/report`
+- Regenerated route inventory.
+
+### Files / Functions
+
+- `server/historical_backtest.mjs`: `runHistoricalWalkForwardFromRows`, `runHistoricalWalkForwardFromSqlite`, `historicalBacktestReport`.
+- `server.mjs`: route wiring, append-only `historicalBacktests` store key, audit event for historical runs.
+- `scripts/core_regression_tests.mjs`: synthetic OHLCV walk-forward fixture.
+- `docs/CODEBASE_ROUTE_INVENTORY.md`: regenerated route/store inventory.
+
+### Verification Output
+
+```text
+$ node --check server.mjs
+$ node --check public/app.js
+$ node --check server/historical_backtest.mjs
+$ node --check scripts/core_regression_tests.mjs
+all passed with no output
+
+$ python3 -m py_compile scripts/build_historical_bars.py scripts/akshare_bridge.py scripts/sqlite_store_sync.py
+passed with no output
+
+$ node scripts/core_regression_tests.mjs
+core_regression_tests: ok
+
+$ node scripts/generate_route_inventory.mjs && node scripts/generate_route_inventory.mjs --check
+{"status":"ok","routes":67,"uiFetches":34,"storeKeys":25}
+{"status":"ok","routes":67,"uiFetches":34,"storeKeys":25}
+
+$ curl -sS -X POST http://localhost:5173/api/recommender/historical-backtest ...
+schemaVersion=historical-backtest-response-v1
+run.status=empty
+run.decisionSource=historical-backtest
+run.metrics.sampleCount=0
+run.metrics.hitRate.n=0
+run.weightOutputs.candidateWeights.status=candidate-only
+run.provenance.engine=native-js
+run.provenance.friction=frictionless-reference
+
+$ curl -sS http://localhost:5173/api/recommender/historical-backtest/hist-bt-1783191958901-775b6e0e/report
+{
+  "id": "hist-bt-1783191958901-775b6e0e",
+  "narrativeZh": "历史 walk-forward 语料为空或未产生到期样本，当前只能验证引擎和数据缺口，不能解读收益表现。",
+  "engine": "native-js",
+  "strategyHash": "775b6e0e"
+}
+```
+
+### Contradictions / Blockers
+
+- Because WP3 provider verification could not populate `historical_bars`, the live API verification only proves the frozen empty-run and report path. The synthetic regression fixture proves non-empty walk-forward behavior, but it is not a provider spot-check.
+- Sector basket benchmarking is marked `sectorBasketStatus:"missing_sector_mapping"` and uses SPY only until a stable historical ticker→sector/security-master mapping exists. I did not invent a sector map inside WP4.
+- LLM narrative is deterministic Chinese narrative derived from frozen JSON. I did not call an LLM because the current historical corpus is empty and the hard rule forbids LLM-written numbers; the report pipeline is ready for a subordinate narrative once non-empty frozen JSON exists.

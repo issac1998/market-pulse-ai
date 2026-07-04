@@ -33,6 +33,7 @@ import {
   normalizeHistoricalBars,
 } from "../lib/historical_features.mjs";
 import { runIntradayWatcherOnce } from "../server/intraday_watcher.mjs";
+import { runHistoricalWalkForwardFromRows } from "../server/historical_backtest.mjs";
 import { proxyFetchResponse } from "../server/network_fetch.mjs";
 
 function assertApprox(actual, expected, tolerance, message) {
@@ -393,6 +394,56 @@ assert.equal(
 assert.ok(
   historicalSnapshot.recommendationScore.contributions.some((item) => item.id === "momentum"),
   "Historical recommendation score should include standard recommender factor contributions",
+);
+
+const historicalBacktestBars = ["SPY", "AAPL", "MSFT"].flatMap((ticker, tickerIndex) =>
+  Array.from({ length: 80 }, (_, index) => {
+    const date = new Date(Date.UTC(2026, 0, 1 + index)).toISOString().slice(0, 10);
+    const drift = ticker === "SPY" ? 0.25 : ticker === "AAPL" ? 0.8 : 0.45;
+    const base = 100 + tickerIndex * 25 + index * drift;
+    return {
+      ticker,
+      date,
+      open: base,
+      high: base + 1.5,
+      low: base - 1,
+      close: base + 0.8,
+      volume: 1_000_000 + index * 20_000 + tickerIndex * 10_000,
+      source: "fixture",
+    };
+  }),
+);
+const historicalWalkForward = runHistoricalWalkForwardFromRows({
+  bars: historicalBacktestBars,
+  regimes: [{ date: "2026-01-01", bucket: "宏观顺风", risk_score: 38 }],
+  config: { minLookback: 20, maxDates: 4, topN: 2, horizons: [1, 3], primaryHorizon: 1, costBps: 1, slippageBps: 1 },
+});
+assert.equal(historicalWalkForward.run.status, "ok", "Historical walk-forward fixture should produce a runnable backtest");
+assert.ok(historicalWalkForward.run.decisions.length > 0, "Historical walk-forward should freeze pseudo-decisions");
+assert.ok(
+  historicalWalkForward.run.decisions.every((item) => item.decisionSource === "historical-backtest"),
+  "Historical pseudo-decisions should be labeled separately from live decisions",
+);
+assert.ok(historicalWalkForward.run.outcomes.length > 0, "Historical walk-forward should compute outcomes");
+assert.equal(
+  historicalWalkForward.run.metrics.hitRate.n,
+  historicalWalkForward.run.metrics.sampleCount,
+  "Every surfaced historical metric should carry its sample count",
+);
+assert.equal(
+  historicalWalkForward.run.weightOutputs.candidateWeights.status,
+  "candidate-only",
+  "Historical learned weights should remain candidate-only",
+);
+assert.equal(
+  historicalWalkForward.run.provenance.engine,
+  "native-js",
+  "Historical backtest report should include engine provenance",
+);
+assert.equal(
+  historicalWalkForward.report.provenance.strategyHash,
+  historicalWalkForward.run.strategyHash,
+  "Historical report should preserve frozen strategy provenance",
 );
 
 const disabledWatcher = await runIntradayWatcherOnce({ db: { watchlist: ["NVDA"] } }, { config: { enabled: false } });
