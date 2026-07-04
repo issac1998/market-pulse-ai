@@ -58,6 +58,7 @@ import {
   addFactorCandidate,
   advanceFactorState,
   buildFactorPerformanceReport,
+  evaluateFactorRegistry,
   normalizeFactorRegistry,
 } from "./server/factor_registry.mjs";
 import {
@@ -1144,6 +1145,7 @@ const ALL_STOCK_AGENT_MIN_ACTIONABLE_DQ = Math.max(0, Math.min(100, Number(proce
 const ALL_STOCK_AGENT_PREFETCH_ENABLED = parseBoolean(process.env.ALL_STOCK_AGENT_PREFETCH_ENABLED, true);
 const SUBSIGNAL_IC_WEIGHTING_REQUESTED = parseBoolean(process.env.SUBSIGNAL_IC_WEIGHTING_ENABLED, false);
 const SUBSIGNAL_IC_WEIGHTING_ENABLED = false;
+const FACTOR_EVALUATOR_ENABLED = parseBoolean(process.env.FACTOR_EVALUATOR_ENABLED, false);
 const ALL_STOCK_AGENT_TECHNICAL_PREFETCH_LIMIT = Math.max(
   0,
   Number(process.env.ALL_STOCK_AGENT_TECHNICAL_PREFETCH_LIMIT ?? 0),
@@ -21232,7 +21234,37 @@ function scoreSocialAttentionFactor(ctx = {}) {
   );
 }
 
-function buildFactorSnapshot(run = {}, ticker = "", ctx = null) {
+function shadowFactorsForContext(registryInput = null, ctx = {}) {
+  const registry = normalizeFactorRegistry(registryInput || {});
+  const rows = {};
+  for (const factor of registry.factors || []) {
+    if (factor.state !== "shadow") continue;
+    const id = normalizeDisplayText(factor.factorId);
+    if (!id || RECOMMENDER_FACTOR_WEIGHTS[id]) continue;
+    rows[id] = {
+      id,
+      label: factor.factorId,
+      raw: {
+        lifecycleState: "shadow",
+        implementation: factor.implementation || "dsl",
+        evidenceStatus: factor.evidence?.status || factor.evidence?.admission?.status || "not-evaluated-live",
+        ticker: ctx.ticker || "",
+      },
+      score: 50,
+      heuristicScore: 50,
+      quality: 0,
+      source: ["factor-registry-shadow"],
+      missingReason: "Shadow factor is tracked for outcomes only and has zero decision weight until human strategy-version promotion.",
+      lifecycleState: "shadow",
+      weightEligible: false,
+      normalization: { method: "shadow-neutral", factorId: id, score: 50 },
+      subSignals: [],
+    };
+  }
+  return rows;
+}
+
+function buildFactorSnapshot(run = {}, ticker = "", ctx = null, registry = null) {
   const symbol = safeTicker(ticker);
   const context = ctx || allStockAgentTickerContext(run, symbol, {});
   const peerGroup = allStockAgentPeerGroup(context);
@@ -21249,7 +21281,8 @@ function buildFactorSnapshot(run = {}, ticker = "", ctx = null) {
     smartMoney: scoreSmartMoneyFactor(context),
     socialAttention: scoreSocialAttentionFactor(context),
   };
-  const factors = Object.fromEntries(
+  const factors = {
+    ...Object.fromEntries(
     Object.entries(heuristicFactors).map(([id, factor]) => {
       const heuristicScore = numberOrNull(factor?.score) ?? 50;
       const normalization = normalizeFactorValue(id, heuristicScore, peerGroup);
@@ -21263,7 +21296,9 @@ function buildFactorSnapshot(run = {}, ticker = "", ctx = null) {
         },
       ];
     }),
-  );
+    ),
+    ...shadowFactorsForContext(registry, context),
+  };
   const dataQualityScore = clampScore(
     Math.round(
       Object.entries(RECOMMENDER_FACTOR_WEIGHTS).reduce((sum, [id, weight]) => sum + (factors[id]?.quality || 0) * weight, 0) /
@@ -21284,9 +21319,9 @@ function buildFactorSnapshot(run = {}, ticker = "", ctx = null) {
   };
 }
 
-function buildFactorSnapshotForRun(run = {}, tickers = []) {
+function buildFactorSnapshotForRun(run = {}, tickers = [], registry = null) {
   const symbols = [...new Set((tickers || []).map(safeTicker).filter(Boolean))];
-  const snapshots = symbols.map((ticker) => buildFactorSnapshot(run, ticker)).filter(Boolean);
+  const snapshots = symbols.map((ticker) => buildFactorSnapshot(run, ticker, null, registry)).filter(Boolean);
   return applyCrossSectionalNormalization(snapshots, {
     minCrossSection: 30,
     lowerPct: 1,
@@ -23164,7 +23199,7 @@ async function runAllStockAgentForRun(db, sourceRun, trigger = "manual", options
   });
   strategyVersion = activeStrategyVersion(state.strategyVersions) || skillStrategyVersion;
   const factorSnapshotMap = new Map(
-    buildFactorSnapshotForRun(source, universe.map((item) => item.ticker))
+    buildFactorSnapshotForRun(source, universe.map((item) => item.ticker), db.factorRegistry)
       .map((snapshot) => [safeTicker(snapshot.ticker), snapshot]),
   );
   const factorCorrelationMatrix = buildFactorCorrelationMatrix([...factorSnapshotMap.values()], { minN: 3 });
@@ -37830,6 +37865,30 @@ async function handleApi(req, res, url) {
     db.factorRegistry = { ...registry, performanceReport: report };
     await saveStore(db);
     return sendJson(res, { report });
+  }
+
+  if (req.method === "POST" && url.pathname === "/api/factors/evaluate") {
+    const body = await readBody(req);
+    if (body.__readError) return sendJson(res, { error: body.__readError }, 400);
+    const db = await ensureStore();
+    const state = normalizeAllStockAgentState(db.allStockAgent);
+    const registry = normalizeFactorRegistry(db.factorRegistry);
+    const performanceReport = buildFactorPerformanceReport(registry, { latestRun: state.runs[0] || null });
+    const result = evaluateFactorRegistry(registry, {
+      actor: "system:evaluator",
+      performanceReport,
+      factorStats: state.runs[0]?.factorStats || {},
+      evidenceOverrides: body.evidenceOverrides || {},
+    });
+    db.factorRegistry = { ...result.registry, performanceReport };
+    appendAuditEvent(db, "factor_registry.evaluate", {
+      enabledBySchedule: FACTOR_EVALUATOR_ENABLED,
+      manual: true,
+      transitions: result.transitions,
+      trialEntries: result.trialEntries.length,
+    }, result.transitions.length ? "ok" : "warn");
+    await saveStore(db);
+    return sendJson(res, { evaluation: result.report, transitions: result.transitions, registry: db.factorRegistry });
   }
 
   if (req.method === "POST" && url.pathname === "/api/factors/candidates") {

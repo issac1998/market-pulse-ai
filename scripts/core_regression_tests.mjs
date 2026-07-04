@@ -40,7 +40,7 @@ import { runIntradayWatcherOnce } from "../server/intraday_watcher.mjs";
 import { historicalMaxDrawdownFromReturns, runHistoricalWalkForwardFromRows } from "../server/historical_backtest.mjs";
 import { proxyFetchResponse } from "../server/network_fetch.mjs";
 import { evaluateFactorSpec, parseFactorSpec } from "../lib/factor_spec.mjs";
-import { addFactorCandidate, normalizeFactorRegistry } from "../server/factor_registry.mjs";
+import { addFactorCandidate, evaluateFactorRegistry, normalizeFactorRegistry } from "../server/factor_registry.mjs";
 import {
   activeStrategyVersion,
   activeStrategyWeights,
@@ -315,6 +315,50 @@ const duplicateCandidate = addFactorCandidate(registryWithSeeds, {
 });
 assert.equal(duplicateCandidate.factor.state, "rejected", "Originality gate should reject duplicate op-sequence factor candidates");
 assert.equal(duplicateCandidate.registry.trialLedger.count, registryWithSeeds.trialLedger.count + 1, "Rejected factor candidates should still be recorded in trial ledger");
+const evaluatedRegistry = evaluateFactorRegistry(registryWithSeeds, {
+  evidenceOverrides: {
+    week52HighProximity: {
+      rankIC: 0.08,
+      n: 160,
+      tStat: 3.4,
+      regimeSigns: 2,
+      adjacentHorizonSigns: 1,
+      maxCorrelation: 0.2,
+      coverage: 0.78,
+    },
+  },
+});
+assert.equal(
+  evaluatedRegistry.registry.factors.find((item) => item.factorId === "week52HighProximity").state,
+  "shadow",
+  "Mechanical evaluator should admit seeded factors to shadow when all gates pass",
+);
+assert.ok(
+  evaluatedRegistry.registry.trialLedger.count > registryWithSeeds.trialLedger.count,
+  "Factor evaluator should write trial-ledger entries before transitions",
+);
+const decayFixture = normalizeFactorRegistry({
+  factors: [
+    {
+      factorId: "activeDecayFixture",
+      family: "momentum",
+      spec: { factorId: "activeDecayFixture", pipeline: [{ op: "ref", input: "bars.close" }] },
+      expectedSign: 1,
+      prior: "literature",
+      state: "active",
+      stateHistory: [],
+      evidence: {},
+    },
+  ],
+});
+const decayed = evaluateFactorRegistry(decayFixture, {
+  factorStats: { activeDecayFixture: { samples: 80, rankIC: -0.02, avgExcessPct: -1.1 } },
+});
+assert.equal(decayed.registry.factors.find((item) => item.factorId === "activeDecayFixture").state, "decayed", "Decay monitor should demote weak active factors");
+const recovered = evaluateFactorRegistry(decayed.registry, {
+  factorStats: { activeDecayFixture: { samples: 80, rankIC: 0.03, avgExcessPct: 0.6 } },
+});
+assert.equal(recovered.registry.factors.find((item) => item.factorId === "activeDecayFixture").state, "shadow", "Decay monitor should recover decayed factors after positive IC");
 
 const recommendationScore = scoreRecommendationFromFactorSnapshot(
   {

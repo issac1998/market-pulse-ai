@@ -1069,3 +1069,67 @@ Regression fixtures added:
 Contradictions:
 
 - `ivRvSpread` cannot be expressed honestly by DSL v1 without extending the whitelist or adding a native multi-input evaluator, so it is registered as `implementation:"native"` with `insufficient-data` evidence.
+
+---
+
+## WP14 — Admission Gates + Shadow Factors + Decay Monitor — 2026-07-05
+
+Implemented Round 2 WP14.
+
+Changes:
+
+- Added B3 seed factors to the registry: `residualMomentum`, `week52HighProximity`, `shortTermReversal`, `idioVol21`, `maxDailyReturn21`, `amihudIlliquidity21`, `overnightGapBias21`.
+- Added mechanical `evaluateFactorRegistry()`:
+  - candidate → shadow admission gates using sign-correct RankIC, t-stat hurdle, regime signs, adjacent-horizon signs, max correlation, and coverage.
+  - trial ledger entries are written for every evaluated factor before transitions.
+  - active/decayed monitor demotes weak active factors and recovers decayed factors with positive IC.
+- Added manual `POST /api/factors/evaluate`; schedule flag `FACTOR_EVALUATOR_ENABLED=false` remains default. Manual evaluation can accept explicit evidence overrides, recorded as `manual-evidence-override`.
+- Live all-stock-agent factor snapshots now inject registry `shadow` factors as `lifecycleState:"shadow"` with neutral score/quality 0 and `weightEligible:false`. They are present for outcome accrual but absent from recommendation-score contributions because they are not in the active weights map.
+- Added `llmGovernance` stamps to factor evaluation/performance reports: LLM does not write scores, weights, or states.
+
+Verification:
+
+```text
+$ node --check server/factor_registry.mjs && node --check server.mjs && node --check scripts/core_regression_tests.mjs && node --check public/app.js
+pass
+
+$ node scripts/core_regression_tests.mjs
+core_regression_tests: ok
+
+$ node scripts/generate_route_inventory.mjs && node scripts/generate_route_inventory.mjs --check
+{"status":"ok","routes":80,"uiFetches":43,"storeKeys":26}
+{"status":"ok","routes":80,"uiFetches":43,"storeKeys":26}
+
+$ curl -sS -X POST http://localhost:5173/api/factors/evaluate ... evidenceOverrides.week52HighProximity
+{
+  "transitions": ["week52HighProximity:candidate->shadow"],
+  "trials": 15,
+  "llm": {
+    "llmWritesScores": false,
+    "llmWritesWeights": false,
+    "llmWritesStates": false,
+    "stateTransitions": "mechanical evaluator or human override only"
+  }
+}
+
+$ curl -sS -X POST http://localhost:5173/api/all-stock-agent/run ... wp14-shadow-smoke
+{
+  "runId": "1783206366858-all-stock-agent",
+  "evaluations": 80,
+  "shadowFactors": 160,
+  "shadowWeighted": 0
+}
+
+$ rg -n "learnedWeights|weights\\s*=|\\.weights\\s*=" server.mjs server/factor_registry.mjs
+only existing candidate-weight/governance paths; factor_registry does not write active weights
+```
+
+Regression fixtures added:
+
+- Seeded `week52HighProximity` walks candidate → shadow when mechanical gate evidence passes.
+- Duplicate/noise-style candidate is rejected and recorded in the trial ledger.
+- Decay monitor demotes an active factor and recovers it after positive IC.
+
+Contradictions:
+
+- True nightly scheduling is intentionally not activated in WP14 because `FACTOR_EVALUATOR_ENABLED` defaults false per spec. The manual route is available.

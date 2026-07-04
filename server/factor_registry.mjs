@@ -118,6 +118,81 @@ export function defaultFactorRegistrySeeds() {
       horizons: [1, 5, 20],
       pipeline: [{ op: "ref", input: "ivHistory.put_call_ratio" }],
     }), { evidence: { status: "insufficient-data", reason: "Requires options_snapshots put_call_ratio.", n: 0 } }),
+    seedFactor("residualMomentum", "momentum", {
+      schemaVersion: "factor-spec-v1",
+      factorId: "residualMomentum",
+      family: "momentum",
+      hypothesis: "剔除市场和行业后的残差动量比裸动量更接近个股 alpha。",
+      expectedSign: 1,
+      horizons: [20, 60],
+      pipeline: [],
+      reason: "DSL v1 cannot regress returns against SPY + sector basket.",
+    }, { implementation: "native", evidence: { status: "insufficient-data", reason: "Requires native residual regression evaluator.", n: 0 } }),
+    seedFactor("week52HighProximity", "momentum", parseFactorSpec({
+      factorId: "week52HighProximity",
+      family: "momentum",
+      hypothesis: "接近 52 周高点的股票更可能延续趋势。",
+      expectedSign: 1,
+      horizons: [20, 60],
+      pipeline: [
+        { op: "ref", input: "bars.close" },
+        { op: "ts_rank", window: 252 },
+      ],
+    }), { evidence: { status: "insufficient-data", reason: "Requires historical factor/outcome evaluation.", n: 0 } }),
+    seedFactor("shortTermReversal", "momentum", parseFactorSpec({
+      factorId: "shortTermReversal",
+      family: "momentum",
+      hypothesis: "极短期上涨后更容易均值回归，适合 1-5 日反转视角。",
+      expectedSign: -1,
+      horizons: [1, 5],
+      pipeline: [
+        { op: "ref", input: "bars.close" },
+        { op: "delta", window: 5 },
+      ],
+    }), { evidence: { status: "insufficient-data", reason: "Requires historical factor/outcome evaluation.", n: 0 } }),
+    seedFactor("idioVol21", "optionsFlow", parseFactorSpec({
+      factorId: "idioVol21",
+      family: "optionsFlow",
+      hypothesis: "短期波动过高会降低趋势信号的可执行性。",
+      expectedSign: -1,
+      horizons: [5, 20],
+      pipeline: [
+        { op: "overnight_return" },
+        { op: "ts_std", window: 21 },
+      ],
+    }), { evidence: { status: "insufficient-data", reason: "Uses overnight-return volatility until residual vol evaluator exists.", n: 0 } }),
+    seedFactor("maxDailyReturn21", "momentum", parseFactorSpec({
+      factorId: "maxDailyReturn21",
+      family: "momentum",
+      hypothesis: "近期单日最大涨幅过高常对应拥挤和回撤风险。",
+      expectedSign: -1,
+      horizons: [5, 20],
+      pipeline: [
+        { op: "overnight_return" },
+        { op: "ts_max", window: 21 },
+      ],
+    }), { evidence: { status: "insufficient-data", reason: "Requires historical factor/outcome evaluation.", n: 0 } }),
+    seedFactor("amihudIlliquidity21", "smartMoney", {
+      schemaVersion: "factor-spec-v1",
+      factorId: "amihudIlliquidity21",
+      family: "smartMoney",
+      hypothesis: "高 Amihud 非流动性会放大滑点并降低信号可执行性。",
+      expectedSign: -1,
+      horizons: [5, 20],
+      pipeline: [],
+      reason: "DSL v1 cannot combine absolute return with dollar volume in a rolling expression without native evaluator.",
+    }, { implementation: "native", evidence: { status: "insufficient-data", reason: "Requires native Amihud evaluator.", n: 0 } }),
+    seedFactor("overnightGapBias21", "momentum", parseFactorSpec({
+      factorId: "overnightGapBias21",
+      family: "momentum",
+      hypothesis: "持续隔夜跳空代表资金定价偏移，但也可能暴露隔夜风险。",
+      expectedSign: 1,
+      horizons: [5, 20],
+      pipeline: [
+        { op: "overnight_return" },
+        { op: "ts_mean", window: 21 },
+      ],
+    }), { evidence: { status: "insufficient-data", reason: "Requires historical factor/outcome evaluation.", n: 0 } }),
   ];
   return specs;
 }
@@ -282,6 +357,153 @@ export function advanceFactorState(registryInput = {}, factorId = "", nextState 
   return { registry: { ...registry, factors }, factor: factors.find((item) => item.factorId === factorId) };
 }
 
+function admissionEvidenceForFactor(factor = {}, context = {}) {
+  const override = context.evidenceOverrides?.[factor.factorId];
+  const liveStats = context.performanceReport?.factorStats?.[factor.factorId] || context.factorStats?.[factor.factorId] || {};
+  const evidence = override || factor.evidence || {};
+  const rankIC = numberOrNull(evidence.rankIC ?? liveStats.rankIC);
+  const n = numberOrNull(evidence.n ?? evidence.samples ?? liveStats.n ?? liveStats.samples);
+  const tStat = numberOrNull(evidence.tStat) ?? (Number.isFinite(rankIC) && Number.isFinite(n) && n > 2 ? rankIC * Math.sqrt(n) : null);
+  const coverage = numberOrNull(evidence.coverage ?? evidence.coveragePct) ?? 0;
+  const maxCorrelation = Math.abs(numberOrNull(evidence.maxCorrelation ?? evidence.maxAbsCorrelation) ?? 1);
+  const regimeSigns = numberOrNull(evidence.regimeSigns) ?? 0;
+  const adjacentHorizonSigns = numberOrNull(evidence.adjacentHorizonSigns) ?? 0;
+  const trialCount = Number(context.trialCount || 0);
+  const baseHurdle = factor.prior === "generated" ? 3.5 : 3.0;
+  const hurdle = baseHurdle + (trialCount > 8 ? Math.floor(Math.log2(trialCount / 8)) * 0.1 : 0);
+  const signOk = Number.isFinite(rankIC) && rankIC * (factor.expectedSign || 1) > 0;
+  const pass =
+    signOk &&
+    Number.isFinite(tStat) &&
+    tStat >= hurdle &&
+    regimeSigns >= 2 &&
+    adjacentHorizonSigns >= 1 &&
+    maxCorrelation < 0.6 &&
+    coverage >= 0.6;
+  return {
+    status: pass ? "passed" : "failed",
+    source: override ? "manual-evidence-override" : liveStats.samples || liveStats.n ? "live-factor-stats" : "stored-evidence",
+    rankIC: Number.isFinite(rankIC) ? rankIC : null,
+    n: Number.isFinite(n) ? n : 0,
+    tStat: Number.isFinite(tStat) ? tStat : null,
+    hurdle,
+    regimeSigns,
+    adjacentHorizonSigns,
+    maxCorrelation,
+    coverage,
+    checks: {
+      signOk,
+      tStatOk: Number.isFinite(tStat) && tStat >= hurdle,
+      regimeOk: regimeSigns >= 2,
+      adjacentHorizonOk: adjacentHorizonSigns >= 1,
+      correlationOk: maxCorrelation < 0.6,
+      coverageOk: coverage >= 0.6,
+    },
+  };
+}
+
+function decayEvidenceForFactor(factor = {}, context = {}) {
+  const liveStats = context.performanceReport?.factorStats?.[factor.factorId] || context.factorStats?.[factor.factorId] || {};
+  const n = numberOrNull(liveStats.n ?? liveStats.samples);
+  const rankIC = numberOrNull(liveStats.rankIC);
+  const avgExcessPct = numberOrNull(liveStats.avgExcessPct);
+  const shouldDecay = Number.isFinite(n) && n >= 60 && Number.isFinite(rankIC) && rankIC <= 0 && Number.isFinite(avgExcessPct) && avgExcessPct < 0;
+  const shouldRecover = factor.state === "decayed" && Number.isFinite(n) && n >= 60 && Number.isFinite(rankIC) && rankIC > 0;
+  return {
+    status: shouldDecay ? "decay" : shouldRecover ? "recover" : "hold",
+    n: Number.isFinite(n) ? n : 0,
+    rankIC: Number.isFinite(rankIC) ? rankIC : null,
+    avgExcessPct: Number.isFinite(avgExcessPct) ? avgExcessPct : null,
+  };
+}
+
+export function evaluateFactorRegistry(registryInput = {}, context = {}) {
+  const registry = normalizeFactorRegistry(registryInput);
+  const now = context.now || nowIso();
+  const trialEntries = [];
+  const transitions = [];
+  const factors = registry.factors.map((factor) => {
+    const trialEntry = {
+      id: compactId("factor-eval"),
+      at: now,
+      factorId: factor.factorId,
+      actor: context.actor || "system:evaluator",
+      accepted: false,
+      reason: "evaluated",
+      checks: [],
+    };
+    trialEntries.push(trialEntry);
+    if (factor.state === "candidate") {
+      const evidence = admissionEvidenceForFactor(factor, { ...context, trialCount: registry.trialLedger.count + trialEntries.length });
+      trialEntry.accepted = evidence.status === "passed";
+      trialEntry.reason = evidence.status === "passed" ? "candidate admitted to shadow" : "candidate gate failed";
+      trialEntry.checks = [evidence];
+      if (evidence.status === "passed") {
+        transitions.push({ factorId: factor.factorId, from: factor.state, to: "shadow", evidence });
+        return {
+          ...factor,
+          state: "shadow",
+          evidence: { ...(factor.evidence || {}), admission: evidence, status: "shadow" },
+          stateHistory: [{ at: now, from: factor.state, to: "shadow", reason: "mechanical admission gates passed", actor: context.actor || "system:evaluator" }, ...(factor.stateHistory || [])],
+        };
+      }
+      return { ...factor, evidence: { ...(factor.evidence || {}), latestAdmission: evidence } };
+    }
+    if (factor.state === "active" || factor.state === "decayed") {
+      const decay = decayEvidenceForFactor(factor, context);
+      trialEntry.reason = `decay monitor: ${decay.status}`;
+      trialEntry.checks = [decay];
+      if (decay.status === "decay") {
+        transitions.push({ factorId: factor.factorId, from: factor.state, to: "decayed", evidence: decay });
+        return {
+          ...factor,
+          state: "decayed",
+          evidence: { ...(factor.evidence || {}), latestDecay: decay },
+          stateHistory: [{ at: now, from: factor.state, to: "decayed", reason: "rolling IC <= 0 and avg contribution negative", actor: context.actor || "system:evaluator" }, ...(factor.stateHistory || [])],
+        };
+      }
+      if (decay.status === "recover") {
+        transitions.push({ factorId: factor.factorId, from: factor.state, to: "shadow", evidence: decay });
+        return {
+          ...factor,
+          state: "shadow",
+          evidence: { ...(factor.evidence || {}), latestDecay: decay },
+          stateHistory: [{ at: now, from: factor.state, to: "shadow", reason: "decayed factor recovered positive IC", actor: context.actor || "system:evaluator" }, ...(factor.stateHistory || [])],
+        };
+      }
+      return { ...factor, evidence: { ...(factor.evidence || {}), latestDecay: decay } };
+    }
+    trialEntry.reason = `state ${factor.state} observed only`;
+    return factor;
+  });
+  const next = {
+    ...registry,
+    trialLedger: {
+      count: registry.trialLedger.count + trialEntries.length,
+      entries: [...trialEntries.reverse(), ...(registry.trialLedger.entries || [])].slice(0, 1000),
+    },
+    factors,
+  };
+  return {
+    registry: next,
+    transitions,
+    trialEntries,
+    report: {
+      schemaVersion: "factor-evaluation-report-v1",
+      generatedAt: now,
+      llmGovernance: {
+        llmWritesScores: false,
+        llmWritesWeights: false,
+        llmWritesStates: false,
+        stateTransitions: "mechanical evaluator or human override only",
+      },
+      transitions,
+      evaluated: factors.length,
+      trialEntries: trialEntries.length,
+    },
+  };
+}
+
 export function buildFactorPerformanceReport(registryInput = {}, context = {}) {
   const registry = normalizeFactorRegistry(registryInput);
   const latestRun = context.latestRun || {};
@@ -289,6 +511,12 @@ export function buildFactorPerformanceReport(registryInput = {}, context = {}) {
   return {
     schemaVersion: "factor-performance-report-v1",
     generatedAt: nowIso(),
+    llmGovernance: {
+      llmWritesScores: false,
+      llmWritesWeights: false,
+      llmWritesStates: false,
+      reportSource: "mechanical registry + stored stats",
+    },
     registrySummary: {
       total: registry.factors.length,
       byState: registry.factors.reduce((acc, factor) => {
