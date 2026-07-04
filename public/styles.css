@@ -3710,6 +3710,138 @@ body.stock-detail-mode .stock-report-panel {
   font-size: 13px;
 }
 
+.daily-loop-box,
+.deep-dive-box,
+.reconciliation-box,
+.strategy-governance-box {
+  display: grid;
+  gap: 14px;
+}
+
+.daily-loop-hero,
+.deep-dive-hero {
+  display: grid;
+  grid-template-columns: minmax(0, 1.1fr) minmax(320px, 0.9fr);
+  gap: 16px;
+  align-items: start;
+}
+
+.daily-subsection {
+  display: grid;
+  gap: 10px;
+}
+
+.daily-subsection summary {
+  cursor: pointer;
+  font-weight: 700;
+}
+
+.daily-card-grid,
+.deep-dive-grid,
+.strategy-version-list,
+.reconciliation-list {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(260px, 1fr));
+  gap: 12px;
+}
+
+.daily-card {
+  display: grid;
+  gap: 10px;
+  min-width: 0;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: rgba(255, 255, 255, 0.72);
+  backdrop-filter: blur(16px);
+  padding: 12px;
+}
+
+.daily-card.wide {
+  grid-column: span 2;
+}
+
+.daily-card-head,
+.daily-card-actions,
+.strategy-actions {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+
+.daily-card p,
+.timeline-row p {
+  font-size: 13px;
+  line-height: 1.55;
+}
+
+.chip-list {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.chip-list span,
+.chain-chip small {
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  background: rgba(248, 250, 252, 0.85);
+  color: var(--muted);
+  font-size: 12px;
+  padding: 4px 8px;
+}
+
+.daily-news-list {
+  display: grid;
+  gap: 10px;
+}
+
+.daily-news-list article,
+.timeline-row {
+  border-left: 3px solid rgba(65, 105, 225, 0.35);
+  padding-left: 10px;
+}
+
+.factor-waterfall-list,
+.chain-chip-grid {
+  display: grid;
+  gap: 8px;
+}
+
+.factor-waterfall-row {
+  display: grid;
+  grid-template-columns: minmax(120px, 1fr) auto;
+  gap: 6px 12px;
+  align-items: center;
+  border-bottom: 1px solid var(--line);
+  padding: 8px 0;
+}
+
+.factor-waterfall-row small {
+  grid-column: 1 / -1;
+  color: var(--muted);
+}
+
+.chain-chip {
+  display: grid;
+  gap: 4px;
+  text-align: left;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: rgba(248, 250, 252, 0.78);
+  cursor: pointer;
+  padding: 10px;
+}
+
+.chain-chip:hover {
+  border-color: rgba(65, 105, 225, 0.45);
+}
+
+.strategy-version-card .mini-kv {
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+}
+
 @media (max-width: 1120px) {
   .layout,
   .status-panel,
@@ -3719,9 +3851,15 @@ body.stock-detail-mode .stock-report-panel {
   .option-read-guide,
   .action-suggestion-hero,
   .all-stock-agent-hero,
+  .daily-loop-hero,
+  .deep-dive-hero,
   .all-stock-agent-paper-grid,
   .split {
     grid-template-columns: 1fr;
+  }
+
+  .daily-card.wide {
+    grid-column: auto;
   }
 
   .page-gateway-grid {

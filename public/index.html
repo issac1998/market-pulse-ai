@@ -177,6 +177,18 @@
             </div>
           </section>
 
+          <section class="panel" data-page-panel="actions">
+            <div class="panel-head">
+              <div>
+                <p class="section-label">Today</p>
+                <h2>今日操作台</h2>
+              </div>
+            </div>
+            <div id="todayDeskBox" class="daily-loop-box empty-state">
+              正在读取今日推荐、追责记录和健康状态。
+            </div>
+          </section>
+
           <section class="panel stock-report-panel" data-page-panel="stocks">
             <div class="panel-head">
               <div>
@@ -201,6 +213,18 @@
             </div>
             <div id="stockReportBox" class="stock-report-box empty-state">
               运行采集后生成个股日报。
+            </div>
+          </section>
+
+          <section class="panel" data-page-panel="stocks">
+            <div class="panel-head">
+              <div>
+                <p class="section-label">Deep Dive</p>
+                <h2>个股证据包</h2>
+              </div>
+            </div>
+            <div id="stockDeepDiveBox" class="deep-dive-box empty-state">
+              打开单股详情后显示因子瀑布、数据质量、产业链和决策历史。
             </div>
           </section>
 
@@ -307,6 +331,18 @@
               </div>
             </div>
             <div id="backtestBox" class="backtest-box"></div>
+          </section>
+
+          <section class="panel" data-page-panel="portfolio">
+            <div class="panel-head">
+              <div>
+                <p class="section-label">Reconciliation</p>
+                <h2>交易建议对账</h2>
+              </div>
+            </div>
+            <div id="recommendationReconciliationBox" class="reconciliation-box empty-state">
+              正在读取交易与推荐的一致性。
+            </div>
           </section>
 
           <section class="split" data-page-panel="research">
@@ -505,6 +541,18 @@
               <button id="diagnoseSources" class="btn compact" type="button">运行诊断</button>
             </div>
             <div id="providerBox" class="provider-box"></div>
+          </section>
+
+          <section class="panel" data-page-panel="ops">
+            <div class="panel-head">
+              <div>
+                <p class="section-label">Strategy</p>
+                <h2>策略版本治理</h2>
+              </div>
+            </div>
+            <div id="strategyGovernanceBox" class="strategy-governance-box empty-state">
+              正在读取策略版本、候选权重和验证记录。
+            </div>
           </section>
         </aside>
       </main>

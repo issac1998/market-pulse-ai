@@ -92,7 +92,7 @@ Scope here: W1 watcher + W3 triage + W4 push + W5 move→reason + W6 novelty + W
 - Shadow debates accrual (D14): scheduled daily debate for top-5 candidates behind `AGENT_DEBATE_DAILY_ENABLED` (default **false** — owner flips it; cost/latency is theirs to accept); results remain shadow-gate only.
 - **Verify**: no path writes weights to the active skill without a promote call + validation record; rollback fixture; parity dashboard renders with both panels.
 
-## ☐ WP9 — Frontend surfaces for the daily loop (roadmap FINAL Phase 1)
+## ☑ WP9 — Frontend surfaces for the daily loop (roadmap FINAL Phase 1)
 
 - Today page: consume `/api/recommendations/today` — freshness badge, regime, ≤8 stories, ≤3 actionable + collapsed research (with downgrade-reason chips), track-record strip with `excludedCount`, health strip.
 - Deep-dive page: consume `/api/stocks/deep-dive` — factor waterfall (contributions reconcile to score), DQ audit block expandable, value chain with verified/inferred chips, news timeline, decision history, invalidations.

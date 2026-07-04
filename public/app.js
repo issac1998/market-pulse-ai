@@ -11,6 +11,7 @@ const els = {
   eventCalendarBox: document.getElementById("eventCalendarBox"),
   actionSuggestionsBox: document.getElementById("actionSuggestionsBox"),
   allStockAgentBox: document.getElementById("allStockAgentBox"),
+  todayDeskBox: document.getElementById("todayDeskBox"),
   runAllStockAgent: document.getElementById("runAllStockAgent"),
   runAllStockAgentBacktest: document.getElementById("runAllStockAgentBacktest"),
   stockReportForm: document.getElementById("stockReportForm"),
@@ -18,6 +19,7 @@ const els = {
   stockReportOptions: document.getElementById("stockReportOptions"),
   stockReportFetch: document.getElementById("stockReportFetch"),
   stockReportBox: document.getElementById("stockReportBox"),
+  stockDeepDiveBox: document.getElementById("stockDeepDiveBox"),
   discoveryGrid: document.getElementById("discoveryGrid"),
   socialGrid: document.getElementById("socialGrid"),
   analysisProvider: document.getElementById("analysisProvider"),
@@ -69,6 +71,7 @@ const els = {
   tradeJournalExportButton: document.getElementById("tradeJournalExportButton"),
   tradeJournalBox: document.getElementById("tradeJournalBox"),
   tradeReviewBox: document.getElementById("tradeReviewBox"),
+  recommendationReconciliationBox: document.getElementById("recommendationReconciliationBox"),
   alertsBox: document.getElementById("alertsBox"),
   runHistoryBox: document.getElementById("runHistoryBox"),
   scheduleBox: document.getElementById("scheduleBox"),
@@ -77,6 +80,7 @@ const els = {
   ibkrPortalKind: document.getElementById("ibkrPortalKind"),
   ibkrPortalInput: document.getElementById("ibkrPortalInput"),
   providerBox: document.getElementById("providerBox"),
+  strategyGovernanceBox: document.getElementById("strategyGovernanceBox"),
   diagnoseSources: document.getElementById("diagnoseSources"),
   llmProviderInputs: Array.from(document.querySelectorAll('input[name="llmProvider"]')),
   pagePanels: Array.from(document.querySelectorAll("[data-page-panel]")),
@@ -152,11 +156,18 @@ let collectionPollTimer = null;
 let sourceDiagnostics = null;
 let sourceDiagnosticsBusy = false;
 let allStockAgentBacktest = null;
+let todayRecommendations = null;
+let recommendationReconciliation = null;
+let strategyVersionsPayload = null;
+let strategyValidationPayload = null;
+let supplementalDataError = "";
 const runDetailCache = new Map();
 const runDetailLoading = new Set();
 const optionFetchInFlight = new Set();
 const stockSnapshotCache = new Map();
 const stockSnapshotLoading = new Set();
+const stockDeepDiveCache = new Map();
+const stockDeepDiveLoading = new Set();
 
 async function api(path, options = {}) {
   const res = await fetch(path, {
@@ -166,6 +177,25 @@ async function api(path, options = {}) {
   const data = await res.json();
   if (!res.ok) throw new Error(data.error || "请求失败");
   return data;
+}
+
+async function loadSupplementalData() {
+  supplementalDataError = "";
+  const results = await Promise.allSettled([
+    api("/api/recommendations/today"),
+    api("/api/trade-recommendation-reconciliation"),
+    api("/api/strategy-versions"),
+    api("/api/strategy-versions/validate"),
+  ]);
+  const [today, reconciliation, versions, validation] = results;
+  if (today.status === "fulfilled") todayRecommendations = today.value.today || null;
+  if (reconciliation.status === "fulfilled") recommendationReconciliation = reconciliation.value.reconciliation || null;
+  if (versions.status === "fulfilled") strategyVersionsPayload = versions.value || null;
+  if (validation.status === "fulfilled") strategyValidationPayload = validation.value.validation || null;
+  const errors = results
+    .filter((item) => item.status === "rejected")
+    .map((item) => item.reason?.message || "补充数据读取失败");
+  supplementalDataError = errors.join("；");
 }
 
 function downloadUrl(path) {
@@ -918,6 +948,7 @@ async function pollCollectionStatus() {
 
 async function loadState() {
   appState = await api("/api/state");
+  await loadSupplementalData();
   if (!sourceDiagnosticsBusy) sourceDiagnostics = appState.sourceDiagnostics || null;
   collectionStatus = appState.runStatus || collectionStatus;
   if (collectionStatus?.state === "running") {
@@ -946,11 +977,15 @@ function render() {
     renderRunSummaryLoading(selectedRun);
     renderActionSuggestions(selectedRun);
     renderAllStockAgent(appState.allStockAgent);
+    renderTodayDesk(todayRecommendations);
+    renderStockDeepDive(stockDetailTickerFromHash() || els.stockReportInput?.value || "");
     renderPortfolio(selectedRun);
+    renderRecommendationReconciliation(recommendationReconciliation);
     renderTradeJournal(appState.tradeJournal, appState.tradeReviews || [], appState.config?.ibkr);
     renderChat(appState.chat || []);
     renderSchedule(appState.config.schedule, appState.config.email, appState.emailLog || []);
     renderIbkrPortal(appState.config?.ibkr?.portal);
+    renderStrategyGovernance(strategyVersionsPayload, strategyValidationPayload);
     renderCapabilityRadar(selectedRun, appState.config || {});
     renderProviders(
       appState.config.providers,
@@ -970,7 +1005,9 @@ function render() {
   renderEventCalendar(selectedRun);
   renderActionSuggestions(selectedRun);
   renderAllStockAgent(appState.allStockAgent);
+  renderTodayDesk(todayRecommendations);
   renderStockReport(selectedRun);
+  renderStockDeepDive(stockDetailTickerFromHash() || els.stockReportInput?.value || "");
   renderDiscovery(selectedRun);
   renderSocial(selectedRun);
   renderAnalysis(selectedRun);
@@ -980,6 +1017,7 @@ function render() {
   renderOpenBB(selectedRun, appState.config?.openbb);
   renderCapabilityRadar(selectedRun, appState.config || {});
   renderPortfolio(selectedRun);
+  renderRecommendationReconciliation(recommendationReconciliation);
   renderTradeJournal(appState.tradeJournal, appState.tradeReviews || [], appState.config?.ibkr);
   renderBacktest(selectedRun);
   renderAlerts(selectedRun);
@@ -987,6 +1025,7 @@ function render() {
   renderChat(appState.chat || []);
   renderSchedule(appState.config.schedule, appState.config.email, appState.emailLog || []);
   renderIbkrPortal(appState.config?.ibkr?.portal);
+  renderStrategyGovernance(strategyVersionsPayload, strategyValidationPayload);
   renderProviders(
     appState.config.providers,
     selectedRun?.dataQuality,
@@ -1369,6 +1408,34 @@ async function requestStockSnapshot(ticker, options = {}) {
   } finally {
     stockSnapshotLoading.delete(normalized);
     renderStockReport(selectedReportRun());
+  }
+}
+
+async function requestStockDeepDive(ticker, options = {}) {
+  const normalized = normalizeTickerInput(ticker);
+  if (!normalized) return;
+  if (!options.force && stockDeepDiveCache.has(normalized)) return;
+  if (stockDeepDiveLoading.has(normalized)) return;
+  stockDeepDiveLoading.add(normalized);
+  renderStockDeepDive(normalized);
+  try {
+    const result = await api(`/api/stocks/deep-dive?ticker=${encodeURIComponent(normalized)}`);
+    if (result.deepDive?.ticker) {
+      stockDeepDiveCache.set(result.deepDive.ticker, result.deepDive);
+    }
+  } catch (error) {
+    stockDeepDiveCache.set(normalized, {
+      ticker: normalized,
+      error: error.message,
+      dataQualityAudit: {
+        status: "missing",
+        score: 0,
+        weakestBlocks: [{ label: "Deep Dive API", missingReason: error.message }],
+      },
+    });
+  } finally {
+    stockDeepDiveLoading.delete(normalized);
+    renderStockDeepDive(normalized);
   }
 }
 
@@ -2526,6 +2593,9 @@ function renderStockReport(run) {
   }
   if (!runHasTickerData(enrichedRun, selected) && !stockSnapshotLoading.has(selected)) {
     setTimeout(() => requestStockSnapshot(selected), 0);
+  }
+  if (!stockDeepDiveCache.has(selected) && !stockDeepDiveLoading.has(selected)) {
+    setTimeout(() => requestStockDeepDive(selected), 0);
   }
   document.body.classList.add("stock-detail-mode");
   const report = buildStockReport(enrichedRun, selected);
@@ -5127,6 +5197,184 @@ function renderAllStockAgentTrackRecord(latest = {}) {
   </section>`;
 }
 
+function metricWithN(item = {}, digits = 1, suffix = "") {
+  const value = item && typeof item === "object" ? item.value : item;
+  const n = item && typeof item === "object" ? Number(item.n || 0) : 0;
+  const numeric = value === null || value === undefined || value === "" ? NaN : Number(value);
+  const text = Number.isFinite(numeric) ? `${fmtNumber(numeric, digits)}${suffix}` : "-";
+  return `${text} · n=${Number.isFinite(n) ? n : 0}`;
+}
+
+function todayCallCard(item = {}, type = "research") {
+  const isActionable = type === "actionable";
+  const title = tickerLabel(item.ticker, { ...item, run: appState?.latest });
+  const thesis = item.thesis || item.oneLine || item.reason || item.actionability?.reason || "";
+  const gates = (item.actionability?.gates || item.gates || []).slice(0, 3);
+  return `<article class="daily-card ${isActionable ? "actionable" : "research"}">
+    <div class="daily-card-head">
+      <button class="link-button" type="button" data-open-stock-report="${escapeHtml(item.ticker)}">${escapeHtml(title)}</button>
+      <span class="tag ${isActionable ? "green" : "amber"}">${escapeHtml(isActionable ? "可执行" : "研究跟踪")}</span>
+    </div>
+    <div class="feed-meta">
+      <span>买分 ${escapeHtml(item.buyScore ?? "-")}</span>
+      <span>行动分 ${escapeHtml(item.actionScore ?? "-")}</span>
+      <span>DQ ${escapeHtml(item.dataQualityScore ?? "-")}</span>
+      <span>${escapeHtml(item.strategyVersion || "")}</span>
+    </div>
+    <p>${escapeHtml(thesis || "暂无 thesis。")}</p>
+    ${gates.length ? `<div class="chip-list">${gates.map((gate) => `<span>${escapeHtml(gate.label || gate.id || "")}</span>`).join("")}</div>` : ""}
+    <div class="daily-card-actions">
+      <button class="btn compact ghost" type="button" data-open-stock-report="${escapeHtml(item.ticker)}">深挖</button>
+      ${isActionable && item.id ? `<button class="btn compact" type="button" data-paper-accept="${escapeHtml(item.id)}">纸面接受</button>` : ""}
+    </div>
+  </article>`;
+}
+
+function renderTodayDesk(today = null) {
+  if (!els.todayDeskBox) return;
+  if (!today) {
+    els.todayDeskBox.className = "daily-loop-box empty-state";
+    els.todayDeskBox.textContent = supplementalDataError || "暂无今日推荐数据。";
+    return;
+  }
+  const calls = today.calls || {};
+  const actionable = calls.actionable || [];
+  const research = calls.research || [];
+  const track = today.trackRecord || {};
+  const regime = today.regime || {};
+  const freshness = today.freshness || {};
+  const health = today.health || {};
+  const missing = (health.missingData || []).slice(0, 6);
+  const stories = (today.stories || []).slice(0, 8);
+  els.todayDeskBox.className = "daily-loop-box";
+  els.todayDeskBox.innerHTML = `<div class="daily-loop-hero">
+    <div>
+      <p class="section-label">Daily Loop</p>
+      <h3>今日操作台</h3>
+      <p class="muted">Agent ${escapeHtml(freshness.agentRunId || "-")} · ${escapeHtml(fmtTime(freshness.agentCompletedAt || freshness.runCompletedAt))}</p>
+    </div>
+    <div class="all-stock-agent-track">
+      ${allStockAgentMetric(actionable.length, `正式建议 / ${calls.actionableLimit ?? 3}`)}
+      ${allStockAgentMetric(research.length, "研究列表")}
+      ${allStockAgentMetric(track.sampleCount, "追责样本")}
+      ${allStockAgentMetric(track.excludedCount, "剔除异常")}
+    </div>
+  </div>
+  <div class="all-stock-agent-note">
+    <strong>Regime</strong>
+    <span>${escapeHtml(regime.label || regime.bucket || "unknown")} · 风险分 ${escapeHtml(Number.isFinite(Number(regime.riskScore)) ? fmtNumber(Number(regime.riskScore), 0) : "-")}。</span>
+  </div>
+  ${today.editorial ? `<div class="all-stock-agent-note"><strong>大盘结论</strong><span>${escapeHtml(today.editorial)}</span></div>` : ""}
+  <section class="daily-subsection">
+    <div class="social-source-head"><h3>今日可执行</h3><span class="tag">${escapeHtml(actionable.length)} 个</span></div>
+    <div class="daily-card-grid">${actionable.length ? actionable.map((item) => todayCallCard(item, "actionable")).join("") : empty("暂无可执行买入；请看研究列表和缺失数据。")}</div>
+  </section>
+  <details class="daily-subsection" open>
+    <summary>研究跟踪 / 降级原因</summary>
+    <div class="daily-card-grid">${research.length ? research.slice(0, 12).map((item) => todayCallCard(item, "research")).join("") : empty("暂无研究跟踪。")}</div>
+  </details>
+  <section class="daily-subsection">
+    <div class="social-source-head"><h3>重要新闻</h3><span class="tag">${escapeHtml(stories.length)} 条</span></div>
+    <div class="daily-news-list">${stories.length ? stories.map((item) => `<article>
+      <a href="${escapeHtml(item.url || "#")}" target="_blank" rel="noopener">${escapeHtml(item.title || "未命名新闻")}</a>
+      <p>${escapeHtml(item.summary || "暂无摘要。")}</p>
+      <div class="feed-meta"><span>${escapeHtml(item.category || "市场")}</span><span>${escapeHtml(item.source || "")}</span><span>${escapeHtml(fmtTime(item.publishedAt))}</span></div>
+    </article>`).join("") : empty("暂无重要新闻。")}</div>
+  </section>
+  <section class="daily-subsection">
+    <div class="social-source-head"><h3>健康与缺口</h3><span class="tag ${missing.length ? "amber" : "green"}">${escapeHtml(missing.length ? "需补数据" : "正常")}</span></div>
+    ${missing.length ? `<ul class="compact-list">${missing.map((item) => `<li>${escapeHtml(item)}</li>`).join("")}</ul>` : `<p class="muted">未发现前台可见缺口。</p>`}
+  </section>`;
+}
+
+function renderStockDeepDive(ticker = "") {
+  if (!els.stockDeepDiveBox) return;
+  const symbol = normalizeTickerInput(ticker || stockDetailTickerFromHash() || els.stockReportInput?.value || "");
+  if (!symbol) {
+    els.stockDeepDiveBox.className = "deep-dive-box empty-state";
+    els.stockDeepDiveBox.textContent = "打开单股详情后显示因子瀑布、数据质量、产业链和决策历史。";
+    return;
+  }
+  if (stockDeepDiveLoading.has(symbol)) {
+    els.stockDeepDiveBox.className = "deep-dive-box empty-state";
+    els.stockDeepDiveBox.textContent = `${symbol} 证据包读取中...`;
+    return;
+  }
+  const dive = stockDeepDiveCache.get(symbol);
+  if (!dive) {
+    els.stockDeepDiveBox.className = "deep-dive-box empty-state";
+    els.stockDeepDiveBox.textContent = `${symbol} 证据包尚未加载。`;
+    return;
+  }
+  if (dive.error) {
+    els.stockDeepDiveBox.className = "deep-dive-box empty-state";
+    els.stockDeepDiveBox.textContent = `${symbol} 证据包读取失败：${dive.error}`;
+    return;
+  }
+  const factorRows = dive.factorWaterfall?.rows || [];
+  const dq = dive.dataQualityAudit || {};
+  const weakest = dq.weakestBlocks || [];
+  const chain = dive.valueChain || {};
+  const chainRows = [...(chain.peers || []), ...(chain.upstream || []), ...(chain.downstream || [])].slice(0, 10);
+  const newsRows = (dive.newsTimeline || []).slice(0, 6);
+  const decisions = (dive.decisionHistory || []).slice(0, 6);
+  const invalidations = dive.invalidations || [];
+  els.stockDeepDiveBox.className = "deep-dive-box";
+  els.stockDeepDiveBox.innerHTML = `<div class="deep-dive-hero">
+    <div>
+      <p class="section-label">${escapeHtml(symbol)} Evidence Pack</p>
+      <h3>${escapeHtml(tickerLabel(symbol, { ...dive.header?.quote, run: appState?.latest }))}</h3>
+      <p class="muted">策略版本 ${escapeHtml(dive.header?.strategyVersion || "-")} · Regime ${escapeHtml(dive.header?.regime || "-")}</p>
+    </div>
+    <div class="all-stock-agent-track">
+      ${allStockAgentMetric(dq.score, "DQ 分")}
+      ${allStockAgentMetric(factorRows.length, "因子")}
+      ${allStockAgentMetric(decisions.length, "历史决策")}
+      ${allStockAgentMetric(invalidations.length, "失效条件")}
+    </div>
+  </div>
+  <div class="deep-dive-grid">
+    <article class="daily-card wide">
+      <h4>因子瀑布</h4>
+      <div class="factor-waterfall-list">${factorRows.length ? factorRows.map((row) => `<div class="factor-waterfall-row">
+        <span>${escapeHtml(row.label || row.id)}</span>
+        <strong>${escapeHtml(fmtNumber(Number(row.contribution), 2))}</strong>
+        <small>分 ${escapeHtml(row.score ?? "-")} · 权重 ${escapeHtml(Number.isFinite(Number(row.weight)) ? fmtNumber(Number(row.weight) * 100, 1) : "-")}% · 来源 ${(row.source || []).map(sourceLabel).join(" / ")}</small>
+      </div>`).join("") : empty("暂无因子瀑布。")}</div>
+    </article>
+    <article class="daily-card">
+      <h4>数据质量</h4>
+      <p><strong>${escapeHtml(contextStatusLabel(dq.status))}</strong> · 缺失 ${escapeHtml(dq.missingBlocks ?? 0)} · 部分 ${escapeHtml(dq.partialBlocks ?? 0)}</p>
+      ${weakest.length ? `<ul class="compact-list">${weakest.map((row) => `<li>${escapeHtml(row.label || row.key)}：${escapeHtml(row.missingReason || "覆盖不足")}（质量 ${escapeHtml(row.qualityScore ?? "-")}）</li>`).join("")}</ul>` : `<p class="muted">暂无明显弱项。</p>`}
+    </article>
+    <article class="daily-card wide">
+      <h4>产业链与同业</h4>
+      <p class="muted">${escapeHtml(chain.industry || dive.business?.industry || "行业未知")} · ${escapeHtml(chain.segment || dive.business?.mainBusiness || "主业信息不足")}</p>
+      <div class="chain-chip-grid">${chainRows.length ? chainRows.map((row) => `<button class="chain-chip" type="button" data-open-stock-report="${escapeHtml(row.ticker)}">
+        <strong>${escapeHtml(tickerLabel(row.ticker, { ...row, run: appState?.latest }))}</strong>
+        <span>${escapeHtml(row.role || row.relation || "")}</span>
+        <small>${escapeHtml((row.sourceTags || []).length ? "已标来源" : "推断")} · 质量 ${escapeHtml(row.qualityScore ?? "-")}</small>
+      </button>`).join("") : empty("暂无产业链关系。")}</div>
+    </article>
+    <article class="daily-card wide">
+      <h4>新闻时间线</h4>
+      ${newsRows.length ? newsRows.map((item) => `<div class="timeline-row">
+        <span>${escapeHtml(fmtTime(item.publishedAt || item.createdAt))}</span>
+        <strong>${escapeHtml(displayTitle(item) || item.title || "未命名材料")}</strong>
+        <p>${escapeHtml(item.summaryZh || item.summary || item.article?.summaryZh || "")}</p>
+      </div>`).join("") : empty("暂无新闻时间线。")}
+    </article>
+    <article class="daily-card">
+      <h4>决策历史</h4>
+      ${decisions.length ? decisions.map((item) => `<p>${escapeHtml(fmtTime(item.generatedAt || item.decisionAt))} · ${escapeHtml(item.action || "")} · ${escapeHtml(item.outcome || "追踪中")}</p>`).join("") : empty("暂无冻结决策历史。")}
+    </article>
+    <article class="daily-card">
+      <h4>失效条件</h4>
+      ${invalidations.length ? `<ul class="compact-list">${invalidations.map((item) => `<li>${escapeHtml(item)}</li>`).join("")}</ul>` : empty("暂无失效条件。")}
+    </article>
+  </div>`;
+}
+
 function renderAllStockAgentBacktestBlock(backtest = null) {
   if (!backtest) return "";
   const summary = backtest.summary || {};
@@ -5769,6 +6017,94 @@ function renderPortfolio(run) {
       .join("")}
   </div>
   <div class="risk-notes">${(risk.notes || []).map((note) => `<p>${escapeHtml(note)}</p>`).join("")}</div>`;
+}
+
+function renderRecommendationReconciliation(payload = null) {
+  if (!els.recommendationReconciliationBox) return;
+  if (!payload) {
+    els.recommendationReconciliationBox.className = "reconciliation-box empty-state";
+    els.recommendationReconciliationBox.textContent = supplementalDataError || "暂无交易建议对账数据。";
+    return;
+  }
+  const summary = payload.summary || {};
+  const rows = payload.rows || [];
+  els.recommendationReconciliationBox.className = "reconciliation-box";
+  els.recommendationReconciliationBox.innerHTML = `<div class="all-stock-agent-track">
+    ${allStockAgentMetric(summary.trades, "交易")}
+    ${allStockAgentMetric(summary.aligned, "顺向")}
+    ${allStockAgentMetric(summary.contrarian, "反向")}
+    ${allStockAgentMetric(summary.uncovered, "无同日建议")}
+  </div>
+  <div class="reconciliation-list">${rows.length ? rows.slice(0, 20).map((row) => `<article class="daily-card">
+    <div class="daily-card-head">
+      <button class="link-button" type="button" data-open-stock-report="${escapeHtml(row.ticker)}">${escapeHtml(tickerLabel(row.ticker, { ...row, run: appState?.latest }))}</button>
+      <span class="tag ${row.classification === "aligned" ? "green" : row.classification === "contrarian" ? "red" : "amber"}">${escapeHtml(row.classification || "-")}</span>
+    </div>
+    <div class="feed-meta">
+      <span>交易 ${escapeHtml(tradeSideLabel(row.tradeSide))}</span>
+      <span>建议 ${escapeHtml(row.decisionAction || "-")}</span>
+      <span>${escapeHtml(row.processQuality || "-")}</span>
+    </div>
+    <p>${escapeHtml(row.thesisAlignment || "暂无 thesis 对齐结果。")}</p>
+  </article>`).join("") : empty("暂无可对账交易。")}</div>`;
+}
+
+function strategyVersionCard(version = {}, activeId = "") {
+  const records = version.validationRecords || [];
+  const latestRecord = records[0] || null;
+  const effectiveActive = version.id === activeId;
+  const displayStatus = effectiveActive ? "active" : version.status === "active" ? "legacy-active" : version.status || "-";
+  return `<article class="daily-card strategy-version-card">
+    <div class="daily-card-head">
+      <strong>${escapeHtml(version.id || "-")}</strong>
+      <span class="tag ${effectiveActive ? "green" : version.status === "candidate" ? "amber" : ""}">${escapeHtml(displayStatus)}</span>
+    </div>
+    <div class="feed-meta">
+      <span>${escapeHtml(version.source || version.sourceFile || "-")}</span>
+      <span>验证 ${escapeHtml(latestRecord?.status || version.validationStatus || "无")}</span>
+      <span>n=${escapeHtml(latestRecord?.n ?? 0)}</span>
+    </div>
+    <p>${escapeHtml(version.changeReason || version.evaluationSummary?.status || "暂无变更说明。")}</p>
+    ${latestRecord ? `<div class="mini-kv">
+      ${indicator("候选超额", metricWithN({ value: latestRecord.candidateExcessPct, n: latestRecord.n }, 2, "%"))}
+      ${indicator("Active 超额", metricWithN({ value: latestRecord.activeExcessPct, n: latestRecord.n }, 2, "%"))}
+      ${indicator("候选 MaxDD", metricWithN({ value: latestRecord.candidateMaxDrawdownPct, n: latestRecord.n }, 2, "%"))}
+      ${indicator("Active MaxDD", metricWithN({ value: latestRecord.activeMaxDrawdownPct, n: latestRecord.n }, 2, "%"))}
+    </div>` : `<p class="muted">暂无 walk-forward validation record，不能 promote。</p>`}
+    <div class="daily-card-actions">
+      ${version.status === "candidate" ? `<button class="btn compact" type="button" data-promote-strategy="${escapeHtml(version.id)}">Promote</button>` : ""}
+    </div>
+  </article>`;
+}
+
+function renderStrategyGovernance(payload = null, validation = null) {
+  if (!els.strategyGovernanceBox) return;
+  if (!payload) {
+    els.strategyGovernanceBox.className = "strategy-governance-box empty-state";
+    els.strategyGovernanceBox.textContent = supplementalDataError || "暂无策略版本数据。";
+    return;
+  }
+  const versions = payload.strategyVersions || [];
+  const active = payload.active || validation?.activeVersion || null;
+  const activeId = strategyVersionText(active);
+  const candidates = versions.filter((item) => item.status === "candidate");
+  els.strategyGovernanceBox.className = "strategy-governance-box";
+  els.strategyGovernanceBox.innerHTML = `<div class="all-stock-agent-track">
+    ${allStockAgentMetric(versions.length, "版本")}
+    ${allStockAgentMetric(candidates.length, "候选")}
+    ${allStockAgentMetric(validation?.validation?.eligibleFactorCount ?? 0, "可验证因子")}
+    ${allStockAgentMetric(payload.rollbackAvailable ? 1 : 0, "可回滚")}
+  </div>
+  <div class="all-stock-agent-note">
+    <strong>Active</strong>
+    <span>${escapeHtml(activeId || "-")}。候选权重必须先通过 walk-forward validation，再由人工 Promote。</span>
+  </div>
+  <div class="strategy-actions">
+    <button class="btn compact ghost" type="button" data-refresh-strategy-panel>刷新策略面板</button>
+    <button class="btn compact" type="button" data-rollback-strategy ${payload.rollbackAvailable ? "" : "disabled"}>Rollback</button>
+  </div>
+  <div class="strategy-version-list">${versions.length ? versions.map((item) => strategyVersionCard(item, activeId)).join("") : empty("暂无策略版本。")}</div>
+  <p class="muted">${escapeHtml(validation?.validation?.rule || "Promote 是人工动作；系统不会自动把学习权重写成 active。")}</p>`;
 }
 
 function tradeSideLabel(value) {
@@ -7773,6 +8109,82 @@ els.allStockAgentBox?.addEventListener("click", (event) => {
   const openButton = event.target.closest("[data-open-stock-report]");
   if (!openButton) return;
   openStockDetail(openButton.dataset.openStockReport, { fetch: false });
+});
+
+els.todayDeskBox?.addEventListener("click", async (event) => {
+  const openButton = event.target.closest("[data-open-stock-report]");
+  if (openButton) {
+    openStockDetail(openButton.dataset.openStockReport);
+    return;
+  }
+  const acceptButton = event.target.closest("[data-paper-accept]");
+  if (!acceptButton) return;
+  acceptButton.disabled = true;
+  try {
+    await api("/api/paper-portfolio/accept", {
+      method: "POST",
+      body: JSON.stringify({ decisionId: acceptButton.dataset.paperAccept }),
+    });
+    await loadState();
+  } catch (error) {
+    alert(`纸面接受失败：${error.message}`);
+  } finally {
+    acceptButton.disabled = false;
+  }
+});
+
+els.stockDeepDiveBox?.addEventListener("click", (event) => {
+  const openButton = event.target.closest("[data-open-stock-report]");
+  if (!openButton) return;
+  openStockDetail(openButton.dataset.openStockReport);
+});
+
+els.strategyGovernanceBox?.addEventListener("click", async (event) => {
+  const refreshButton = event.target.closest("[data-refresh-strategy-panel]");
+  if (refreshButton) {
+    refreshButton.disabled = true;
+    try {
+      await loadSupplementalData();
+      renderStrategyGovernance(strategyVersionsPayload, strategyValidationPayload);
+    } catch (error) {
+      alert(`策略面板刷新失败：${error.message}`);
+    } finally {
+      refreshButton.disabled = false;
+    }
+    return;
+  }
+  const promoteButton = event.target.closest("[data-promote-strategy]");
+  if (promoteButton) {
+    const id = promoteButton.dataset.promoteStrategy;
+    const confirmation = prompt(`输入 ${id} 确认提升该候选策略为 Active`);
+    if (confirmation !== id) return;
+    promoteButton.disabled = true;
+    try {
+      await api("/api/strategy-versions/promote", {
+        method: "POST",
+        body: JSON.stringify({ id }),
+      });
+      await loadState();
+    } catch (error) {
+      alert(`策略 Promote 失败：${error.message}`);
+    } finally {
+      promoteButton.disabled = false;
+    }
+    return;
+  }
+  const rollbackButton = event.target.closest("[data-rollback-strategy]");
+  if (!rollbackButton) return;
+  const confirmation = prompt("输入 ROLLBACK 确认恢复上一版 active strategy");
+  if (confirmation !== "ROLLBACK") return;
+  rollbackButton.disabled = true;
+  try {
+    await api("/api/strategy-versions/rollback", { method: "POST", body: JSON.stringify({}) });
+    await loadState();
+  } catch (error) {
+    alert(`策略 Rollback 失败：${error.message}`);
+  } finally {
+    rollbackButton.disabled = false;
+  }
 });
 
 els.moversWithReasonsBox?.addEventListener("click", (event) => {

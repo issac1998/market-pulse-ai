@@ -613,3 +613,118 @@ liveParity.panels.live.n=90
 - Current production `store.json` has no candidate strategy version after prior runs, so runtime promote/rollback cannot be exercised without mutating production state or running a new learning-producing agent run. The promote/rollback behavior is covered by deterministic regression fixtures instead.
 - Historical panel sample counts are currently 0 because the stored historical backtest corpus has no completed outcomes in the current environment. The payload keeps live and historical panels separate and exposes `n=0` rather than blending sources.
 - `ALL_STOCK_AGENT_APPLY_LEARNED_WEIGHTS=true` is now intentionally ignored for active writes; the factor-weight state records `env_ignored_candidate_workflow_required` if that env is present, because WP8 requires candidate-only learning until promote.
+
+## WP9 — Frontend Surfaces for the Daily Loop
+
+### What Changed
+
+- Added a Today Desk panel on the Action page that consumes `/api/recommendations/today`:
+  - freshness / regime / editorial summary
+  - ≤3 actionable calls
+  - collapsed research-tracking list with downgrade chips
+  - track-record strip with `excludedCount`
+  - visible health / missing-data section
+  - paper-accept button wired to `/api/paper-portfolio/accept`
+- Added a stock Deep Dive evidence panel on the Stocks page that consumes `/api/stocks/deep-dive`:
+  - factor waterfall with score, weight, contribution, source
+  - expandable-style data quality block with weakest/missing blocks
+  - value-chain / peers / upstream / downstream chips with source/quality labels
+  - news timeline, decision history, and invalidation list
+- Added a Reconciliation panel on the Portfolio page that consumes `/api/trade-recommendation-reconciliation`.
+- Added a Strategy Governance panel on the Ops page that consumes `/api/strategy-versions` and `/api/strategy-versions/validate`:
+  - active/candidate/legacy-active version list
+  - validation record metrics with `n`
+  - promote button requiring typed confirmation
+  - rollback button requiring typed `ROLLBACK`
+- Regenerated route inventory for the added frontend API calls.
+
+### Files / Functions
+
+- `public/index.html`: new Today Desk, Deep Dive, Reconciliation, and Strategy Governance containers.
+- `public/app.js`: supplemental API loading, Today Desk renderer, Deep Dive renderer, Reconciliation renderer, Strategy Governance renderer, paper accept and strategy promote/rollback handlers.
+- `public/styles.css`: responsive card/grid styles for the new panels.
+- `docs/CODEBASE_ROUTE_INVENTORY.md`: regenerated frontend API call inventory.
+
+### Verification Output
+
+```text
+$ node --check public/app.js
+$ node --check server.mjs
+$ node --check server/strategy_versions.mjs
+all passed with no output
+
+$ node scripts/core_regression_tests.mjs
+core_regression_tests: ok
+
+$ node scripts/generate_route_inventory.mjs && node scripts/generate_route_inventory.mjs --check
+{"status":"ok","routes":72,"uiFetches":42,"storeKeys":25}
+{"status":"ok","routes":72,"uiFetches":42,"storeKeys":25}
+
+Browser verification on http://localhost:5173:
+actions page:
+bodyPage=actions
+today desk rendered agentRunId=1783189346161-all-stock-agent
+visiblePanels=2
+consoleErrors=[]
+
+stock page:
+url=http://localhost:5173/#/stock/NVDA
+bodyPage=stocks
+deep dive rendered "NVDA Evidence Pack"
+factor count=10
+DQ score=71
+invalidations=4
+
+portfolio page:
+bodyPage=portfolio
+reconciliation summary trades=0 aligned=0 contrarian=0 uncovered=0
+
+ops page:
+bodyPage=ops
+strategy versions=2
+active=all-stock-e07073aab308
+legacy active row is labeled legacy-active after hard reload
+consoleErrors=[]
+```
+
+### Contradictions / Blockers
+
+- Current store has no strategy candidate and no user trades, so the UI shows empty candidate/reconciliation states. The panels render correctly and expose why no action is available.
+- The store contains two legacy `status:"active"` strategy rows. Backend effective active selection is singular; the WP9 UI labels the non-effective active row as `legacy-active` instead of mutating historical strategy records.
+
+## Final Summary — WP1 to WP9
+
+### Completed WPs
+
+- WP1: restored frozen sample flow, IV ATM accrual, and outcome quarantine.
+- WP2: added disabled-by-default intraday watcher, triage, push seam, explain endpoint, novelty, and consensus snapshots.
+- WP3: added historical corpus builder and Alpha158-style historical feature reconstruction.
+- WP4: added historical walk-forward backtest and report API.
+- WP5: added QuantStats / Alphalens bridge fallbacks.
+- WP6: added EDGAR PIT bridge and watcher seam.
+- WP7: added factor-quality pack, winsorization, correlation matrix, and accrual tables.
+- WP8: added candidate strategy-version governance, validation/promote/rollback, regime split, live parity, and disabled shadow debate scheduler.
+- WP9: added daily-loop frontend surfaces for Today, Deep Dive, Reconciliation, and Strategy Governance.
+
+### Open Contradictions
+
+- Historical corpus providers were unavailable in the current environment for live bulk corpus population; fixtures verify logic, but real historical sample counts remain limited until providers return.
+- Historical panel sample counts are currently 0 in the latest stored backtest state.
+- Current production store has no candidate strategy version, so runtime promote/rollback success cannot be demonstrated without producing a real candidate or mutating production state.
+- Current store has no user trades, so reconciliation shows the correct empty state.
+- EDGAR 13F bridge is filing-level-only; per-holding expansion remains a future data upgrade.
+- SUE / short-interest / analyst revision accrual tables are wired but have no live rows in the current store.
+- The store has legacy duplicate active strategy rows; UI marks the non-effective row as `legacy-active` without rewriting history.
+
+### Disabled-By-Default Flags
+
+- `INTRADAY_WATCHER_ENABLED=false`
+- push provider config (`PUSH_PROVIDER`, `PUSH_TARGET`, provider-specific tokens) remains unset/disabled.
+- `AGENT_DEBATE_DAILY_ENABLED=false`
+- EDGAR watcher seam is disabled unless `EDGAR_WATCHER_ENABLED=true` and a production collector is supplied.
+
+### Human-Only / Owner Actions
+
+- Strategy-version promote is human-only by design and requires a stored passed validation record.
+- Live trading remains locked behind existing `IBKR_TRADING_ENABLED` plus `data/ALLOW_LIVE_TRADING`; no broker order-submission path was added.
+- To exercise successful promote/rollback in production, first run a learning-producing agent/backtest to create a candidate, then attach/persist a passed walk-forward validation record.
