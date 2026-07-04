@@ -7,6 +7,8 @@ import { buildFactorSnapshotAsOf, normalizeHistoricalBars } from "../lib/histori
 import {
   classifyOutcomeQuality,
   applyCrossSectionalNormalization,
+  buildFactorCorrelationMatrix,
+  buildFactorStatsFromOutcomes,
   learnRecommendationFactorWeights,
   normalizeRecommendationFactorWeights,
   outcomeFromExcess,
@@ -504,52 +506,20 @@ function periodTable(outcomes = [], primaryHorizon = 20, size = 7) {
 }
 
 function factorStats(outcomes = []) {
-  const stats = {};
   const usable = outcomes.filter((row) => row.outcomeUsable !== false);
   const clippedReturns = winsorizeSeries(usable.map((row) => row.excessPct), { enabled: true, lowerPct: 1, upperPct: 99 });
-  for (const [outcomeIndex, outcome] of usable.entries()) {
-    const value = pct(clippedReturns.values[outcomeIndex]);
-    if (!Number.isFinite(value)) continue;
-    for (const [id, factor] of Object.entries(outcome.factorSnapshot?.factors || {})) {
-      const score = pct(factor.score);
-      if (!Number.isFinite(score)) continue;
-      const row = stats[id] || {
-        id,
-        label: factor.label || id,
-        samples: 0,
-        wins: 0,
-        losses: 0,
-        avgExcessPct: 0,
-        avgScore: 0,
-        scores: [],
-        returns: [],
-        schemaMix: {},
-      };
-      row.samples += 1;
-      row.wins += outcome.outcome === "win" ? 1 : 0;
-      row.losses += outcome.outcome === "loss" ? 1 : 0;
-      row.avgExcessPct = ((row.avgExcessPct * (row.samples - 1)) + value) / row.samples;
-      row.avgScore = ((row.avgScore * (row.samples - 1)) + score) / row.samples;
-      row.scores.push(score);
-      row.returns.push(value);
-      const scoreSchema = outcome.scoreSchema || outcome.factorSnapshot?.scoreSchema || outcome.factorSnapshot?.schemaVersion || "unknown";
-      row.schemaMix[scoreSchema] = (row.schemaMix[scoreSchema] || 0) + 1;
-      stats[id] = row;
-    }
-  }
+  const clippedOutcomes = usable.map((outcome, index) => ({ ...outcome, excessPct: clippedReturns.values[index] }));
+  const stats = buildFactorStatsFromOutcomes(clippedOutcomes, {
+    source: "historical-backtest",
+    deadbandPct: 0.5,
+  });
   for (const row of Object.values(stats)) {
-    row.rankIC = rankCorrelation(row.scores, row.returns);
-    row.ic = correlation(row.scores, row.returns);
-    row.hitRate = row.samples ? row.wins / row.samples : null;
-    row.source = "historical-backtest";
     row.winsorization = {
       enabled: clippedReturns.enabled,
       lower: clippedReturns.lower,
       upper: clippedReturns.upper,
       clipCount: clippedReturns.clipCount,
     };
-    delete row.scores;
-    delete row.returns;
   }
   return stats;
 }
@@ -644,15 +614,7 @@ function factorAnalysis(outcomes = []) {
   const stats = factorStats(outcomes);
   const rows = Object.values(stats);
   const usable = outcomes.filter((row) => row.outcomeUsable !== false);
-  const factorIds = rows.map((row) => row.id);
-  const valuesByFactor = Object.fromEntries(
-    factorIds.map((id) => [id, usable.map((outcome) => pct(outcome.factorSnapshot?.factors?.[id]?.score))]),
-  );
-  const correlationMatrix = rows.map((left) => ({
-    factorId: left.id,
-    correlations: Object.fromEntries(rows.map((right) => [right.id, left.id === right.id ? 1 : rankCorrelation(valuesByFactor[left.id] || [], valuesByFactor[right.id] || [])])),
-    n: left.samples,
-  }));
+  const correlationMatrix = buildFactorCorrelationMatrix(usable.map((outcome) => outcome.factorSnapshot).filter(Boolean), { minN: 3 });
   return {
     schemaVersion: "historical-factor-analysis-v1",
     factorStats: stats,
@@ -962,7 +924,7 @@ async function persistHistoricalBacktestRun(sqlitePath, run = {}, report = {}, t
   return { persisted: true, runId: run.id };
 }
 
-function compactHistoricalRun(run = {}, options = {}) {
+export function compactHistoricalRun(run = {}, options = {}) {
   const limit = Math.max(0, Number(options.detailLimit ?? 20));
   const decisionCount = run.decisions?.length || 0;
   const outcomeCount = run.outcomes?.length || 0;

@@ -5139,6 +5139,17 @@ function renderAllStockAgentTrackRecord(latest = {}) {
   const winRate = Number(paperSummary.winRate);
   const openPositions = paper.openPositions || [];
   const closedTrades = paper.closedTrades || [];
+  const factorRows = Object.values(latest.factorStats || {})
+    .filter((row) => Number(row.n || row.samples) > 0)
+    .sort((a, b) => Math.abs(Number(b.rankIC) || 0) - Math.abs(Number(a.rankIC) || 0) || Number(b.n || b.samples) - Number(a.n || a.samples))
+    .slice(0, 6);
+  const subSignalRows = factorRows
+    .flatMap((factor) => Object.values(factor.subSignals || {}).map((sub) => ({ ...sub, factorLabel: factor.label || factor.id })))
+    .filter((row) => Number(row.n || row.samples) > 0)
+    .sort((a, b) => Math.abs(Number(b.rankIC) || 0) - Math.abs(Number(a.rankIC) || 0) || Number(b.n || b.samples) - Number(a.n || a.samples))
+    .slice(0, 6);
+  const correlation = latest.factorCorrelationMatrix || {};
+  const highPairs = (correlation.highCorrelationPairs || []).slice(0, 6);
   return `<section class="all-stock-agent-section">
     <div class="social-source-head">
       <div>
@@ -5191,6 +5202,33 @@ function renderAllStockAgentTrackRecord(latest = {}) {
             <button class="link-button" type="button" data-open-stock-report="${escapeHtml(item.ticker)}">${escapeHtml(tickerLabel(item.ticker, { ...item, run: latest }))}</button>
             <span>${escapeHtml(fmtPct(Number(item.returnPct)))} · ${escapeHtml(item.reason || "")}</span>
           </div>`).join("") : `<p class="muted">暂无已平仓纸面交易。</p>`}
+        </div>
+      </article>
+      <article class="all-stock-agent-paper-card">
+        <h4>因子 IC</h4>
+        <div class="all-stock-agent-mini-list">
+          ${factorRows.length ? factorRows.map((item) => `<div>
+            <strong>${escapeHtml(item.label || item.id)}</strong>
+            <span>RankIC ${escapeHtml(fmtNumber(Number(item.rankIC), 2))} · n=${escapeHtml(item.n || item.samples || 0)}</span>
+          </div>`).join("") : `<p class="muted">暂无因子追责样本。</p>`}
+        </div>
+      </article>
+      <article class="all-stock-agent-paper-card">
+        <h4>子信号 IC</h4>
+        <div class="all-stock-agent-mini-list">
+          ${subSignalRows.length ? subSignalRows.map((item) => `<div>
+            <strong>${escapeHtml(item.factorLabel)} / ${escapeHtml(item.label || item.id)}</strong>
+            <span>RankIC ${escapeHtml(fmtNumber(Number(item.rankIC), 2))} · n=${escapeHtml(item.n || item.samples || 0)}</span>
+          </div>`).join("") : `<p class="muted">暂无子信号追责样本。</p>`}
+        </div>
+      </article>
+      <article class="all-stock-agent-paper-card">
+        <h4>高相关因子</h4>
+        <div class="all-stock-agent-mini-list">
+          ${highPairs.length ? highPairs.map((item) => `<div>
+            <strong>${escapeHtml(item.left)} / ${escapeHtml(item.right)}</strong>
+            <span>ρ ${escapeHtml(fmtNumber(Number(item.rho), 2))} · n=${escapeHtml(item.n || 0)}</span>
+          </div>`).join("") : `<p class="muted">暂无 |ρ| > 0.6 的因子对。矩阵样本 n=${escapeHtml(correlation.n || 0)}。</p>`}
         </div>
       </article>
     </div>

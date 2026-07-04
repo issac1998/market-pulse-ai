@@ -28,9 +28,12 @@ import {
   DEFAULT_RECOMMENDER_FACTOR_WEIGHTS,
   applyCrossSectionalNormalization,
   buildBenchmarkBasket as buildBenchmarkBasketCore,
+  buildFactorCorrelationMatrix,
+  buildFactorStatsFromOutcomes,
   classifyOutcomeQuality as classifyRecommendationOutcomeQuality,
   estimateThesisHit,
   learnRecommendationFactorWeights,
+  newsRecencyDecayWeight,
   normalizeBenchmarkBasket as normalizeBenchmarkBasketCore,
   normalizeFactorValue as normalizeRecommenderFactorValue,
   normalizeRecommendationFactorWeights,
@@ -52,6 +55,7 @@ import {
 } from "./server/all_stock/debate_gate.mjs";
 import { intradayWatcherConfigFromEnv, runIntradayWatcherOnce } from "./server/intraday_watcher.mjs";
 import {
+  compactHistoricalRun,
   historicalBacktestDetailsFromSqlite,
   historicalBacktestReport,
   runHistoricalWalkForwardFromSqlite,
@@ -1132,6 +1136,8 @@ const RECOMMENDER_PRIMARY_HORIZON_DAYS = Math.max(1, Number(process.env.RECOMMEN
 const ALL_STOCK_AGENT_ACTIONABLE_BUY_LIMIT = Math.max(1, Number(process.env.ALL_STOCK_AGENT_ACTIONABLE_BUY_LIMIT || 3));
 const ALL_STOCK_AGENT_MIN_ACTIONABLE_DQ = Math.max(0, Math.min(100, Number(process.env.ALL_STOCK_AGENT_MIN_ACTIONABLE_DQ || 60)));
 const ALL_STOCK_AGENT_PREFETCH_ENABLED = parseBoolean(process.env.ALL_STOCK_AGENT_PREFETCH_ENABLED, true);
+const SUBSIGNAL_IC_WEIGHTING_REQUESTED = parseBoolean(process.env.SUBSIGNAL_IC_WEIGHTING_ENABLED, false);
+const SUBSIGNAL_IC_WEIGHTING_ENABLED = false;
 const ALL_STOCK_AGENT_TECHNICAL_PREFETCH_LIMIT = Math.max(
   0,
   Number(process.env.ALL_STOCK_AGENT_TECHNICAL_PREFETCH_LIMIT ?? 0),
@@ -3439,7 +3445,9 @@ function compactStoreForSave(db = {}) {
     alerts: Array.isArray(db.alerts) ? db.alerts.slice(0, 200) : [],
     signalHistory: Array.isArray(db.signalHistory) ? db.signalHistory.slice(0, 1000) : [],
     consensusSnapshots: Array.isArray(db.consensusSnapshots) ? db.consensusSnapshots.slice(0, 2000) : [],
-    historicalBacktests: Array.isArray(db.historicalBacktests) ? db.historicalBacktests.slice(0, 50) : [],
+    historicalBacktests: Array.isArray(db.historicalBacktests)
+      ? db.historicalBacktests.slice(0, 50).map((run) => compactHistoricalRun(run, { detailLimit: 20 }))
+      : [],
     intradayWatcher: db.intradayWatcher && typeof db.intradayWatcher === "object" ? db.intradayWatcher : {},
     pushDeliveryState: db.pushDeliveryState && typeof db.pushDeliveryState === "object" ? db.pushDeliveryState : {},
     intradayExplain: db.intradayExplain && typeof db.intradayExplain === "object" ? db.intradayExplain : {},
@@ -3697,7 +3705,9 @@ async function ensureStore() {
       ibkrSyncLog: Array.isArray(db.ibkrSyncLog) ? db.ibkrSyncLog : [],
       akshareGlobalNewsLog: Array.isArray(db.akshareGlobalNewsLog) ? db.akshareGlobalNewsLog : [],
       consensusSnapshots: Array.isArray(db.consensusSnapshots) ? db.consensusSnapshots : [],
-      historicalBacktests: Array.isArray(db.historicalBacktests) ? db.historicalBacktests : [],
+      historicalBacktests: Array.isArray(db.historicalBacktests)
+        ? db.historicalBacktests.slice(0, 50).map((run) => compactHistoricalRun(run, { detailLimit: 20 }))
+        : [],
       intradayWatcher: db.intradayWatcher && typeof db.intradayWatcher === "object" ? db.intradayWatcher : {},
       pushDeliveryState: db.pushDeliveryState && typeof db.pushDeliveryState === "object" ? db.pushDeliveryState : {},
       intradayExplain: db.intradayExplain && typeof db.intradayExplain === "object" ? db.intradayExplain : {},
@@ -20580,6 +20590,7 @@ function allStockAgentTickerContext(run = {}, ticker = "", state = {}) {
   const expectationGap = buildReverseDcfExpectationGap({ quote, fundamental, researchPack });
   return {
     ticker: symbol,
+    asOf: run.completedAt || run.generatedAt || nowIso(),
     row,
     quote,
     technical,
@@ -20693,12 +20704,15 @@ function materialNewsText(item = {}) {
 
 function buildNewsStorylines(ctx = {}) {
   const groups = new Map();
+  const asOf = ctx.asOf || new Date();
   for (const item of (ctx.materials || []).slice(0, 24)) {
     const text = materialNewsText(item);
     if (!text) continue;
     const category = classifyAllStockAgentNewsStory(text);
     const direction = newsStoryDirection(text, item);
-    const materiality = newsStoryMateriality(text, item);
+    const publishedAt = item.publishedAt || item.datetime || item.time || item.date || item.article?.publishedAt || "";
+    const recencyWeight = newsRecencyDecayWeight(publishedAt, asOf, 36);
+    const materiality = newsStoryMateriality(text, item) * recencyWeight;
     const key = `${category}:${direction}`;
     const row = groups.get(key) || {
       category,
@@ -20706,12 +20720,14 @@ function buildNewsStorylines(ctx = {}) {
       direction,
       count: 0,
       materiality: 0,
+      recencyWeightSum: 0,
       bodyEvidenceCount: 0,
       sources: new Set(),
       evidence: [],
     };
     row.count += 1;
     row.materiality = Math.max(row.materiality, materiality);
+    row.recencyWeightSum += recencyWeight;
     if (normalizeDisplayText(item.article?.text || item.article?.summary || item.summary || item.summaryZh).length > 120) {
       row.bodyEvidenceCount += 1;
     }
@@ -20729,6 +20745,7 @@ function buildNewsStorylines(ctx = {}) {
       return {
         ...row,
         sources: [...row.sources].slice(0, 4),
+        avgRecencyWeight: row.count ? row.recencyWeightSum / row.count : null,
         evidence,
         summary,
       };
@@ -20759,16 +20776,128 @@ function factorQuality(raw = {}, source = []) {
   return clampScore(Math.round((present / values.length) * 82 + Math.min(18, (source || []).length * 6)));
 }
 
+function subSignal(id = "", label = "", raw = null, score = null) {
+  const rawPresent = factorMetricPresent(raw);
+  const heuristicScore = rawPresent && Number.isFinite(score) ? clampScore(score) : null;
+  return {
+    id,
+    label,
+    raw: rawPresent ? raw : null,
+    heuristicScore,
+    score: Number.isFinite(heuristicScore) ? heuristicScore : 50,
+    quality: Number.isFinite(heuristicScore) ? 100 : 0,
+  };
+}
+
+function scoreRsiBand(value) {
+  const rsi = numberOrNull(value);
+  if (!Number.isFinite(rsi)) return null;
+  if (rsi > 78) return 42;
+  if (rsi >= 45 && rsi <= 72) return 68;
+  if (rsi < 32) return 38;
+  return 55;
+}
+
+function trendLabelScore(value = "") {
+  const trend = normalizeDisplayText(value);
+  if (!trend) return null;
+  if (/uptrend|上升|强/i.test(trend)) return 72;
+  if (/downtrend|下降|弱/i.test(trend)) return 32;
+  return 50;
+}
+
+function biasLabelScore(value = "", positivePattern = /buy|accumulat|增持|买入|净买/i, negativePattern = /sell|distribut|减持|卖出|净卖/i) {
+  const text = normalizeDisplayText(value);
+  if (!text) return null;
+  if (positivePattern.test(text)) return 65;
+  if (negativePattern.test(text)) return 35;
+  return 50;
+}
+
+function buildFactorSubSignals(id = "", raw = {}) {
+  if (id === "momentum") {
+    return [
+      subSignal("smaDistance", "均线距离", firstFiniteNumber(raw.priceVsSma10Pct, raw.priceVsSma20Pct), Number.isFinite(firstFiniteNumber(raw.priceVsSma10Pct, raw.priceVsSma20Pct)) ? 50 + firstFiniteNumber(raw.priceVsSma10Pct, raw.priceVsSma20Pct) * 2 : null),
+      subSignal("return5d", "5日收益", raw.return5d, Number.isFinite(numberOrNull(raw.return5d)) ? 50 + numberOrNull(raw.return5d) * 2 : null),
+      subSignal("rsiBand", "RSI 区间", raw.rsi14, scoreRsiBand(raw.rsi14)),
+      subSignal("trendLabel", "趋势标签", raw.trend, trendLabelScore(raw.trend)),
+    ];
+  }
+  if (id === "qualityGrowth") {
+    return [
+      subSignal("revenueGrowth", "收入增长", raw.revenueGrowth, Number.isFinite(numberOrNull(raw.revenueGrowth)) ? 50 + numberOrNull(raw.revenueGrowth) * 0.55 : null),
+      subSignal("netMargin", "净利率", raw.netMargin, Number.isFinite(numberOrNull(raw.netMargin)) ? 50 + numberOrNull(raw.netMargin) * 0.45 : null),
+      subSignal("roe", "ROE", raw.roe, Number.isFinite(numberOrNull(raw.roe)) ? 50 + numberOrNull(raw.roe) * 0.25 : null),
+      subSignal("leverage", "杠杆", raw.debtToEquity, Number.isFinite(numberOrNull(raw.debtToEquity)) ? (numberOrNull(raw.debtToEquity) > 2 ? 42 : 58) : null),
+      subSignal("accrualsRatio", "应计占比", raw.accrualsRatio, Number.isFinite(numberOrNull(raw.accrualsRatio)) ? 50 - numberOrNull(raw.accrualsRatio) * 80 : null),
+      subSignal("cashConversion", "现金转化", raw.cashConversion, Number.isFinite(numberOrNull(raw.cashConversion)) ? 50 + numberOrNull(raw.cashConversion) * 20 : null),
+    ];
+  }
+  if (id === "valuationExpectation") {
+    return [
+      subSignal("targetUpside", "目标价上行", raw.targetUpsidePct, Number.isFinite(numberOrNull(raw.targetUpsidePct)) ? 50 + numberOrNull(raw.targetUpsidePct) * 0.65 : null),
+      subSignal("reverseDcfGap", "反向DCF缺口", raw.gapPct, Number.isFinite(numberOrNull(raw.gapPct)) ? 50 + numberOrNull(raw.gapPct) * 0.8 : null),
+      subSignal("peLevel", "PE 水位", raw.pe, Number.isFinite(numberOrNull(raw.pe)) ? 72 - Math.min(38, Math.max(0, numberOrNull(raw.pe) - 15) * 0.6) : null),
+    ];
+  }
+  if (id === "earningsRevision") {
+    const buyRatio = numberOrNull(raw.buyRatio);
+    const sellRatio = numberOrNull(raw.sellRatio);
+    return [
+      subSignal("ratingLevel", "评级分布", Number.isFinite(buyRatio) || Number.isFinite(sellRatio) ? `${buyRatio ?? "-"}:${sellRatio ?? "-"}` : null, 50 + (Number.isFinite(buyRatio) ? buyRatio * 22 : 0) - (Number.isFinite(sellRatio) ? sellRatio * 26 : 0)),
+    ];
+  }
+  if (id === "newsCatalyst") {
+    return [
+      subSignal("positiveMateriality", "正向材料性", raw.positiveMateriality, Number.isFinite(numberOrNull(raw.positiveMateriality)) ? 50 + numberOrNull(raw.positiveMateriality) / 18 : null),
+      subSignal("negativeMateriality", "负向材料性", raw.negativeMateriality, Number.isFinite(numberOrNull(raw.negativeMateriality)) ? 50 - numberOrNull(raw.negativeMateriality) / 16 : null),
+      subSignal("bodyEvidence", "正文证据", raw.bodyEvidence, Number.isFinite(numberOrNull(raw.bodyEvidence)) ? 50 + Math.min(15, numberOrNull(raw.bodyEvidence) * 4) : null),
+    ];
+  }
+  if (id === "optionsFlow") {
+    return [
+      subSignal("unusualCount", "期权异动", raw.unusualCount, Number.isFinite(numberOrNull(raw.unusualCount)) ? 50 + Math.min(12, numberOrNull(raw.unusualCount) * 3) : null),
+      subSignal("ivRankLevel", "IV 水位", raw.ivRank, Number.isFinite(numberOrNull(raw.ivRank)) ? 58 - Math.max(0, numberOrNull(raw.ivRank) - 55) * 0.35 : null),
+      subSignal("flowRatio", "资金流/成交额", raw.flowRatio, Number.isFinite(numberOrNull(raw.flowRatio)) ? 50 + Math.max(-8, Math.min(8, numberOrNull(raw.flowRatio) * 160)) : null),
+    ];
+  }
+  if (id === "smartMoney") {
+    return [
+      subSignal("insiderBias", "内部人方向", raw.insiderBias, biasLabelScore(raw.insiderBias, /net-buy|buy|买/i, /net-sell|sell|卖/i)),
+      subSignal("holderBias", "机构方向", raw.holderBias, biasLabelScore(raw.holderBias, /accumulat|增/i, /distribut|减/i)),
+      subSignal("shortRiskLevel", "空头风险", raw.shortRisk, biasLabelScore(raw.shortRisk, /low|低/i, /high|高/i)),
+    ];
+  }
+  if (id === "socialAttention") {
+    return [
+      subSignal("mentions", "提及量", raw.mentions, Number.isFinite(numberOrNull(raw.mentions)) ? 50 + Math.min(12, Math.log10(Math.max(numberOrNull(raw.mentions), 1)) * 5) : null),
+      subSignal("mentionDelta", "提及增量", raw.mentionDelta, Number.isFinite(numberOrNull(raw.mentionDelta)) ? 50 + Math.max(-6, Math.min(10, numberOrNull(raw.mentionDelta) / 20)) : null),
+    ];
+  }
+  if (id === "industryChain") {
+    return [
+      subSignal("relativeChange", "同业相对强弱", raw.relativeChange, Number.isFinite(numberOrNull(raw.relativeChange)) ? 50 + numberOrNull(raw.relativeChange) * 1.2 : null),
+      subSignal("downstreamChange", "下游变化", raw.downstreamAvgChange, Number.isFinite(numberOrNull(raw.downstreamAvgChange)) ? 50 + numberOrNull(raw.downstreamAvgChange) : null),
+    ];
+  }
+  return [];
+}
+
 function factorRow(id, label, raw = {}, score = 50, source = [], missingReason = "") {
   const normalizedScore = Number.isFinite(score) ? clampScore(score) : 50;
   const sources = [...new Set((source || []).map(normalizeDisplayText).filter(Boolean))];
-  const quality = factorQuality(raw, sources);
+  const subSignals = buildFactorSubSignals(id, raw);
+  const presentSubSignals = subSignals.filter((item) => Number.isFinite(item.heuristicScore));
+  const quality = subSignals.length
+    ? clampScore(Math.round((presentSubSignals.length / subSignals.length) * 82 + Math.min(18, sources.length * 6)))
+    : factorQuality(raw, sources);
   return {
     id,
     label,
     raw,
     score: normalizedScore,
     quality,
+    subSignals,
     source: sources,
     missingReason: quality ? "" : missingReason || "缺少该因子所需字段。",
   };
@@ -20866,6 +20995,8 @@ function scoreQualityGrowthFactor(ctx = {}) {
   const netMargin = firstFiniteNumber(f.netProfitMarginTTM, f.netMargin, f.profitMargin, f.financialLatest?.netMargin);
   const roe = firstFiniteNumber(f.roeTTM, f.roe, f.financialLatest?.roe);
   const debtToEquity = firstFiniteNumber(f.debtToEquity, f.financialLatest?.debtToEquity);
+  const accrualsRatio = firstFiniteNumber(f.accrualsRatio, f.financialLatest?.accrualsRatio);
+  const cashConversion = firstFiniteNumber(f.cashConversion, f.freeCashFlowConversion, f.financialLatest?.cashConversion);
   const business = normalizeDisplayText(f.mainBusiness || known?.mainBusiness || "");
   const businessBonus = isSpecificBusinessText(business) ? 6 : 0;
   const score = clampScore(
@@ -20879,7 +21010,7 @@ function scoreQualityGrowthFactor(ctx = {}) {
   return factorRow(
     "qualityGrowth",
     "基本面质量/成长",
-    { revenueGrowth, netMargin, roe, debtToEquity, business: business.slice(0, 120) },
+    { revenueGrowth, netMargin, roe, debtToEquity, accrualsRatio, cashConversion, business: business.slice(0, 120) },
     score,
     [f.provider, "fundamental snapshot"].filter(Boolean),
     "缺少收入增速、利润率、ROE 或主业画像。",
@@ -21059,6 +21190,7 @@ function scoreSmartMoneyFactor(ctx = {}) {
     "smartMoney",
     "内部人/机构/空头",
     {
+      insiderBias,
       insiderBuyCount: numberOrNull(insider.buyCount),
       insiderSellCount: numberOrNull(insider.sellCount),
       shortRisk,
@@ -23026,6 +23158,7 @@ async function runAllStockAgentForRun(db, sourceRun, trigger = "manual", options
     buildFactorSnapshotForRun(source, universe.map((item) => item.ticker))
       .map((snapshot) => [safeTicker(snapshot.ticker), snapshot]),
   );
+  const factorCorrelationMatrix = buildFactorCorrelationMatrix([...factorSnapshotMap.values()], { minN: 3 });
   const evaluations = universe
     .map((item) => buildAllStockAgentEvaluation(source, item, state, skill, {
       factorWeights: activeFactorWeights,
@@ -23170,6 +23303,11 @@ async function runAllStockAgentForRun(db, sourceRun, trigger = "manual", options
         exposureSoftStartPct: skill.settings?.exposureSoftStartPct,
         maxPortfolioExposurePct: skill.settings?.maxPortfolioExposurePct,
       },
+      subSignalComposites: {
+        icWeightedEnabled: SUBSIGNAL_IC_WEIGHTING_ENABLED,
+        requestedByEnv: SUBSIGNAL_IC_WEIGHTING_REQUESTED,
+        mode: "equal-weight-composite; IC weighting disabled until WP16 strategy-version promotion",
+      },
     },
     universeCoverage: {
       labels: [...new Set(universe.flatMap((item) => item.labels || []))],
@@ -23187,6 +23325,7 @@ async function runAllStockAgentForRun(db, sourceRun, trigger = "manual", options
     outcomeSnapshots: stateWithOutcomes.outcomeSnapshots.slice(0, 120),
     ruleStats,
     factorStats,
+    factorCorrelationMatrix,
     factorStatsSource,
     factorStatsBacktest: factorStatsBacktest
       ? {
@@ -24066,50 +24205,10 @@ function backtestTurnover(daily = []) {
 }
 
 function allStockAgentBacktestFactorStats(outcomes = []) {
-  const stats = {};
-  for (const outcome of outcomes || []) {
-    if (!allStockAgentOutcomeIsUsable(outcome)) continue;
-    const value = firstFiniteNumber(outcome.excessPct, outcome.performancePct);
-    if (!Number.isFinite(value)) continue;
-    const factors = outcome.factorSnapshot?.factors || {};
-    for (const [id, factor] of Object.entries(factors)) {
-      const score = numberOrNull(factor.score);
-      if (!Number.isFinite(score)) continue;
-      const row = stats[id] || {
-        id,
-        label: factor.label || id,
-        samples: 0,
-        wins: 0,
-        losses: 0,
-        totalExcessPct: 0,
-        avgExcessPct: 0,
-        avgScore: 0,
-        hitRate: 0,
-        scores: [],
-        returns: [],
-        schemaMix: {},
-      };
-      row.samples += 1;
-      row.wins += outcome.outcome === "win" || value > ALL_STOCK_AGENT_OUTCOME_DEADBAND_PCT ? 1 : 0;
-      row.losses += outcome.outcome === "loss" || value < -ALL_STOCK_AGENT_OUTCOME_DEADBAND_PCT ? 1 : 0;
-      row.totalExcessPct += value;
-      row.avgExcessPct = row.totalExcessPct / row.samples;
-      row.avgScore = ((row.avgScore * (row.samples - 1)) + score) / row.samples;
-      row.hitRate = row.wins / row.samples;
-      row.scores.push(score);
-      row.returns.push(value);
-      const scoreSchema = outcome.scoreSchema || outcome.factorSnapshot?.scoreSchema || outcome.factorSnapshot?.schemaVersion || "unknown";
-      row.schemaMix[scoreSchema] = (row.schemaMix[scoreSchema] || 0) + 1;
-      stats[id] = row;
-    }
-  }
-  for (const row of Object.values(stats)) {
-    row.rankIC = rankCorrelation(row.scores, row.returns);
-    row.ic = numericCorrelation(row.scores, row.returns);
-    delete row.scores;
-    delete row.returns;
-  }
-  return stats;
+  return buildFactorStatsFromOutcomes((outcomes || []).filter(allStockAgentOutcomeIsUsable), {
+    source: "live-outcomes",
+    deadbandPct: ALL_STOCK_AGENT_OUTCOME_DEADBAND_PCT,
+  });
 }
 
 function allStockAgentBacktestRegimeSplit(outcomes = []) {
@@ -37858,7 +37957,8 @@ async function handleApi(req, res, url) {
         },
       });
       const db = await ensureStore();
-      db.historicalBacktests = [result.run, ...(db.historicalBacktests || []).filter((item) => item.id !== result.run.id)].slice(0, 50);
+      const historicalRunForStore = compactHistoricalRun(result.run, { detailLimit: 20 });
+      db.historicalBacktests = [historicalRunForStore, ...(db.historicalBacktests || []).filter((item) => item.id !== result.run.id)].slice(0, 50);
       const agentState = normalizeAllStockAgentState(db.allStockAgent);
       const skillBundle = loadAllStockAgentSkill();
       const skillVersion = allStockAgentStrategyVersion(skillBundle, skillBundle.skill, {

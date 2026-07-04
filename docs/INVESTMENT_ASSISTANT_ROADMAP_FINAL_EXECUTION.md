@@ -942,3 +942,68 @@ Notes:
 Contradictions:
 
 - None for WP11.
+
+---
+
+## WP12 — Sub-Signal Decomposition + Correlation Matrix — 2026-07-05
+
+Implemented Round 2 WP12.
+
+Changes:
+
+- Added shared recommender helpers in `lib/recommender_core.mjs`: sub-signal-aware cross-sectional normalization, `buildFactorStatsFromOutcomes()`, `buildFactorCorrelationMatrix()`, shared `rankCorrelation()`, and `newsRecencyDecayWeight()`.
+- Factor snapshots now carry `factors[id].subSignals[]` for live factors. Macro regime remains atomic. All-null sub-signal groups set factor quality to 0 and remain neutral through quality shrinkage.
+- Historical factor snapshots now expose reconstructable sub-signals for momentum, PIT quality, and PIT valuation; non-reconstructable factors remain explicit neutral/missing rather than fabricated.
+- Live and historical factorStats now use the shared helper and include per-factor horizons plus per-sub-signal stats, all with `n`/`samples`.
+- Historical factor analysis now uses the shared Spearman correlation matrix object with per-cell `rho` and `n`.
+- Live all-stock-agent runs now persist `factorCorrelationMatrix`; the track-record UI renders factor IC, sub-signal IC, and high-correlation factor pairs with sample counts.
+- News storyline materiality is decayed by `2^(-ageHours/36)` using published timestamps; missing timestamps use weight `0.5`.
+- `SUBSIGNAL_IC_WEIGHTING_ENABLED` is intentionally hard-disabled in WP12. The run payload records env requests but keeps equal-weight composites until WP16 strategy-version promotion.
+- Store hardening added while validating WP12: historical backtest runs are compacted on read, write, and route storage via `compactHistoricalRun()`. Local ignored `data/store.json` was compacted from 536MB to 80MB because Node could not read the oversized JSON string.
+
+Verification:
+
+```text
+$ node --check lib/recommender_core.mjs && node --check lib/historical_features.mjs && node --check server/historical_backtest.mjs && node --check server.mjs && node --check public/app.js && node --check scripts/core_regression_tests.mjs
+pass
+
+$ node scripts/core_regression_tests.mjs
+core_regression_tests: ok
+
+$ node scripts/generate_route_inventory.mjs && node scripts/generate_route_inventory.mjs --check
+{"status":"ok","routes":75,"uiFetches":43,"storeKeys":25}
+{"status":"ok","routes":75,"uiFetches":43,"storeKeys":25}
+
+$ ALL_STOCK_AGENT_PREFETCH_ENABLED=false BRIDGE_PYTHON=.venv-bridges/bin/python NODE_OPTIONS=--max-old-space-size=4096 node server.mjs
+Market Pulse AI running at http://localhost:5173
+
+$ curl -sS --max-time 180 -X POST http://localhost:5173/api/all-stock-agent/run -H 'content-type: application/json' --data '{"trigger":"wp12-smoke-light"}' ...
+{
+  "runId": "1783204909405-all-stock-agent",
+  "evaluations": 80,
+  "subSignals": 2160,
+  "subRank": 428,
+  "subRankPct": 0.19814814814814816,
+  "factorStats": 10,
+  "subSignalFactors": 9,
+  "horizonFactors": 10,
+  "matrixRows": 10,
+  "highPairs": 0,
+  "icWeighted": {
+    "icWeightedEnabled": false,
+    "requestedByEnv": false,
+    "mode": "equal-weight-composite; IC weighting disabled until WP16 strategy-version promotion"
+  }
+}
+```
+
+Regression fixtures added:
+
+- Sub-signals normalize through cross-sectional rank and factor composite uses sub-signal mean.
+- All-null sub-signal composites set factor quality to 0 and score to neutral 50.
+- News recency decay halves after 36 hours and missing timestamps receive the documented 0.5 weight.
+- Historical factorStats now assert horizon cells and sub-signal stats exist when reconstructable.
+
+Contradictions:
+
+- None for WP12. Some live sub-signals are missing and therefore use missing/fallback normalization; this is expected because the live run lacks every raw field for every ticker.

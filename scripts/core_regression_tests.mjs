@@ -18,6 +18,7 @@ import {
   buildBenchmarkBasket,
   classifyOutcomeQuality,
   applyCrossSectionalNormalization,
+  newsRecencyDecayWeight,
   learnRecommendationFactorWeights,
   normalizeRecommendationFactorWeights,
   normalizeFactorValue,
@@ -228,6 +229,53 @@ assert.deepEqual(
   normalizedSyntheticAgain.map((row) => row.factors.momentum.score),
   "Same cross-section through the shared live/historical normalizer should produce identical scores",
 );
+const subSignalUniverse = Array.from({ length: 40 }, (_, index) => ({
+  ticker: `S${index}`,
+  factors: {
+    newsCatalyst: {
+      label: "News",
+      score: 50,
+      quality: 80,
+      subSignals: [
+        { id: "positiveMateriality", label: "Positive", heuristicScore: index, score: index, quality: 100 },
+        { id: "negativeMateriality", label: "Negative", heuristicScore: 40 - index, score: 40 - index, quality: 100 },
+      ],
+    },
+  },
+}));
+const normalizedSubSignals = applyCrossSectionalNormalization(subSignalUniverse).snapshots;
+assert.equal(
+  normalizedSubSignals[0].factors.newsCatalyst.normalization.method,
+  "subsignal-composite",
+  "Factors with sub-signals should use sub-signal composite scores",
+);
+assert.equal(
+  normalizedSubSignals[0].factors.newsCatalyst.subSignals[0].normalization.method,
+  "cross-sectional-rank",
+  "Sub-signals should be normalized through the cross-sectional rank path",
+);
+const allNullSubSignals = applyCrossSectionalNormalization(Array.from({ length: 40 }, (_, index) => ({
+  ticker: `N${index}`,
+  factors: {
+    optionsFlow: {
+      label: "Options",
+      score: 50,
+      quality: 70,
+      subSignals: [
+        { id: "flowRatio", label: "Flow", heuristicScore: null, score: 50, quality: 0 },
+      ],
+    },
+  },
+}))).snapshots;
+assert.equal(allNullSubSignals[0].factors.optionsFlow.quality, 0, "All-null sub-signal composites should set factor quality to 0");
+assert.equal(allNullSubSignals[0].factors.optionsFlow.score, 50, "All-null sub-signal composites should stay neutral");
+assertApprox(
+  newsRecencyDecayWeight("2026-01-01T00:00:00Z", "2026-01-02T12:00:00Z", 36),
+  0.5,
+  1e-12,
+  "News recency decay should halve materiality after 36 hours",
+);
+assert.equal(newsRecencyDecayWeight("", "2026-01-01T00:00:00Z", 36), 0.5, "Missing news timestamps should receive the documented 0.5 weight");
 
 const recommendationScore = scoreRecommendationFromFactorSnapshot(
   {
@@ -628,8 +676,16 @@ assert.equal(
   "Historical learned weights should remain candidate-only",
 );
 assert.ok(
-  historicalWalkForward.run.factorAnalysis.correlationMatrix.length > 0,
+  historicalWalkForward.run.factorAnalysis.correlationMatrix.rows.length > 0,
   "Historical factor analysis should include a cross-factor correlation matrix",
+);
+assert.ok(
+  Object.values(historicalWalkForward.run.factorAnalysis.factorStats).some((row) => Object.keys(row.horizons || {}).length > 0),
+  "Historical factor stats should include per-horizon cells with n",
+);
+assert.ok(
+  Object.values(historicalWalkForward.run.factorAnalysis.factorStats).some((row) => Object.keys(row.subSignals || {}).length > 0),
+  "Historical factor stats should include per-sub-signal stats when reconstructable",
 );
 assert.ok(
   Object.values(historicalWalkForward.run.factorAnalysis.factorStats).every((row) => row.winsorization?.enabled === true),
