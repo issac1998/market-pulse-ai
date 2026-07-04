@@ -27,6 +27,11 @@ import {
   stockHistoryPricePath,
 } from "../lib/recommender_core.mjs";
 import { storyFingerprint, triageIntradaySignal } from "../lib/alert_triage.mjs";
+import {
+  alpha158Subset,
+  buildFactorSnapshotAsOf,
+  normalizeHistoricalBars,
+} from "../lib/historical_features.mjs";
 import { runIntradayWatcherOnce } from "../server/intraday_watcher.mjs";
 import { proxyFetchResponse } from "../server/network_fetch.mjs";
 
@@ -319,6 +324,75 @@ assert.equal(
   storyFingerprint({ ticker: "NVDA", headline: "NVDA files 8-K and raises guidance after data-center demand update", catalystClass: "guidance" }),
   intradayTriage.storyFingerprint,
   "Story fingerprint should be stable for the same ticker/headline/catalyst",
+);
+
+const historicalBars = Array.from({ length: 70 }, (_, index) => {
+  const date = new Date(Date.UTC(2026, 0, 1 + index)).toISOString().slice(0, 10);
+  return {
+    ticker: "MU",
+    date,
+    open: 100 + index,
+    high: 102 + index,
+    low: 99 + index,
+    close: 101 + index * 1.1,
+    volume: 1_000_000 + index * 10_000,
+    source: "fixture",
+  };
+});
+const alpha = alpha158Subset(historicalBars);
+assert.equal(alpha.sampleCount, 70, "Alpha158 subset should keep the full OHLCV fixture sample");
+for (const key of ["KMID", "KLEN", "KUP", "KLOW", "KSFT", "ROC5", "ROC20", "ROC60", "MA20", "STD20", "RSV20", "RANK20", "IMAX20", "IMIN20", "CORR20", "CNTP20", "CNTN20", "WVMA20"]) {
+  assert.equal(Number.isFinite(alpha.features[key]), true, `Alpha158 subset should compute ${key}`);
+}
+const normalizedHistoricalBars = normalizeHistoricalBars(historicalBars);
+assert.deepEqual(
+  alpha158Subset(normalizedHistoricalBars).features,
+  alpha.features,
+  "Alpha158 subset must be formula-identical for normalized/live-shaped and raw historical inputs",
+);
+const poisonedFuture = [
+  ...historicalBars,
+  {
+    ticker: "MU",
+    date: "2026-12-31",
+    open: 9999,
+    high: 9999,
+    low: 9999,
+    close: 9999,
+    volume: 9999,
+    source: "future-poison",
+  },
+];
+const historicalSnapshot = buildFactorSnapshotAsOf({
+  ticker: "MU",
+  asOf: historicalBars.at(-1).date,
+  bars: poisonedFuture,
+  historicalRegime: { date: historicalBars.at(-1).date, bucket: "宏观中性", risk_score: 50 },
+});
+assert.equal(historicalSnapshot.factorSnapshot.ignoredFutureRows, 1, "Historical snapshot must reject post-asOf rows");
+assert.notEqual(
+  historicalSnapshot.factorSnapshot.rawInputs.latestBar.close,
+  9999,
+  "Future poison close must not enter the as-of raw inputs",
+);
+assert.equal(
+  historicalSnapshot.factorSnapshot.factors.qualityGrowth.score,
+  50,
+  "Non-reconstructable historical factors must remain neutral 50",
+);
+assert.equal(
+  historicalSnapshot.factorSnapshot.factors.qualityGrowth.missingReason,
+  "not-reconstructable",
+  "Non-reconstructable historical factors should carry an explicit missing reason",
+);
+assert.equal(
+  historicalSnapshot.recommendationScore.schemaVersion,
+  "recommendation-score-v1",
+  "Historical factor snapshots must score through recommender_core",
+);
+assert.ok(
+  historicalSnapshot.recommendationScore.contributions.some((item) => item.id === "momentum"),
+  "Historical recommendation score should include standard recommender factor contributions",
 );
 
 const disabledWatcher = await runIntradayWatcherOnce({ db: { watchlist: ["NVDA"] } }, { config: { enabled: false } });

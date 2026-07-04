@@ -44,7 +44,7 @@ Scope here: W1 watcher + W3 triage + W4 push + W5 move→reason + W6 novelty + W
 - Anticipation calendar: static FOMC/CPI/OPEX lists + earnings calendar; watcher tightens interval around events for affected names. **Include the consensus snapshot**: the day before each watchlist earnings date, snapshot consensus EPS/revenue from the research pack into a new `consensus_snapshots` store key + mirror table (starts SUE accrual for WP7).
 - **Verify**: simulated ±5% move and a fake filing alert → push < 2 min end-to-end, audit_events timestamps prove no LLM on the critical path; triage unit tests green; watcher fully disabled when `INTRADAY_WATCHER_ENABLED=false` (default **false** until owner enables).
 
-## ☐ WP3 — Tier-1 historical corpus (spec: §4.4 Tier 1 + D4/D5)
+## ☑ WP3 — Tier-1 historical corpus (spec: §4.4 Tier 1 + D4/D5)
 
 - `scripts/build_historical_bars.py`: bulk daily OHLCV via the **existing AkShare bridge** (D5; ~1500 bars/ticker), gap-fill Finnhub/Alpha Vantage, into `historical_bars(ticker, date, open, high, low, close, volume, source)` with a corpus-metadata row (universe def, build date, survivorship caveat). Universe: current S&P 500 + Nasdaq 100 + all tickers in `stock_history`/decisions. Resumable, rate-limit-aware.
 - `historical_regimes(date, bucket, risk_score)` from FRED history through the existing `scoreFredMacroRegime` logic.

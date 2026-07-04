@@ -648,37 +648,42 @@ def fetch_hist(ak: Any, args: argparse.Namespace) -> dict[str, Any]:
     end = args.end or today_yyyymmdd()
     fn_name, fn = resolve_function(ak, ["stock_us_hist"])
     errors = []
+    direct_error = getattr(args, "direct_error", "")
+    if direct_error:
+        errors.append({"symbol": symbol, "fallback": "manual-eastmoney-before-akshare-import", "error": direct_error})
     first_empty: tuple[str, Any] | None = None
     fallback_used = ""
+    skip_manual = str(os.environ.get("AKSHARE_SKIP_MANUAL_HIST", "")).strip().lower() in {"1", "true", "yes", "on"}
     for candidate in us_hist_symbol_candidates(symbol):
-        try:
-            df = manual_eastmoney_hist_frame(candidate, period, start, end)
-            fallback_used = "manual-eastmoney"
-            rows = to_records(df, limit, tail=True)
-            return success_payload(
-                "hist",
-                rows,
-                {
-                    "akshareVersion": get_ak_version(ak),
-                    "function": fn_name,
-                    "fallbackUsed": fallback_used,
-                    "symbol": symbol,
-                    "resolvedSymbol": candidate,
-                    "period": period,
-                    "start": start,
-                    "end": end,
-                    "triedSymbols": us_hist_symbol_candidates(symbol),
-                    "errors": errors,
-                },
-            )
-        except Exception as fallback_exc:
-            errors.append(
-                {
-                    "symbol": candidate,
-                    "fallback": "manual-eastmoney",
-                    "error": f"{type(fallback_exc).__name__}: {fallback_exc}",
-                }
-            )
+        if not skip_manual:
+            try:
+                df = manual_eastmoney_hist_frame(candidate, period, start, end)
+                fallback_used = "manual-eastmoney"
+                rows = to_records(df, limit, tail=True)
+                return success_payload(
+                    "hist",
+                    rows,
+                    {
+                        "akshareVersion": get_ak_version(ak),
+                        "function": fn_name,
+                        "fallbackUsed": fallback_used,
+                        "symbol": symbol,
+                        "resolvedSymbol": candidate,
+                        "period": period,
+                        "start": start,
+                        "end": end,
+                        "triedSymbols": us_hist_symbol_candidates(symbol),
+                        "errors": errors,
+                    },
+                )
+            except Exception as fallback_exc:
+                errors.append(
+                    {
+                        "symbol": candidate,
+                        "fallback": "manual-eastmoney",
+                        "error": f"{type(fallback_exc).__name__}: {fallback_exc}",
+                    }
+                )
         try:
             result = call_ak_function(
                 fn,
@@ -959,7 +964,11 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         raise ValueError(f"unsupported command: {command}")
 
     if command == "hist":
-        return fetch_hist_direct(args)
+        try:
+            return fetch_hist_direct(args)
+        except Exception as direct_exc:
+            setattr(args, "direct_error", f"{type(direct_exc).__name__}: {direct_exc}")
+            os.environ["AKSHARE_SKIP_MANUAL_HIST"] = "1"
 
     ak, import_error = import_akshare()
     if command == "probe":
