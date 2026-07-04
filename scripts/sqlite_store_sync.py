@@ -298,6 +298,26 @@ def init_schema(conn: sqlite3.Connection) -> None:
           json TEXT NOT NULL
         );
 
+        CREATE TABLE IF NOT EXISTS factor_registry (
+          factor_id TEXT PRIMARY KEY,
+          family TEXT,
+          state TEXT,
+          prior TEXT,
+          implementation TEXT,
+          created_by TEXT,
+          updated_at TEXT,
+          json TEXT NOT NULL
+        );
+
+        CREATE TABLE IF NOT EXISTS factor_trial_ledger (
+          id TEXT PRIMARY KEY,
+          factor_id TEXT,
+          accepted INTEGER DEFAULT 0,
+          reason TEXT,
+          created_at TEXT,
+          json TEXT NOT NULL
+        );
+
         CREATE TABLE IF NOT EXISTS strategy_versions (
           id TEXT PRIMARY KEY,
           strategy_type TEXT,
@@ -450,6 +470,8 @@ def init_schema(conn: sqlite3.Connection) -> None:
         CREATE INDEX IF NOT EXISTS idx_recommendation_decisions_ticker_time ON recommendation_decisions(ticker, generated_at DESC);
         CREATE INDEX IF NOT EXISTS idx_recommendation_outcomes_decision ON recommendation_outcomes(decision_id, horizon_days);
         CREATE INDEX IF NOT EXISTS idx_factor_stats_factor ON factor_stats(factor_id, samples DESC);
+        CREATE INDEX IF NOT EXISTS idx_factor_registry_state ON factor_registry(state, family);
+        CREATE INDEX IF NOT EXISTS idx_factor_trial_factor ON factor_trial_ledger(factor_id, created_at DESC);
         CREATE INDEX IF NOT EXISTS idx_news_items_ticker_time ON news_items(ticker, published_at DESC);
         CREATE INDEX IF NOT EXISTS idx_news_items_run ON news_items(run_id);
         CREATE INDEX IF NOT EXISTS idx_dq_audits_decision ON data_quality_audits(decision_id);
@@ -483,6 +505,8 @@ def sync_store(conn: sqlite3.Connection, store: dict[str, Any]) -> dict[str, int
         "recommendationDecisions": 0,
         "recommendationOutcomes": 0,
         "factorStats": 0,
+        "factorRegistry": 0,
+        "factorTrialLedger": 0,
         "strategyVersions": 0,
         "newsItems": 0,
         "dataQualityAudits": 0,
@@ -1036,6 +1060,71 @@ def sync_store(conn: sqlite3.Connection, store: dict[str, Any]) -> dict[str, int
                         )
                         counts["factorStats"] += 1
 
+            registry = store.get("factorRegistry") or {}
+            if isinstance(registry, dict):
+                for factor in registry.get("factors") or []:
+                    if not isinstance(factor, dict):
+                        continue
+                    factor_id = text(factor.get("factorId"))
+                    if not factor_id:
+                        continue
+                    state_history = factor.get("stateHistory") if isinstance(factor.get("stateHistory"), list) else []
+                    updated_at = text((state_history[0] or {}).get("at")) if state_history else text(factor.get("createdAt"))
+                    conn.execute(
+                        """
+                        INSERT INTO factor_registry(factor_id, family, state, prior, implementation, created_by, updated_at, json)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                        ON CONFLICT(factor_id) DO UPDATE SET
+                          family=excluded.family,
+                          state=excluded.state,
+                          prior=excluded.prior,
+                          implementation=excluded.implementation,
+                          created_by=excluded.created_by,
+                          updated_at=excluded.updated_at,
+                          json=excluded.json
+                        """,
+                        (
+                            factor_id,
+                            text(factor.get("family")),
+                            text(factor.get("state")),
+                            text(factor.get("prior")),
+                            text(factor.get("implementation") or "dsl"),
+                            text(factor.get("createdBy")),
+                            updated_at,
+                            dump(factor),
+                        ),
+                    )
+                    counts["factorRegistry"] += 1
+                ledger = registry.get("trialLedger") or {}
+                if isinstance(ledger, dict):
+                    for entry in ledger.get("entries") or []:
+                        if not isinstance(entry, dict):
+                            continue
+                        entry_id = text(entry.get("id") or f"{entry.get('factorId','')}:{entry.get('at','')}")
+                        if not entry_id:
+                            continue
+                        conn.execute(
+                            """
+                            INSERT INTO factor_trial_ledger(id, factor_id, accepted, reason, created_at, json)
+                            VALUES (?, ?, ?, ?, ?, ?)
+                            ON CONFLICT(id) DO UPDATE SET
+                              factor_id=excluded.factor_id,
+                              accepted=excluded.accepted,
+                              reason=excluded.reason,
+                              created_at=excluded.created_at,
+                              json=excluded.json
+                            """,
+                            (
+                                entry_id,
+                                text(entry.get("factorId")),
+                                1 if entry.get("accepted") else 0,
+                                text(entry.get("reason")),
+                                text(entry.get("at")),
+                                dump(entry),
+                            ),
+                        )
+                        counts["factorTrialLedger"] += 1
+
             portfolio = agent.get("userPaperPortfolio") or {}
             if isinstance(portfolio, dict):
                 for row in portfolio.get("acceptances") or []:
@@ -1238,6 +1327,8 @@ def status(conn: sqlite3.Connection) -> dict[str, Any]:
         "recommendation_decisions",
         "recommendation_outcomes",
         "factor_stats",
+        "factor_registry",
+        "factor_trial_ledger",
         "strategy_versions",
         "news_items",
         "data_quality_audits",

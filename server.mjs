@@ -55,6 +55,12 @@ import {
 } from "./server/all_stock/debate_gate.mjs";
 import { intradayWatcherConfigFromEnv, runIntradayWatcherOnce } from "./server/intraday_watcher.mjs";
 import {
+  addFactorCandidate,
+  advanceFactorState,
+  buildFactorPerformanceReport,
+  normalizeFactorRegistry,
+} from "./server/factor_registry.mjs";
+import {
   compactHistoricalRun,
   historicalBacktestDetailsFromSqlite,
   historicalBacktestReport,
@@ -3454,6 +3460,7 @@ function compactStoreForSave(db = {}) {
     auditEvents: normalizeAuditEvents(db.auditEvents),
     ibkrPortalFeed: normalizeIbkrPortalFeed(db.ibkrPortalFeed),
     allStockAgent: normalizeAllStockAgentState(db.allStockAgent),
+    factorRegistry: normalizeFactorRegistry(db.factorRegistry),
   };
 }
 
@@ -3720,6 +3727,7 @@ async function ensureStore() {
       optionsCache: Object.keys(optionsCache).length ? optionsCache : buildOptionsCacheFromRuns(runs),
       ibkrPortalFeed,
       allStockAgent: normalizeAllStockAgentState(db.allStockAgent),
+      factorRegistry: normalizeFactorRegistry(db.factorRegistry),
     };
     storeCache = cloneStoreValue(normalized);
     storeCacheMtimeMs = fileStat.mtimeMs;
@@ -3761,6 +3769,7 @@ async function ensureStore() {
       optionsCache: {},
       ibkrPortalFeed: { updatedAt: "", entries: [] },
       allStockAgent: normalizeAllStockAgentState(),
+      factorRegistry: normalizeFactorRegistry(),
     };
     await saveStore(db);
     return cloneStoreValue(db);
@@ -37805,6 +37814,61 @@ async function handleApi(req, res, url) {
       config: configForClient(db),
       serverTime: nowIso(),
     });
+  }
+
+  if (req.method === "GET" && url.pathname === "/api/factors/registry") {
+    const db = await ensureStore();
+    const registry = normalizeFactorRegistry(db.factorRegistry);
+    return sendJson(res, { registry });
+  }
+
+  if (req.method === "GET" && url.pathname === "/api/factors/performance-report") {
+    const db = await ensureStore();
+    const state = normalizeAllStockAgentState(db.allStockAgent);
+    const registry = normalizeFactorRegistry(db.factorRegistry);
+    const report = buildFactorPerformanceReport(registry, { latestRun: state.runs[0] || null });
+    db.factorRegistry = { ...registry, performanceReport: report };
+    await saveStore(db);
+    return sendJson(res, { report });
+  }
+
+  if (req.method === "POST" && url.pathname === "/api/factors/candidates") {
+    const body = await readBody(req);
+    if (body.__readError) return sendJson(res, { error: body.__readError }, 400);
+    const db = await ensureStore();
+    const result = addFactorCandidate(db.factorRegistry, body, { actor: "human", createdBy: body.createdBy || "human" });
+    db.factorRegistry = result.registry;
+    appendAuditEvent(db, "factor_registry.candidate", {
+      factorId: result.factor.factorId,
+      state: result.factor.state,
+      accepted: result.gate.ok,
+      reason: result.gate.reason,
+    }, result.gate.ok ? "ok" : "warn");
+    await saveStore(db);
+    return sendJson(res, { factor: result.factor, gate: result.gate, registry: result.registry }, result.gate.ok ? 200 : 202);
+  }
+
+  if (req.method === "POST" && url.pathname.startsWith("/api/factors/candidates/") && url.pathname.endsWith("/advance")) {
+    const factorId = decodeURIComponent(url.pathname.replace("/api/factors/candidates/", "").replace(/\/advance$/, ""));
+    const body = await readBody(req);
+    if (body.__readError) return sendJson(res, { error: body.__readError }, 400);
+    try {
+      const db = await ensureStore();
+      const result = advanceFactorState(db.factorRegistry, factorId, body.state || body.nextState, {
+        actor: "human",
+        reason: body.reason || "human override",
+      });
+      db.factorRegistry = result.registry;
+      appendAuditEvent(db, "factor_registry.advance", {
+        factorId,
+        state: result.factor.state,
+        reason: body.reason || "human override",
+      });
+      await saveStore(db);
+      return sendJson(res, { factor: result.factor, registry: result.registry });
+    } catch (error) {
+      return sendJson(res, { error: errorZh(error.message) }, 400);
+    }
   }
 
   if (req.method === "POST" && url.pathname === "/api/agent-debate/ingest") {

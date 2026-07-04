@@ -39,6 +39,8 @@ import {
 import { runIntradayWatcherOnce } from "../server/intraday_watcher.mjs";
 import { historicalMaxDrawdownFromReturns, runHistoricalWalkForwardFromRows } from "../server/historical_backtest.mjs";
 import { proxyFetchResponse } from "../server/network_fetch.mjs";
+import { evaluateFactorSpec, parseFactorSpec } from "../lib/factor_spec.mjs";
+import { addFactorCandidate, normalizeFactorRegistry } from "../server/factor_registry.mjs";
 import {
   activeStrategyVersion,
   activeStrategyWeights,
@@ -276,6 +278,43 @@ assertApprox(
   "News recency decay should halve materiality after 36 hours",
 );
 assert.equal(newsRecencyDecayWeight("", "2026-01-01T00:00:00Z", 36), 0.5, "Missing news timestamps should receive the documented 0.5 weight");
+
+assert.throws(
+  () => parseFactorSpec({ factorId: "bad", pipeline: [{ op: "evil_op", input: "bars.close" }] }),
+  /Valid ops/,
+  "Factor spec parser should reject unknown operators with the valid whitelist",
+);
+const pitFilteredFactor = evaluateFactorSpec(
+  {
+    factorId: "closeDelta",
+    pipeline: [
+      { op: "ref", input: "bars.close" },
+      { op: "delta", window: 5 },
+    ],
+  },
+  {
+    bars: [
+      ...Array.from({ length: 8 }, (_, index) => ({ date: `2026-01-${String(index + 1).padStart(2, "0")}`, close: 100 + index })),
+      { date: "2026-02-01", close: 9999, source: "future-poison" },
+    ],
+  },
+  { asOf: "2026-01-08" },
+);
+assert.equal(pitFilteredFactor.status, "ok", "Factor DSL evaluator should produce values before asOf");
+assert.notEqual(pitFilteredFactor.latest.value, 9999 - 107, "Factor DSL evaluator must filter future rows before evaluation");
+const registryWithSeeds = normalizeFactorRegistry({});
+const duplicateCandidate = addFactorCandidate(registryWithSeeds, {
+  factorId: "revisionMomentumClone",
+  spec: {
+    factorId: "revisionMomentumClone",
+    pipeline: [
+      { op: "ref", input: "revisions.upgrades" },
+      { op: "delta", window: 21 },
+    ],
+  },
+});
+assert.equal(duplicateCandidate.factor.state, "rejected", "Originality gate should reject duplicate op-sequence factor candidates");
+assert.equal(duplicateCandidate.registry.trialLedger.count, registryWithSeeds.trialLedger.count + 1, "Rejected factor candidates should still be recorded in trial ledger");
 
 const recommendationScore = scoreRecommendationFromFactorSnapshot(
   {

@@ -1007,3 +1007,65 @@ Regression fixtures added:
 Contradictions:
 
 - None for WP12. Some live sub-signals are missing and therefore use missing/fallback normalization; this is expected because the live run lacks every raw field for every ticker.
+
+---
+
+## WP13 — Factor Spec DSL + Registry — 2026-07-05
+
+Implemented Round 2 WP13.
+
+Changes:
+
+- Added pure `lib/factor_spec.mjs` with `parseFactorSpec()` and `evaluateFactorSpec()`. The operator whitelist is closed to the WP13 list, windows are restricted to `{5,10,21,63,126,252}`, pipelines are capped at 8 steps, and windowed ops are capped at 3.
+- The evaluator filters all dataset rows to `<= asOf` before any operation, preserving PIT/no-lookahead discipline.
+- Added `server/factor_registry.mjs` with default B1/B2 seeds, registry normalization, originality gates, candidate ingestion, human state advancement, and performance-report assembly.
+- Added store key `factorRegistry` (`factor-registry-v1`) and four routes:
+  - `GET /api/factors/registry`
+  - `GET /api/factors/performance-report`
+  - `POST /api/factors/candidates`
+  - `POST /api/factors/candidates/:id/advance`
+- Originality gate rejects op-sequence similarity `>=0.8`; rejected submissions are still recorded in the trial ledger.
+- Added SQLite mirror tables `factor_registry` and `factor_trial_ledger` in `scripts/sqlite_store_sync.py`.
+- Seeded B1/B2 factors as candidates where DSL can represent them: `revisionMomentum`, `sueScore`, `shortInterestDelta`, `daysToCover`, `ivRank252`, `putCallRatio`. `ivRvSpread` is registered as `implementation:"native"` with explicit `insufficient-data` evidence because DSL v1 cannot honestly combine IV and realized volatility without a native multi-input evaluator.
+
+Verification:
+
+```text
+$ node --check lib/factor_spec.mjs && node --check server/factor_registry.mjs && node --check server.mjs && node --check scripts/core_regression_tests.mjs && node --check public/app.js
+pass
+
+$ node scripts/core_regression_tests.mjs
+core_regression_tests: ok
+
+$ python3 -m py_compile scripts/sqlite_store_sync.py
+pass
+
+$ node scripts/generate_route_inventory.mjs && node scripts/generate_route_inventory.mjs --check
+{"status":"ok","routes":79,"uiFetches":43,"storeKeys":26}
+{"status":"ok","routes":79,"uiFetches":43,"storeKeys":26}
+
+$ curl -sS http://localhost:5173/api/factors/registry
+{"schema":"factor-registry-v1","factors":7,"states":{"candidate":7}}
+
+$ curl -sS http://localhost:5173/api/factors/performance-report
+{"schema":"factor-performance-report-v1","total":7,"trialCount":0,"source":"latest-all-stock-agent-run"}
+
+$ curl -sS -X POST http://localhost:5173/api/factors/candidates ... duplicate revisionMomentum shape
+{"factor":"wp13Duplicate","state":"rejected","gateOk":false,"reason":"op-sequence similarity 1.00 vs revisionMomentum","trialCount":1}
+
+$ curl -sS -X POST http://localhost:5173/api/factors/candidates/revisionMomentum/advance ...
+{"factor":"revisionMomentum","state":"shadow","history":2}
+
+$ python3 scripts/sqlite_store_sync.py --store-json data/store.json --db data/market_pulse.sqlite
+synced factorRegistry=8, factorTrialLedger=1
+```
+
+Regression fixtures added:
+
+- Unknown DSL op is rejected and lists the valid whitelist.
+- Poisoned future bar rows are filtered before evaluation.
+- Duplicate factor candidate is rejected but still recorded in the trial ledger.
+
+Contradictions:
+
+- `ivRvSpread` cannot be expressed honestly by DSL v1 without extending the whitelist or adding a native multi-input evaluator, so it is registered as `implementation:"native"` with `insufficient-data` evidence.
