@@ -77,6 +77,7 @@ import {
   buildPromotionValidationRecord,
   buildRegimeSplitEvaluationPayload,
   candidateStrategyVersionFromLearning,
+  candidateStrategyVersionFromSubSignalComposites,
   normalizeStrategyVersions as normalizeStrategyVersionRows,
   promoteStrategyVersion,
   rollbackStrategyVersions,
@@ -20395,6 +20396,20 @@ function upsertStrategyVersion(rows = [], version = null) {
   return upsertStrategyVersionCore(rows, version);
 }
 
+function subSignalCompositeOptionsFromStrategyVersion(version = null) {
+  const settings = version?.json?.settings || version?.settings || {};
+  if (settings.subSignalCompositeMode !== "ic-weighted") {
+    return {
+      subSignalCompositeMode: "equal-weight",
+      subSignalCompositePlan: null,
+    };
+  }
+  return {
+    subSignalCompositeMode: "ic-weighted",
+    subSignalCompositePlan: settings.subSignalCompositePlan || version.subSignalCompositePlan || null,
+  };
+}
+
 function regimeTagFromRiskScore(riskScore, label = "") {
   const score = numberOrNull(riskScore);
   const bucket = Number.isFinite(score)
@@ -21324,13 +21339,14 @@ function buildFactorSnapshot(run = {}, ticker = "", ctx = null, registry = null)
   };
 }
 
-function buildFactorSnapshotForRun(run = {}, tickers = [], registry = null) {
+function buildFactorSnapshotForRun(run = {}, tickers = [], registry = null, options = {}) {
   const symbols = [...new Set((tickers || []).map(safeTicker).filter(Boolean))];
   const snapshots = symbols.map((ticker) => buildFactorSnapshot(run, ticker, null, registry)).filter(Boolean);
   return applyCrossSectionalNormalization(snapshots, {
     minCrossSection: 30,
     lowerPct: 1,
     upperPct: 99,
+    ...subSignalCompositeOptionsFromStrategyVersion(options.strategyVersion),
   }).snapshots;
 }
 
@@ -23203,8 +23219,16 @@ async function runAllStockAgentForRun(db, sourceRun, trigger = "manual", options
     weights: activeFactorWeights,
   });
   strategyVersion = activeStrategyVersion(state.strategyVersions) || skillStrategyVersion;
+  const activeSubSignalCompositeOptions = subSignalCompositeOptionsFromStrategyVersion(strategyVersion);
+  const subSignalCompositeCandidate = candidateStrategyVersionFromSubSignalComposites(factorStats, {
+    source: factorStatsSource,
+    sourceRunId: agentRunId,
+    baseVersion: strategyVersion,
+    previousWeights: currentFactorWeights,
+    fallbackWeights: RECOMMENDER_FACTOR_WEIGHTS,
+  });
   const factorSnapshotMap = new Map(
-    buildFactorSnapshotForRun(source, universe.map((item) => item.ticker), db.factorRegistry)
+    buildFactorSnapshotForRun(source, universe.map((item) => item.ticker), db.factorRegistry, { strategyVersion })
       .map((snapshot) => [safeTicker(snapshot.ticker), snapshot]),
   );
   const factorCorrelationMatrix = buildFactorCorrelationMatrix([...factorSnapshotMap.values()], { minN: 3 });
@@ -23353,9 +23377,12 @@ async function runAllStockAgentForRun(db, sourceRun, trigger = "manual", options
         maxPortfolioExposurePct: skill.settings?.maxPortfolioExposurePct,
       },
       subSignalComposites: {
-        icWeightedEnabled: SUBSIGNAL_IC_WEIGHTING_ENABLED,
+        icWeightedEnabled: activeSubSignalCompositeOptions.subSignalCompositeMode === "ic-weighted",
         requestedByEnv: SUBSIGNAL_IC_WEIGHTING_REQUESTED,
-        mode: "equal-weight-composite; IC weighting disabled until WP16 strategy-version promotion",
+        mode: activeSubSignalCompositeOptions.subSignalCompositeMode === "ic-weighted"
+          ? "ic-weighted-active-strategy-version"
+          : "equal-weight-composite; IC weighting requires strategy-version promotion",
+        candidateStrategyVersionId: subSignalCompositeCandidate?.id || "",
       },
     },
     universeCoverage: {
@@ -23424,6 +23451,9 @@ async function runAllStockAgentForRun(db, sourceRun, trigger = "manual", options
     : upsertStrategyVersion(state.strategyVersions || [], skillStrategyVersion);
   if (factorWeightCandidate) {
     nextStrategyVersions = upsertStrategyVersion(nextStrategyVersions, factorWeightCandidate);
+  }
+  if (subSignalCompositeCandidate) {
+    nextStrategyVersions = upsertStrategyVersion(nextStrategyVersions, subSignalCompositeCandidate);
   }
   const nextState = normalizeAllStockAgentState({
     ...stateWithOutcomes,
@@ -24450,7 +24480,7 @@ function runAllStockAgentBacktest(db = {}, options = {}) {
     const regimeTag = allStockAgentRegimeTagFromRun(run);
     const universe = allStockAgentTickerPool(run, db, state, skill, null);
     const factorSnapshotMap = new Map(
-      buildFactorSnapshotForRun(run, universe.map((item) => item.ticker))
+      buildFactorSnapshotForRun(run, universe.map((item) => item.ticker), null, { strategyVersion })
         .map((snapshot) => [safeTicker(snapshot.ticker), snapshot]),
     );
     const evaluations = universe

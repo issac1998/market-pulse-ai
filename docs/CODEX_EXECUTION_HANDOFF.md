@@ -174,7 +174,7 @@ All five live in `server/historical_backtest.mjs` metrics/report assembly (engin
 - **UI**: factor lifecycle board (candidate/shadow/active/decayed/retired columns; per-card IC sparkline + `n` + gate evidence expandable) on the ops/track-record page.
 - **Verify**: end-to-end cycle with the mock invoker (`harness/invoker/mock.py`) lands a valid registry candidate without human edit; a forced demotion produces a post-mortem lesson in memory; no LLM write path to scores/weights/states (review will grep).
 
-## ☐ WP16 — Overlap-aware stats everywhere, IC-weighted composites live, B4/B5 (plan §5 D1, §3 B4/B5)
+## ☑ WP16 — Overlap-aware stats everywhere, IC-weighted composites live, B4/B5 (plan §5 D1, §3 B4/B5)
 
 - Replace pooled-sample t-stats in **all** factorStats surfaces (live, historical, report) with non-overlapping effective-`n` (report `effectiveN` alongside raw `n`); Newey-West adjustment acceptable as a labeled alternative.
 - Flip IC-weighted sub-signal composites on — ONLY via a candidate strategy version through the WP8 promote flow; record the reweighting in the changelog.

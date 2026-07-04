@@ -1223,3 +1223,68 @@ Regression fixtures added:
 Contradictions:
 
 - None. Weekly automation is implemented but disabled by default per spec through `FACTOR_RESEARCHER_ENABLED=false`.
+
+---
+
+## WP16 — Overlap-Aware Stats + Sub-Signal Strategy Candidate + B4/B5 Seeds — 2026-07-05
+
+Implemented Round 2 WP16.
+
+Changes:
+
+- Replaced pooled t-stat assumptions in shared factorStats with overlap-aware `effectiveN`:
+  - raw `n/samples` remains unchanged.
+  - `effectiveN` is computed by unique frozen decision key across overlapping horizons.
+  - `tStat = rankIC * sqrt(effectiveN)` and `tStatMethod:"rankIC*sqrt(effectiveN)"`.
+  - horizon and sub-signal rows carry the same effective-n fields.
+- Updated factor admission gate to use `effectiveN` for t-stat calculation while still reporting raw `n`.
+- Added `effectiveN` to historical factor analysis surfaces: `factorStats`, `rankIC`, `icDecay`, and weight trajectory factor IC rows.
+- Added mechanical IC-weighted sub-signal composite support:
+  - `buildSubSignalCompositePlan()` reads only factorStats/subSignal rankIC and effectiveN.
+  - `applyCrossSectionalNormalization()` can use `subSignalCompositeMode:"ic-weighted"` with a strategy-version-controlled plan.
+  - default live mode remains equal-weight unless an active strategy version has been human-promoted with the IC-weighted plan.
+- Added `candidateStrategyVersionFromSubSignalComposites()`:
+  - creates `status:"candidate"` strategy versions only.
+  - records a changelog entry and `json.settings.subSignalCompositeMode:"ic-weighted"`.
+  - does not change active weights or active scoring before validate/promote.
+- Live all-stock-agent runs now create a candidate sub-signal-composite strategy version when evidence is available, and show the candidate id in run roadmap metadata.
+- Added B4/B5 registry seeds:
+  - `netShareIssuance`
+  - `grossProfitability`
+  - `assetGrowth`
+  - `insiderClusterBuy`
+  - `institutionalBreadthDelta`
+
+Verification:
+
+```text
+$ node --check lib/recommender_core.mjs && node --check server/strategy_versions.mjs && node --check server/factor_registry.mjs && node --check server/historical_backtest.mjs && node --check server.mjs && node --check scripts/core_regression_tests.mjs
+pass
+
+$ python3 -m py_compile harness/invoker/mock.py harness/tools/http_tools.py harness/tests/test_harness.py
+pass
+
+$ node scripts/core_regression_tests.mjs
+core_regression_tests: ok
+
+$ python3 -m unittest harness.tests.test_harness
+........
+Ran 8 tests in 0.013s
+OK
+
+$ node scripts/generate_route_inventory.mjs && node scripts/generate_route_inventory.mjs --check
+{"status":"ok","routes":81,"uiFetches":43,"storeKeys":26}
+{"status":"ok","routes":81,"uiFetches":43,"storeKeys":26}
+```
+
+Regression fixtures added:
+
+- Overlapping horizon fixture: raw `n=3`, `effectiveN=2`, proving `effectiveN < n` when one decision contributes multiple horizons.
+- Historical walk-forward fixture asserts at least one factorStats row has `effectiveN < n` under multi-horizon outcomes.
+- IC-weighted sub-signal fixture reweights `newsCatalyst` relative to equal-weight composite using only sub-signal RankIC/effectiveN evidence.
+- Strategy-version fixture proves IC-weighted composite enters as `status:"candidate"` and records a changelog entry, while active version remains unchanged until promote.
+- B4/B5 seed fixtures prove `netShareIssuance` is registered with `insufficient-data`, and `institutionalBreadthDelta` is recorded as `blocked-data-depth`.
+
+Contradictions:
+
+- `institutionalBreadthDelta` remains blocked because the current 13F sync is filing-level-only and does not provide holdings-level point-in-time holder breadth by ticker. The factor is recorded as `implementation:"native"` with `evidence.status:"blocked-data-depth"`; no synthetic breadth data is fabricated.

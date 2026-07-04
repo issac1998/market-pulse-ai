@@ -1,6 +1,6 @@
 import crypto from "node:crypto";
 
-import { normalizeRecommendationFactorWeights } from "../lib/recommender_core.mjs";
+import { buildSubSignalCompositePlan, normalizeRecommendationFactorWeights } from "../lib/recommender_core.mjs";
 
 function cloneValue(value) {
   if (!value || typeof value !== "object") return value;
@@ -149,6 +149,74 @@ export function candidateStrategyVersionFromLearning(learning = null, options = 
       weights,
       baseVersionId: baseVersion?.id || options.baseVersionId || "",
       source,
+    },
+  };
+}
+
+export function candidateStrategyVersionFromSubSignalComposites(factorStats = {}, options = {}) {
+  const plan = options.plan || buildSubSignalCompositePlan(factorStats, {
+    minSamples: options.minSamples || 50,
+    generatedAt: options.createdAt,
+  });
+  if (!plan?.factorCount) return null;
+  const baseVersion = options.baseVersion && typeof options.baseVersion === "object" ? options.baseVersion : null;
+  const weights = normalizeRecommendationFactorWeights(
+    baseVersion?.weights || options.previousWeights || options.fallbackWeights || {},
+    options.fallbackWeights || {},
+  );
+  const source = String(options.source || "subsignal-ic-composite-learning");
+  const configHash = hashObject({
+    strategyType: options.strategyType || "all-stock-agent",
+    baseVersionId: baseVersion?.id || options.baseVersionId || "",
+    subSignalCompositePlan: plan,
+    weights,
+  });
+  return {
+    schemaVersion: "strategy-version-v2",
+    id: `candidate-subsignal-${configHash.slice(0, 12)}`,
+    strategyType: options.strategyType || "all-stock-agent",
+    configHash,
+    createdAt: options.createdAt || nowIso(),
+    activeFrom: "",
+    activeTo: "",
+    status: "candidate",
+    active: false,
+    source,
+    sourceRunId: String(options.sourceRunId || ""),
+    baseVersionId: baseVersion?.id || options.baseVersionId || "",
+    baseConfigHash: baseVersion?.configHash || options.baseConfigHash || "",
+    changeReason: "mechanical-subsig-ic-composite-candidate",
+    changelog: [
+      {
+        at: options.createdAt || nowIso(),
+        type: "subsignal-composite",
+        summary: `启用 IC 加权子信号 composite 候选，覆盖 ${plan.factorCount} 个因子；仍需人工 validate/promote 后才会进入 active scoring。`,
+        sampleRule: `effectiveN >= ${plan.minSamples}, weight ∝ max(0, rankIC)`,
+      },
+    ],
+    evaluationSummary: {
+      schemaVersion: "subsignal-composite-candidate-summary-v1",
+      source,
+      sourceRunId: String(options.sourceRunId || ""),
+      factorCount: plan.factorCount,
+      minSamples: plan.minSamples,
+      mode: plan.mode,
+    },
+    weights,
+    previousWeights: weights,
+    subSignalCompositePlan: plan,
+    validationRecords: [],
+    validationStatus: "pending_validation",
+    llmWritable: false,
+    json: {
+      schemaVersion: "all-stock-agent-weight-overlay-v1",
+      weights,
+      baseVersionId: baseVersion?.id || options.baseVersionId || "",
+      source,
+      settings: {
+        subSignalCompositeMode: "ic-weighted",
+        subSignalCompositePlan: plan,
+      },
     },
   };
 }

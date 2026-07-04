@@ -560,16 +560,19 @@ function icDecayForFactor(outcomes = [], factorId = "") {
   for (const outcome of outcomes.filter((row) => row.outcomeUsable !== false)) {
     const horizon = Number(outcome.horizonDays || 0);
     if (!horizon) continue;
-    if (!byHorizon.has(horizon)) byHorizon.set(horizon, { scores: [], returns: [] });
+    if (!byHorizon.has(horizon)) byHorizon.set(horizon, { scores: [], returns: [], keys: [] });
     const row = byHorizon.get(horizon);
     row.scores.push(pct(outcome.factorSnapshot?.factors?.[factorId]?.score));
     row.returns.push(pct(outcome.excessPct));
+    row.keys.push(outcome.decisionId || outcome.id || `${outcome.ticker || ""}:${outcome.decisionAt || ""}:${outcome.action || ""}`);
   }
   const curve = [...byHorizon.entries()]
     .map(([horizonDays, row]) => ({
       horizonDays,
       rankIC: rankCorrelation(row.scores, row.returns),
       n: row.scores.filter((value, index) => Number.isFinite(value) && Number.isFinite(row.returns[index])).length,
+      effectiveN: new Set(row.keys.filter(Boolean)).size || row.scores.filter((value, index) => Number.isFinite(value) && Number.isFinite(row.returns[index])).length,
+      effectiveNMethod: "unique-decision-non-overlap",
     }))
     .filter((row) => row.n >= 3)
     .sort((a, b) => a.horizonDays - b.horizonDays);
@@ -618,7 +621,13 @@ function factorAnalysis(outcomes = []) {
   return {
     schemaVersion: "historical-factor-analysis-v1",
     factorStats: stats,
-    rankIC: Object.fromEntries(rows.map((row) => [row.id, { value: row.rankIC, n: row.samples, source: "historical-backtest" }])),
+    rankIC: Object.fromEntries(rows.map((row) => [row.id, {
+      value: row.rankIC,
+      n: row.samples,
+      effectiveN: row.effectiveN,
+      effectiveNMethod: row.effectiveNMethod,
+      source: "historical-backtest",
+    }])),
     quantileSpreads: Object.fromEntries(rows.map((row) => [row.id, quantileSpreadForFactor(usable, row.id)])),
     icDecay: Object.fromEntries(rows.map((row) => [row.id, icDecayForFactor(usable, row.id)])),
     regimeSplit: regimeSplit(usable),
@@ -653,7 +662,13 @@ function weightTrajectory(outcomes = [], currentWeights = DEFAULT_WEIGHTS, optio
       n: windowOutcomes.length,
       status: windowOutcomes.length >= (options.minSamples || 20) ? "ok" : "low-sample",
       candidateWeights: learned.learnedWeights || {},
-      factorRankIC: Object.fromEntries(Object.entries(stats).map(([id, row]) => [id, { value: row.rankIC, n: row.samples, source: "historical-backtest-window" }])),
+      factorRankIC: Object.fromEntries(Object.entries(stats).map(([id, row]) => [id, {
+        value: row.rankIC,
+        n: row.samples,
+        effectiveN: row.effectiveN,
+        effectiveNMethod: row.effectiveNMethod,
+        source: "historical-backtest-window",
+      }])),
     });
   }
   return windows;

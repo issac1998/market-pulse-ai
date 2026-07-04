@@ -193,6 +193,56 @@ export function defaultFactorRegistrySeeds() {
         { op: "ts_mean", window: 21 },
       ],
     }), { evidence: { status: "insufficient-data", reason: "Requires historical factor/outcome evaluation.", n: 0 } }),
+    seedFactor("netShareIssuance", "qualityGrowth", parseFactorSpec({
+      factorId: "netShareIssuance",
+      family: "qualityGrowth",
+      hypothesis: "持续增发会稀释每股价值并压制未来超额收益；若发行后仍能维持正超额则证伪。",
+      expectedSign: -1,
+      horizons: [60, 126],
+      pipeline: [
+        { op: "ref", input: "pit.shares_outstanding" },
+        { op: "delta", window: 252 },
+      ],
+    }), { evidence: { status: "insufficient-data", reason: "Requires at least two PIT shares_outstanding periods.", n: 0 } }),
+    seedFactor("grossProfitability", "qualityGrowth", parseFactorSpec({
+      factorId: "grossProfitability",
+      family: "qualityGrowth",
+      hypothesis: "高毛利资产效率通常代表更强产品力和资本效率，预期中期超额为正。",
+      expectedSign: 1,
+      horizons: [60, 126],
+      pipeline: [{ op: "ref", input: "pit.gross_profitability" }],
+    }), { evidence: { status: "insufficient-data", reason: "Requires PIT gross_profitability or gross_profit/assets field.", n: 0 } }),
+    seedFactor("assetGrowth", "qualityGrowth", parseFactorSpec({
+      factorId: "assetGrowth",
+      family: "qualityGrowth",
+      hypothesis: "资产扩张过快可能对应低质量增长和未来回报回落，预期中期超额为负。",
+      expectedSign: -1,
+      horizons: [60, 126],
+      pipeline: [
+        { op: "ref", input: "pit.total_assets" },
+        { op: "delta", window: 252 },
+      ],
+    }), { evidence: { status: "insufficient-data", reason: "Requires at least two PIT total_assets periods.", n: 0 } }),
+    seedFactor("insiderClusterBuy", "smartMoney", {
+      schemaVersion: "factor-spec-v1",
+      factorId: "insiderClusterBuy",
+      family: "smartMoney",
+      hypothesis: "30 日内至少两位不同内部人公开市场买入，通常比单一 Form 4 更有信息含量。",
+      expectedSign: 1,
+      horizons: [20, 60],
+      pipeline: [],
+      reason: "DSL v1 cannot count distinct Form 4 insiders in a rolling 30d window.",
+    }, { implementation: "native", evidence: { status: "insufficient-data", reason: "Requires normalized Form 4 transaction rows with distinct insider identity.", n: 0 } }),
+    seedFactor("institutionalBreadthDelta", "smartMoney", {
+      schemaVersion: "factor-spec-v1",
+      factorId: "institutionalBreadthDelta",
+      family: "smartMoney",
+      hypothesis: "机构持有人广度提升可能代表基本面共识扩散，预期中期超额为正。",
+      expectedSign: 1,
+      horizons: [60, 126],
+      pipeline: [],
+      reason: "Blocked: current 13F sync is filing-level only and does not provide point-in-time holder breadth by ticker.",
+    }, { implementation: "native", evidence: { status: "blocked-data-depth", reason: "13F mirror is filing-level-only; cannot compute institutional breadth delta without holdings-level PIT sync.", n: 0 } }),
   ];
   return specs;
 }
@@ -429,7 +479,8 @@ function admissionEvidenceForFactor(factor = {}, context = {}) {
   const evidence = override || factor.evidence || {};
   const rankIC = numberOrNull(evidence.rankIC ?? liveStats.rankIC);
   const n = numberOrNull(evidence.n ?? evidence.samples ?? liveStats.n ?? liveStats.samples);
-  const tStat = numberOrNull(evidence.tStat) ?? (Number.isFinite(rankIC) && Number.isFinite(n) && n > 2 ? rankIC * Math.sqrt(n) : null);
+  const effectiveN = numberOrNull(evidence.effectiveN ?? liveStats.effectiveN) ?? n;
+  const tStat = numberOrNull(evidence.tStat) ?? (Number.isFinite(rankIC) && Number.isFinite(effectiveN) && effectiveN > 2 ? rankIC * Math.sqrt(effectiveN) : null);
   const coverage = numberOrNull(evidence.coverage ?? evidence.coveragePct) ?? 0;
   const maxCorrelation = Math.abs(numberOrNull(evidence.maxCorrelation ?? evidence.maxAbsCorrelation) ?? 1);
   const regimeSigns = numberOrNull(evidence.regimeSigns) ?? 0;
@@ -451,6 +502,8 @@ function admissionEvidenceForFactor(factor = {}, context = {}) {
     source: override ? "manual-evidence-override" : liveStats.samples || liveStats.n ? "live-factor-stats" : "stored-evidence",
     rankIC: Number.isFinite(rankIC) ? rankIC : null,
     n: Number.isFinite(n) ? n : 0,
+    effectiveN: Number.isFinite(effectiveN) ? effectiveN : Number.isFinite(n) ? n : 0,
+    tStatMethod: "rankIC*sqrt(effectiveN)",
     tStat: Number.isFinite(tStat) ? tStat : null,
     hurdle,
     regimeSigns,

@@ -16,6 +16,8 @@ import {
 } from "../lib/market_core.mjs";
 import {
   buildBenchmarkBasket,
+  buildFactorStatsFromOutcomes,
+  buildSubSignalCompositePlan,
   classifyOutcomeQuality,
   applyCrossSectionalNormalization,
   newsRecencyDecayWeight,
@@ -55,6 +57,7 @@ import {
   buildPromotionValidationRecord,
   buildRegimeSplitEvaluationPayload,
   candidateStrategyVersionFromLearning,
+  candidateStrategyVersionFromSubSignalComposites,
   promoteStrategyVersion,
   rollbackStrategyVersions,
   upsertStrategyVersion,
@@ -262,6 +265,27 @@ assert.equal(
   "cross-sectional-rank",
   "Sub-signals should be normalized through the cross-sectional rank path",
 );
+const icWeightedSubSignals = applyCrossSectionalNormalization(subSignalUniverse, {
+  subSignalCompositeMode: "ic-weighted",
+  subSignalStats: {
+    newsCatalyst: {
+      subSignals: {
+        positiveMateriality: { effectiveN: 60, n: 80, rankIC: 0.12 },
+        negativeMateriality: { effectiveN: 60, n: 80, rankIC: 0 },
+      },
+    },
+  },
+}).snapshots;
+assert.equal(
+  icWeightedSubSignals[10].factors.newsCatalyst.normalization.method,
+  "ic-weighted-subsignal-composite",
+  "IC-weighted sub-signal composite should activate only when a strategy-version-controlled plan is supplied",
+);
+assert.notEqual(
+  icWeightedSubSignals[10].factors.newsCatalyst.score,
+  normalizedSubSignals[10].factors.newsCatalyst.score,
+  "IC-weighted composite should reweight at least one factor score relative to equal-weight composite",
+);
 const allNullSubSignals = applyCrossSectionalNormalization(Array.from({ length: 40 }, (_, index) => ({
   ticker: `N${index}`,
   factors: {
@@ -309,6 +333,14 @@ const pitFilteredFactor = evaluateFactorSpec(
 assert.equal(pitFilteredFactor.status, "ok", "Factor DSL evaluator should produce values before asOf");
 assert.notEqual(pitFilteredFactor.latest.value, 9999 - 107, "Factor DSL evaluator must filter future rows before evaluation");
 const registryWithSeeds = normalizeFactorRegistry({});
+assert.ok(
+  registryWithSeeds.factors.some((item) => item.factorId === "netShareIssuance" && item.evidence?.status === "insufficient-data"),
+  "B4 PIT netShareIssuance seed should be registered with honest insufficient-data evidence",
+);
+assert.ok(
+  registryWithSeeds.factors.some((item) => item.factorId === "institutionalBreadthDelta" && item.evidence?.status === "blocked-data-depth"),
+  "B5 institutional breadth factor should be recorded as blocked rather than faked",
+);
 const duplicateCandidate = addFactorCandidate(registryWithSeeds, {
   factorId: "revisionMomentumClone",
   spec: {
@@ -407,6 +439,32 @@ assert.equal(
   1,
   "Factor postmortem should also attach to registry factor entry",
 );
+const overlappingFactorStats = buildFactorStatsFromOutcomes([
+  {
+    decisionId: "decision-1",
+    ticker: "AAA",
+    horizonDays: 1,
+    excessPct: 1,
+    factorSnapshot: { factors: { momentum: { label: "Momentum", score: 60 } } },
+  },
+  {
+    decisionId: "decision-1",
+    ticker: "AAA",
+    horizonDays: 3,
+    excessPct: 2,
+    factorSnapshot: { factors: { momentum: { label: "Momentum", score: 60 } } },
+  },
+  {
+    decisionId: "decision-2",
+    ticker: "BBB",
+    horizonDays: 1,
+    excessPct: -1,
+    factorSnapshot: { factors: { momentum: { label: "Momentum", score: 40 } } },
+  },
+]);
+assert.equal(overlappingFactorStats.momentum.n, 3, "Factor stats should retain raw pooled n");
+assert.equal(overlappingFactorStats.momentum.effectiveN, 2, "Factor stats should report non-overlapping effectiveN by frozen decision");
+assert.ok(overlappingFactorStats.momentum.effectiveN < overlappingFactorStats.momentum.n, "effectiveN should be below raw n when horizons overlap");
 
 const recommendationScore = scoreRecommendationFromFactorSnapshot(
   {
@@ -507,6 +565,23 @@ const candidateStrategy = candidateStrategyVersionFromLearning(learnedWeights, {
   fallbackWeights: normalizeRecommendationFactorWeights(),
 });
 assert.equal(candidateStrategy.status, "candidate", "Learned weights should create a candidate strategy version");
+const subSignalPlan = buildSubSignalCompositePlan({
+  newsCatalyst: {
+    subSignals: {
+      positiveMateriality: { effectiveN: 55, n: 70, rankIC: 0.11 },
+      negativeMateriality: { effectiveN: 55, n: 70, rankIC: 0 },
+    },
+  },
+});
+const subSignalCandidate = candidateStrategyVersionFromSubSignalComposites({}, {
+  plan: subSignalPlan,
+  baseVersion: activeStrategy,
+  fallbackWeights: normalizeRecommendationFactorWeights(),
+  sourceRunId: "run-1",
+});
+assert.equal(subSignalCandidate.status, "candidate", "IC-weighted sub-signal composites should enter through a candidate strategy version");
+assert.equal(subSignalCandidate.json.settings.subSignalCompositeMode, "ic-weighted", "Sub-signal candidate should carry the active-after-promote setting");
+assert.ok(subSignalCandidate.changelog?.[0]?.summary.includes("IC 加权子信号"), "Sub-signal candidate should record a changelog entry");
 let strategyRows = upsertStrategyVersion([activeStrategy], candidateStrategy);
 assert.equal(activeStrategyVersion(strategyRows).id, "active-v1", "Candidate insertion must not change active strategy version");
 assert.notEqual(
@@ -813,6 +888,10 @@ assert.ok(
 assert.ok(
   Object.values(historicalWalkForward.run.factorAnalysis.factorStats).some((row) => Object.keys(row.horizons || {}).length > 0),
   "Historical factor stats should include per-horizon cells with n",
+);
+assert.ok(
+  Object.values(historicalWalkForward.run.factorAnalysis.factorStats).some((row) => Number(row.effectiveN) < Number(row.n || row.samples)),
+  "Historical factor stats should include effectiveN below raw n when multiple horizons overlap",
 );
 assert.ok(
   Object.values(historicalWalkForward.run.factorAnalysis.factorStats).some((row) => Object.keys(row.subSignals || {}).length > 0),
