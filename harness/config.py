@@ -9,6 +9,11 @@ DATA_DIR = REPO_ROOT / "data"
 ARTIFACTS_DIR = HARNESS_DIR / "artifacts"
 AGENTS_DIR = HARNESS_DIR / "agents"
 KNOWLEDGE_DIR = HARNESS_DIR / "knowledge" / "files"
+DEBATE_PERSONA_AGENT_IDS = [
+    item.strip()
+    for item in os.environ.get("DEBATE_PERSONA_AGENT_IDS", "").split(",")
+    if item.strip()
+]
 
 BASE_URL = os.environ.get("MARKET_PULSE_BASE_URL", "http://localhost:5173").rstrip("/")
 SQLITE_DB_FILE = Path(os.environ.get("SQLITE_DB_FILE", str(DATA_DIR / "market_pulse.sqlite")))

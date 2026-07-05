@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import fs from "node:fs";
 import zlib from "node:zlib";
 import {
   blackScholesPrice,
@@ -10,6 +11,7 @@ import {
   addNyseTradingDays,
   calculateOptionFifoLots,
   isNyseTradingDay,
+  nyseSessionForYmdRuleBased,
   nyseSessionForYmd,
   scoreFredMacroRegime,
   semanticNewsOwnership,
@@ -37,6 +39,8 @@ import { storyFingerprint, triageIntradaySignal } from "../lib/alert_triage.mjs"
 import {
   alpha158Subset,
   buildFactorSnapshotAsOf,
+  calculateAltmanZScore,
+  calculatePiotroskiFScore,
   normalizeHistoricalBars,
 } from "../lib/historical_features.mjs";
 import { runIntradayWatcherOnce } from "../server/intraday_watcher.mjs";
@@ -1047,6 +1051,67 @@ assert.deepEqual(
   "Semiconductor mega-cap basket should use QQQ/SMH/SPY",
 );
 assert.ok(Math.abs(semiBasket.reduce((sum, item) => sum + item.weight, 0) - 1) < 1e-9, "Benchmark weights should normalize to 1");
+const materialsBasket = buildBenchmarkBasket("AA", {
+  sector: "Materials",
+  industry_group: "Materials",
+  market_cap: 5_000_000_000,
+});
+assert.ok(
+  materialsBasket.some((item) => item.ticker === "XLB"),
+  "FinanceDatabase sector fields should map Materials names to the XLB sector basket",
+);
+
+const piotroskiFixture = calculatePiotroskiFScore(
+  {
+    net_income: 100,
+    assets: 1000,
+    operating_cash_flow: 130,
+    long_term_debt: 250,
+    current_assets: 500,
+    current_liabilities: 250,
+    shares_basic: 100,
+    gross_profit: 420,
+    revenue: 1100,
+  },
+  {
+    net_income: 80,
+    assets: 900,
+    operating_cash_flow: 90,
+    long_term_debt: 260,
+    current_assets: 430,
+    current_liabilities: 250,
+    shares_basic: 101,
+    gross_profit: 340,
+    revenue: 900,
+  },
+);
+assert.equal(piotroskiFixture.score, 9, "Piotroski fixture should hand-compute to 9/9");
+assert.equal(piotroskiFixture.status, "ok", "Piotroski fixture should require all nine signals");
+const altmanFixture = calculateAltmanZScore({
+  current_assets: 500,
+  current_liabilities: 250,
+  retained_earnings: 300,
+  ebit: 120,
+  assets: 1000,
+  liabilities: 400,
+  revenue: 1000,
+  latest_close: 20,
+  shares_basic: 100,
+});
+assertApprox(altmanFixture.zScore, 5.116, 1e-12, "Altman Z fixture should match the hand-computed public-company formula");
+assert.equal(altmanFixture.status, "ok", "Altman Z fixture should be exact when all formula components are present");
+
+const nyseReferencePath = new URL("../data/reference/nyse_calendar_2019_2028.json", import.meta.url);
+if (fs.existsSync(nyseReferencePath)) {
+  const calendar = JSON.parse(fs.readFileSync(nyseReferencePath, "utf8"));
+  const divergences = (calendar.sessions || []).filter((row) => {
+    const rule = nyseSessionForYmdRuleBased(row.date);
+    return Boolean(rule.isTradingDay) !== Boolean(row.isTradingDay) || Boolean(rule.isHalfDay) !== Boolean(row.isHalfDay);
+  });
+  assert.equal(divergences.length, 0, "Rule-based NYSE calendar should match pandas-market-calendars over the generated reference range");
+  assert.equal(nyseSessionForYmd("2026-07-03").source, "pandas-market-calendars-reference", "Generated NYSE reference calendar should win when present");
+  assert.equal(isNyseTradingDay("2026-07-03"), false, "Generated NYSE reference calendar should mark observed Independence Day closed");
+}
 
 assert.equal(outcomeFromExcess(1.2, 0.5), "win", "Excess return above deadband should be win");
 assert.equal(outcomeFromExcess(-1.2, 0.5), "loss", "Excess return below negative deadband should be loss");
@@ -1220,10 +1285,10 @@ assert.notEqual(
   "PIT fundamentals should enable qualityGrowth when filed facts exist as of the date",
 );
 
-const historicalBacktestBars = ["SPY", "AAPL", "MSFT"].flatMap((ticker, tickerIndex) =>
+const historicalBacktestBars = ["SPY", "XLK", "AAPL", "MSFT"].flatMap((ticker, tickerIndex) =>
   Array.from({ length: 80 }, (_, index) => {
     const date = new Date(Date.UTC(2026, 0, 1 + index)).toISOString().slice(0, 10);
-    const drift = ticker === "SPY" ? 0.25 : ticker === "AAPL" ? 0.8 : 0.45;
+    const drift = ticker === "SPY" ? 0.25 : ticker === "XLK" ? 0.35 : ticker === "AAPL" ? 0.8 : 0.45;
     const base = 100 + tickerIndex * 25 + index * drift;
     return {
       ticker,
@@ -1240,7 +1305,19 @@ const historicalBacktestBars = ["SPY", "AAPL", "MSFT"].flatMap((ticker, tickerIn
 const historicalWalkForward = runHistoricalWalkForwardFromRows({
   bars: historicalBacktestBars,
   regimes: [{ date: "2026-01-01", bucket: "宏观顺风", risk_score: 38 }],
-  config: { minLookback: 20, maxDates: 4, topN: 2, horizons: [1, 3], primaryHorizon: 1, costBps: 1, slippageBps: 1 },
+  config: {
+    minLookback: 20,
+    maxDates: 4,
+    topN: 2,
+    horizons: [1, 3],
+    primaryHorizon: 1,
+    costBps: 1,
+    slippageBps: 1,
+    securityMasterExt: [
+      { ticker: "AAPL", sector: "Information Technology", industry_group: "Technology Hardware & Equipment", industry: "Technology Hardware" },
+      { ticker: "MSFT", sector: "Information Technology", industry_group: "Software & Services", industry: "Software" },
+    ],
+  },
 });
 const handComputedDrawdown = historicalMaxDrawdownFromReturns([10, -5, -5, 2, 4, -1, 3, -2, 1, 1]);
 assertApprox(
@@ -1251,6 +1328,14 @@ assertApprox(
 );
 assert.equal(historicalWalkForward.run.status, "ok", "Historical walk-forward fixture should produce a runnable backtest");
 assert.ok(historicalWalkForward.run.decisions.length > 0, "Historical walk-forward should freeze pseudo-decisions");
+assert.ok(
+  historicalWalkForward.run.decisions.some((item) => item.sectorBasketStatus === "sector_mapping_ok" && item.benchmarkBasket.some((basket) => basket.ticker === "XLK")),
+  "Historical walk-forward should use security_master_ext sector ETF baskets when sector bars exist",
+);
+assert.ok(
+  historicalWalkForward.run.outcomes.some((item) => Number.isFinite(item.sectorBenchmarkReturnPct)),
+  "Historical outcomes should expose sectorBenchmarkReturnPct when benchmark basket components are available",
+);
 assert.ok(
   historicalWalkForward.run.decisions.every((item) => item.decisionSource === "historical-backtest"),
   "Historical pseudo-decisions should be labeled separately from live decisions",

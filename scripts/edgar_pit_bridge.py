@@ -138,9 +138,15 @@ def extract_facts_from_filing(filing: Any) -> list[dict[str, Any]]:
         "eps_diluted": ("EarningsPerShareDiluted",),
         "gross_profit": ("GrossProfit",),
         "assets": ("Assets",),
+        "current_assets": ("AssetsCurrent",),
         "liabilities": ("Liabilities",),
+        "current_liabilities": ("LiabilitiesCurrent",),
+        "long_term_debt": ("LongTermDebt", "LongTermDebtAndFinanceLeaseObligations", "LongTermDebtCurrentAndNoncurrent"),
         "equity": ("StockholdersEquity", "StockholdersEquityIncludingPortionAttributableToNoncontrollingInterest"),
+        "retained_earnings": ("RetainedEarningsAccumulatedDeficit",),
+        "ebit": ("OperatingIncomeLoss", "IncomeLossFromContinuingOperationsBeforeIncomeTaxesExtraordinaryItemsNoncontrollingInterest"),
         "operating_cash_flow": ("NetCashProvidedByUsedInOperatingActivities",),
+        "shares_basic": ("WeightedAverageNumberOfSharesOutstandingBasic", "WeightedAverageNumberOfSharesOutstandingBasicAndDiluted"),
         "shares_diluted": ("WeightedAverageNumberOfDilutedSharesOutstanding", "WeightedAverageDilutedSharesOutstanding"),
     }
     try:

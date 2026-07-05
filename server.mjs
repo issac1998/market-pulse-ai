@@ -136,6 +136,7 @@ const UZI_REPORT_DIR = path.resolve(
 );
 const COMPANY_TICKERS_FILE = path.join(DATA_DIR, "company_tickers.json");
 const NASDAQ_SYMBOLS_FILE = path.join(DATA_DIR, "nasdaq_symbols.json");
+const SECURITY_MASTER_EXT_FILE = path.join(DATA_DIR, "reference", "security_master_ext.json");
 const US_STOCK_STRATEGIES_FILE = path.join(__dirname, "strategies", "us_stock_strategies.json");
 const ALL_STOCK_AGENT_SKILL_FILE = path.join(
   __dirname,
@@ -11370,6 +11371,17 @@ function cachedNasdaqSecurityMasterSync() {
   }
 }
 
+function cachedSecurityMasterExtSync(ticker = "") {
+  const symbol = safeTicker(ticker);
+  if (!symbol) return null;
+  try {
+    const payload = JSON.parse(readFileSync(SECURITY_MASTER_EXT_FILE, "utf8"));
+    return payload.byTicker?.[symbol] || null;
+  } catch {
+    return null;
+  }
+}
+
 function shouldSkipSecFilings(ticker) {
   return SEC_FILING_SKIP_TICKERS.has(safeTicker(ticker));
 }
@@ -22031,11 +22043,13 @@ function benchmarkSectorTicker(industryText = "", businessText = "") {
   if (/health|pharma|biotech|drug|医疗|医药|生物/i.test(text)) return "XLV";
   if (/energy|oil|gas|能源|石油|天然气/i.test(text)) return "XLE";
   if (/bank|financial|insurance|金融|银行|保险/i.test(text)) return "XLF";
-  if (/consumer discretionary|retail|auto|ecommerce|消费|零售|汽车|电商/i.test(text)) return "XLY";
+  if (/consumer discretionary|automobiles|retail|auto|ecommerce|消费|零售|汽车|电商/i.test(text)) return "XLY";
+  if (/consumer staples|consumer staple|food|beverage|tobacco|household|personal products|日用品|食品|饮料/i.test(text)) return "XLP";
   if (/communication|media|telecom|通信|传媒|广告/i.test(text)) return "XLC";
-  if (/industrial|aerospace|defense|manufacturing|工业|航天|国防|制造/i.test(text)) return "XLI";
+  if (/industrial|industrials|transportation|aerospace|defense|manufacturing|工业|航天|国防|制造/i.test(text)) return "XLI";
+  if (/materials|chemical|metals|mining|paper|包装|材料|化工|金属|矿业/i.test(text)) return "XLB";
+  if (/real estate|reit|房地产|不动产/i.test(text)) return "XLRE";
   if (/utility|utilities|电力|公用事业/i.test(text)) return "XLU";
-  if (/consumer staple|food|beverage|日用品|食品|饮料/i.test(text)) return "XLP";
   return "";
 }
 
@@ -22046,11 +22060,13 @@ function normalizeBenchmarkBasket(items = []) {
 function buildBenchmarkBasket(ticker = "", profile = {}, industryText = "") {
   const symbol = safeTicker(ticker);
   const known = knownEquityProfile(symbol) || {};
+  const ext = cachedSecurityMasterExtSync(symbol) || {};
   return buildBenchmarkBasketCore(ticker, {
     ...known,
+    ...ext,
     ...profile,
-    industry: industryText || profile.industry || known.industry || "",
-    mainBusiness: profile.mainBusiness || known.mainBusiness || "",
+    industry: industryText || profile.industry || profile.industry_group || profile.industryGroup || profile.sector || ext.industry || ext.industry_group || ext.sector || known.industry || "",
+    mainBusiness: profile.mainBusiness || profile.summary || ext.summary || known.mainBusiness || "",
   });
 }
 

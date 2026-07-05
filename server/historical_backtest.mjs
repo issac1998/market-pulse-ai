@@ -220,6 +220,85 @@ function benchmarkReturn(spyRows = [], signalDate = "", exitDate = "", roundTrip
   };
 }
 
+const SECTOR_ETF_BY_NAME = [
+  [/information technology|technology|software|semiconductor/i, "XLK"],
+  [/communication services|communication|media|telecom/i, "XLC"],
+  [/consumer discretionary|automobiles|retail/i, "XLY"],
+  [/consumer staples|food|beverage|household|personal products/i, "XLP"],
+  [/energy|oil|gas/i, "XLE"],
+  [/financials|banks|insurance|diversified financials/i, "XLF"],
+  [/health care|pharma|biotech|life sciences/i, "XLV"],
+  [/industrials|capital goods|transportation|aerospace|defense/i, "XLI"],
+  [/materials|metals|mining|chemicals|paper/i, "XLB"],
+  [/real estate|reit/i, "XLRE"],
+  [/utilities|utility/i, "XLU"],
+];
+
+function sectorEtfForSecurity(row = {}) {
+  const text = [row.sector, row.industry_group, row.industry, row.name].filter(Boolean).join(" ");
+  for (const [pattern, etf] of SECTOR_ETF_BY_NAME) {
+    if (pattern.test(text)) return etf;
+  }
+  return "";
+}
+
+function securityMasterMap(rows = []) {
+  const map = new Map();
+  for (const row of rows || []) {
+    const ticker = safeTicker(row.ticker);
+    if (ticker) map.set(ticker, row);
+  }
+  return map;
+}
+
+function benchmarkBasketForTicker(ticker = "", securityMaster = new Map(), byTicker = new Map()) {
+  const row = securityMaster.get(safeTicker(ticker)) || {};
+  const sectorEtf = sectorEtfForSecurity(row);
+  const basket = [{ ticker: "SPY", weight: sectorEtf ? 0.5 : 1, source: "historical_bars" }];
+  let status = row.sector ? "sector_mapping_ok" : "missing_sector_mapping";
+  if (sectorEtf) {
+    basket.push({ ticker: sectorEtf, weight: 0.5, source: "security_master_ext" });
+    if (!byTicker.has(sectorEtf)) status = "sector_mapping_missing_bars";
+  }
+  return {
+    basket,
+    status,
+    sector: row.sector || "",
+    industryGroup: row.industry_group || row.industryGroup || "",
+    industry: row.industry || "",
+  };
+}
+
+function benchmarkReturnForBasket(byTicker = new Map(), basket = [], signalDate = "", exitDate = "", roundTripCostBps = 0) {
+  const components = [];
+  for (const item of basket || []) {
+    const rows = byTicker.get(safeTicker(item.ticker)) || [];
+    const entry = barAfter(rows, signalDate);
+    const exit = entry ? rows.find((row) => row.date >= exitDate) || null : null;
+    const value = entry && exit ? returnPct(entry.open, exit.close, roundTripCostBps) : null;
+    if (Number.isFinite(value)) {
+      components.push({
+        ticker: safeTicker(item.ticker),
+        weight: pct(item.weight) ?? 0,
+        entryDate: entry.date,
+        exitDate: exit.date,
+        entryPrice: entry.open,
+        exitPrice: exit.close,
+        returnPct: value,
+      });
+    }
+  }
+  const totalWeight = components.reduce((sum, item) => sum + item.weight, 0);
+  const value = totalWeight > 0
+    ? components.reduce((sum, item) => sum + item.returnPct * (item.weight / totalWeight), 0)
+    : null;
+  return {
+    label: components.map((item) => item.ticker).join("+") || "",
+    returnPct: value,
+    components,
+  };
+}
+
 function maxDrawdownFromReturns(returns = []) {
   let equity = 1;
   let peak = 1;
@@ -1039,9 +1118,11 @@ export function runHistoricalWalkForwardFromRows({ bars = [], regimes = [], conf
     minSamplesForWeightUpdate: Math.max(1, Number(config.minSamplesForWeightUpdate || 20)),
     maxStepPct: Math.max(0, Math.min(2, Number(config.maxStepPct || 1))),
     pitFundamentalsError: config.pitFundamentalsError || "",
+    securityMasterExtError: config.securityMasterExtError || "",
   };
   const strategyHash = hashJson({ engine: "historical-walk-forward-v1", config: runConfig, weights: DEFAULT_WEIGHTS });
   const byTicker = groupBars(bars);
+  const securityMaster = securityMasterMap(config.securityMasterExt || []);
   const pitRows = Array.isArray(config.pitFundamentals) ? config.pitFundamentals : [];
   const dates = allDatesFromBars(byTicker, runConfig.minLookback).slice(-runConfig.maxDates);
   const spyRows = byTicker.get("SPY") || [];
@@ -1078,6 +1159,7 @@ export function runHistoricalWalkForwardFromRows({ bars = [], regimes = [], conf
       const rows = byTicker.get(item.ticker) || [];
       const entry = barAfter(rows, signalDate);
       if (!entry) continue;
+      const benchmarkPlan = benchmarkBasketForTicker(item.ticker, securityMaster, byTicker);
       const decision = {
         schemaVersion: "historical-pseudo-decision-v1",
         id: `historical:${strategyHash.slice(0, 12)}:${signalDate}:${item.ticker}`,
@@ -1097,15 +1179,19 @@ export function runHistoricalWalkForwardFromRows({ bars = [], regimes = [], conf
         strategyHash,
         costBps: runConfig.costBps,
         slippageBps: runConfig.slippageBps,
-        benchmarkBasket: [{ ticker: "SPY", weight: 1, source: "historical_bars" }],
-        sectorBasketStatus: "missing_sector_mapping",
+        benchmarkBasket: benchmarkPlan.basket,
+        sectorBasketStatus: benchmarkPlan.status,
+        sector: benchmarkPlan.sector,
+        industryGroup: benchmarkPlan.industryGroup,
+        industry: benchmarkPlan.industry,
       };
       decisions.push(decision);
       for (const horizon of runConfig.horizons) {
         const exit = barAtHorizon(rows, entry.date, horizon);
         if (!exit) continue;
         const raw = returnPct(entry.open, exit.close, roundTripCostBps);
-        const benchmark = benchmarkReturn(spyRows, signalDate, exit.date, roundTripCostBps);
+        const benchmark = benchmarkReturnForBasket(byTicker, decision.benchmarkBasket, signalDate, exit.date, roundTripCostBps);
+        const spyBenchmark = benchmarkReturn(spyRows, signalDate, exit.date, roundTripCostBps);
         const benchmarkPct = pct(benchmark.returnPct);
         const excess = Number.isFinite(raw) ? raw - (Number.isFinite(benchmarkPct) ? benchmarkPct : 0) : null;
         const outcome = outcomeFromExcess(excess, 0.5);
@@ -1131,9 +1217,12 @@ export function runHistoricalWalkForwardFromRows({ bars = [], regimes = [], conf
           entryPrice: entry.open,
           exitPrice: exit.close,
           rawReturnPct: raw,
-          benchmarkTicker: "SPY",
+          benchmarkTicker: benchmark.label || "SPY",
           benchmarkReturnPct: benchmarkPct,
+          spyBenchmarkReturnPct: pct(spyBenchmark.returnPct),
+          sectorBenchmarkReturnPct: benchmarkPct,
           benchmarkComponents: benchmark.components,
+          sectorBasketStatus: decision.sectorBasketStatus,
           excessPct: excess,
           outcome,
           outcomeQualityStatus: quality.status,
@@ -1161,6 +1250,11 @@ export function runHistoricalWalkForwardFromRows({ bars = [], regimes = [], conf
   const factorPack = factorAnalysis(outcomes);
   const weights = weightOutputs(stats, DEFAULT_WEIGHTS, runConfig, outcomes);
   const equityCurve = equityAndDrawdownCurve(daily);
+  const sectorBasketStatusCounts = decisions.reduce((acc, decision) => {
+    const key = decision.sectorBasketStatus || "unknown";
+    acc[key] = (acc[key] || 0) + 1;
+    return acc;
+  }, {});
   const run = {
     schemaVersion: "historical-walk-forward-run-v1",
     id: `hist-bt-${Date.now()}-${strategyHash.slice(0, 8)}`,
@@ -1212,15 +1306,18 @@ export function runHistoricalWalkForwardFromRows({ bars = [], regimes = [], conf
       config: runConfig,
       backtestWeightsUsage: "candidate-only",
       friction: roundTripCostBps > 0 ? "costed" : "frictionless-reference",
-      sectorBasketStatus: "missing_sector_mapping",
+      sectorBasketStatus: Object.keys(sectorBasketStatusCounts).length ? sectorBasketStatusCounts : { missing_sector_mapping: decisions.length },
       diagnostics: {
         pitFundamentalsError: runConfig.pitFundamentalsError,
+        securityMasterExtError: runConfig.securityMasterExtError,
+        securityMasterExtRows: securityMaster.size,
+        sectorBasketStatusCounts,
       },
     },
     caveats: [
       "Walk-forward uses only dates present in historical_bars and never reads rows after the signal date.",
       "Backtest outputs are labeled historical-backtest and must not blend with live recommendation rows.",
-      "Sector baskets require a stable ticker-to-sector mapping; current Tier-1 fallback uses SPY only and records sectorBasketStatus.",
+      "Sector baskets use security_master_ext when present; if a mapped sector ETF has no historical bars, the basket falls back to available components and records sector_mapping_missing_bars.",
       roundTripCostBps > 0 ? "Costs/slippage are included in raw and benchmark returns." : "Zero-cost run is labeled frictionless-reference.",
     ],
   };
@@ -1271,6 +1368,8 @@ export async function runHistoricalWalkForwardFromSqlite({ sqlitePath, config = 
   );
   let pitFundamentals = [];
   let pitFundamentalsError = "";
+  let securityMasterExt = [];
+  let securityMasterExtError = "";
   try {
     pitFundamentals = await sqliteJson(
       sqlitePath,
@@ -1281,7 +1380,21 @@ export async function runHistoricalWalkForwardFromSqlite({ sqlitePath, config = 
     pitFundamentalsError = error.message;
     pitFundamentals = [];
   }
-  const result = runHistoricalWalkForwardFromRows({ bars, regimes, config: { ...config, pitFundamentals, pitFundamentalsError } });
+  try {
+    securityMasterExt = await sqliteJson(
+      sqlitePath,
+      `SELECT ticker,name,sector,industry_group,industry,country,market_cap_bucket,market_cap,exchange,mic FROM security_master_ext WHERE ticker IN (${tickerList}) ORDER BY ticker;`,
+      config.sqliteTimeoutMs || 30000,
+    );
+  } catch (error) {
+    securityMasterExtError = error.message;
+    securityMasterExt = [];
+  }
+  const result = runHistoricalWalkForwardFromRows({
+    bars,
+    regimes,
+    config: { ...config, pitFundamentals, pitFundamentalsError, securityMasterExt, securityMasterExtError },
+  });
   await applyMetricBridges(result.run, config);
   result.report = buildReport(result.run);
   const persistence = await persistHistoricalBacktestRun(

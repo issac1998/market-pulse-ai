@@ -1784,3 +1784,139 @@ $ node scripts/generate_route_inventory.mjs && node scripts/generate_route_inven
 Contradictions:
 
 - None.
+
+---
+
+## WP25 — External Integrations Round 2 — 2026-07-05
+
+Implemented Round 5 WP25.
+
+Changes:
+
+- Added `scripts/finance_database_import.py`:
+  - downloads FinanceDatabase equity CSVs from GitHub with a bounded `curl --max-time` path;
+  - imports rows into SQLite table `security_master_ext(ticker, name, sector, industry_group, industry, country, market_cap_bucket, ...)`;
+  - writes an ignored local JSON cache at `data/reference/security_master_ext.json`;
+  - reports raw corpus coverage and equity-only coverage, excluding benchmark/ETF tickers that do not have equity sector classifications.
+- Extended benchmark sector mapping:
+  - `lib/recommender_core.mjs` now recognizes the full SPDR sector set: XLK/XLE/XLF/XLV/XLY/XLP/XLI/XLB/XLU/XLRE/XLC plus SMH for semiconductors.
+  - server-side benchmark basket construction falls back to the FinanceDatabase JSON cache when Longbridge/static company profile industry fields are missing.
+  - historical walk-forward reads `security_master_ext` from SQLite and stores sector basket metadata on pseudo-decisions/outcomes.
+- Added `scripts/generate_market_calendar.py`:
+  - generates `data/reference/nyse_calendar_2019_2028.json` from `pandas_market_calendars`;
+  - `lib/market_core.mjs` loads the reference calendar when present and keeps rule-based fallback when absent;
+  - added rule-based export fixtures and the 2025-01-09 special closure.
+- Replaced historical PIT quality approximations with exact formula functions in `lib/historical_features.mjs`:
+  - `calculatePiotroskiFScore()`;
+  - `calculateAltmanZScore()`;
+  - `qualityGrowth` raw payload now records exact score/status fields when sufficient PIT data exists.
+- Extended `scripts/edgar_pit_bridge.py` XBRL aliases for formula inputs:
+  - current assets/current liabilities;
+  - long-term debt;
+  - retained earnings;
+  - EBIT;
+  - basic shares.
+- Added optional debate personas, default off:
+  - `damodaran_persona`;
+  - `graham_persona`;
+  - `munger_persona`;
+  - `burry_persona`.
+- Added `DEBATE_PERSONA_AGENT_IDS` config; selected personas append narrative-only debate rows and cannot override factor gates, risk vetoes, or weights.
+- Regenerated route inventory; route count remains 81.
+
+Verification:
+
+```text
+$ node --check server.mjs
+pass
+
+$ node --check lib/market_core.mjs
+pass
+
+$ node --check lib/recommender_core.mjs
+pass
+
+$ node --check lib/historical_features.mjs
+pass
+
+$ node --check server/historical_backtest.mjs
+pass
+
+$ node --check scripts/core_regression_tests.mjs
+pass
+
+$ python3 -m py_compile scripts/finance_database_import.py scripts/generate_market_calendar.py scripts/edgar_pit_bridge.py harness/config.py harness/orchestrator/debate.py harness/agents/loader.py
+pass
+
+$ node scripts/core_regression_tests.mjs
+core_regression_tests: ok
+
+$ node scripts/generate_route_inventory.mjs && node scripts/generate_route_inventory.mjs --check
+{"status":"ok","routes":81,"uiFetches":43,"storeKeys":26}
+{"status":"ok","routes":81,"uiFetches":43,"storeKeys":26}
+```
+
+FinanceDatabase import verification:
+
+```text
+$ python3 scripts/finance_database_import.py --db data/market_pulse.sqlite --timeout 10 --exchanges NYQ,NMS,NGM,ASE,NCM,OQB,OQX,OBB,OEM
+rows: 9432
+raw coverage: 41 / 45 = 91.1%
+equity coverage excluding benchmark/ETF tickers: 41 / 42 = 97.6%
+missing equity ticker: IQST
+spot checks:
+  AAPL -> Information Technology / Technology Hardware & Equipment
+  MSFT -> Information Technology / Software & Services
+  NVDA -> Information Technology / Semiconductors & Semiconductor Equipment
+```
+
+NYSE calendar verification:
+
+```text
+$ .venv-bridges/bin/python scripts/generate_market_calendar.py --start 2019-01-01 --end 2028-12-31 --output data/reference/nyse_calendar_2019_2028.json
+sessions: 3653
+tradingDays: 2513
+halfDays: 20
+```
+
+Historical backtest sector basket smoke:
+
+```text
+$ node ... runHistoricalWalkForwardFromSqlite({ maxDates: 2, topN: 3, horizons: [1] })
+status: ok
+decisions: 6
+outcomes: 6
+sectorBasketStatuses: { sector_mapping_missing_bars: 6 }
+sectorBenchmarkReturnCount: 6
+securityMasterExtRows: 42
+```
+
+Persona verification:
+
+```text
+$ DEBATE_PERSONA_AGENT_IDS=damodaran_persona python3 -m harness --invoker mock debate --ticker NVDA
+schemaVersion: trading-agents-llm-v2; persona row: 达摩达兰故事估值纪律
+
+$ DEBATE_PERSONA_AGENT_IDS=graham_persona python3 -m harness --invoker mock debate --ticker NVDA
+schemaVersion: trading-agents-llm-v2; persona row: 格雷厄姆安全边际
+
+$ DEBATE_PERSONA_AGENT_IDS=munger_persona python3 -m harness --invoker mock debate --ticker NVDA
+schemaVersion: trading-agents-llm-v2; persona row: 芒格质量与激励
+
+$ DEBATE_PERSONA_AGENT_IDS=burry_persona python3 -m harness --invoker mock debate --ticker NVDA
+schemaVersion: trading-agents-llm-v2; persona row: Burry 逆向深度价值
+```
+
+Regression fixtures added or updated:
+
+- Sector basket mapping from FinanceDatabase `sector/industry_group` fields to XLB and XLK.
+- Historical walk-forward uses `security_master_ext` to attach sector basket metadata and `sectorBenchmarkReturnPct`.
+- Piotroski F-score exact 9-signal fixture.
+- Altman Z public-company formula fixture.
+- Generated NYSE reference calendar full-range comparison against rule-based calendar when the JSON exists.
+
+Contradictions:
+
+- FinanceDatabase equities do not classify benchmark/ETF tickers such as SPY/QQQ/SPCX. The importer reports raw coverage and equity-only coverage separately; equity coverage is 97.6% on the current corpus, while raw coverage is 91.1%.
+- The current historical corpus has SPY bars but no sector ETF bars such as XLK/XLF/XLV, so live SQLite backtest marks `sector_mapping_missing_bars`. Code support is complete; fully sectorized benchmark returns require adding sector ETF bars to `historical_bars`.
+- Production `pit_fundamentals` currently lacks enough AAPL/JPM/TSLA rows to verify exact Piotroski/Altman from real filings for all three names. Formula correctness is covered by hand-computed fixtures, and EDGAR extraction aliases were extended so future PIT sync can populate the required fields.

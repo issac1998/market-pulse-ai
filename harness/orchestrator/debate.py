@@ -1,4 +1,5 @@
 from ..agents.loader import load_agent
+from ..config import DEBATE_PERSONA_AGENT_IDS
 from ..runtime.loop import run_agent_loop
 from ..runtime.trace import utc_now_iso
 
@@ -58,13 +59,35 @@ def run_debate(ticker, ctx):
     final.setdefault("schemaVersion", "trading-agents-llm-v2")
     final.setdefault("framework", "Python harness 多轮 LLM 辩论（可选 agy-cli/codex-cli/mock），工具取证")
     final.setdefault("ticker", ticker)
-    final["traces"] = [bull.trace.to_dict(), bear.trace.to_dict(), risk.trace.to_dict(), coordinator.trace.to_dict()]
+    persona_rows = []
+    persona_traces = []
+    for persona_id in DEBATE_PERSONA_AGENT_IDS:
+        spec = load_agent(persona_id)
+        result = run_agent_loop(spec, {"ticker": ticker, "bull": bull.output, "bear": bear.output, "risk": risk.output}, ctx)
+        persona_rows.append(_agent_row("persona", spec.name, result))
+        persona_traces.append(result.trace.to_dict())
+    final["traces"] = [bull.trace.to_dict(), bear.trace.to_dict(), risk.trace.to_dict(), coordinator.trace.to_dict(), *persona_traces]
     if not final.get("agents"):
         final["agents"] = [
             _agent_row("bull", "多方研究员", bull),
             _agent_row("bear", "空方研究员", bear),
             _agent_row("risk", "风险经理", risk),
         ]
+    final["agents"].extend(persona_rows)
     if not final.get("debateRounds"):
         final["debateRounds"] = _fallback_payload(ticker, bull, bear, risk)["debateRounds"]
+    for row in persona_rows:
+        final["debateRounds"].append({
+            "title": row["name"],
+            "speaker": row["name"],
+            "stance": row["stance"],
+            "argument": row["view"],
+        })
+    if persona_rows:
+        final["personaConfig"] = {
+            "enabled": True,
+            "agentIds": DEBATE_PERSONA_AGENT_IDS,
+            "defaultOff": True,
+            "note": "Persona checklists are narrative-only and cannot override factor gates or risk vetoes.",
+        }
     return final
