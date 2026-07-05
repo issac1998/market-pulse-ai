@@ -28,6 +28,7 @@ import {
   outcomeIsUsable,
   pathExcursions,
   scoreRecommendationFromFactorSnapshot,
+  selectStarvationBackfillEvaluations,
   stockHistoryPricePath,
   winsorizeFactorSnapshots,
   winsorizeSeries,
@@ -801,6 +802,46 @@ const overlappingFactorStats = buildFactorStatsFromOutcomes([
 assert.equal(overlappingFactorStats.momentum.n, 3, "Factor stats should retain raw pooled n");
 assert.equal(overlappingFactorStats.momentum.effectiveN, 2, "Factor stats should report non-overlapping effectiveN by frozen decision");
 assert.ok(overlappingFactorStats.momentum.effectiveN < overlappingFactorStats.momentum.n, "effectiveN should be below raw n when horizons overlap");
+const backfillFactorStats = buildFactorStatsFromOutcomes([
+  {
+    decisionId: "normal-1",
+    ticker: "AAA",
+    horizonDays: 1,
+    excessPct: 1.2,
+    trackingReason: "",
+    outcome: "win",
+    factorSnapshot: { factors: { momentum: { label: "Momentum", score: 65 } } },
+  },
+  {
+    decisionId: "backfill-1",
+    ticker: "BBB",
+    horizonDays: 1,
+    excessPct: -0.8,
+    trackingReason: "starvation-backfill",
+    outcome: "loss",
+    factorSnapshot: { factors: { momentum: { label: "Momentum", score: 35 } } },
+  },
+]);
+assert.equal(backfillFactorStats.momentum.trackingReasonSplit.primary.n, 1, "Factor stats should count primary samples by tracking reason");
+assert.equal(
+  backfillFactorStats.momentum.trackingReasonSplit["starvation-backfill"].n,
+  1,
+  "Factor stats should count starvation backfill samples by tracking reason",
+);
+const starvationBackfill = selectStarvationBackfillEvaluations(
+  [
+    { ticker: "HELD", actionScore: 90, alphaScore: 80, dataQualityScore: 70, hasPosition: true },
+    { ticker: "COOL", actionScore: 99, alphaScore: 95, dataQualityScore: 90, actionability: { gates: [{ id: "ticker_cooldown" }] } },
+    { ticker: "LOWDQ", actionScore: 98, alphaScore: 85, dataQualityScore: 20 },
+    { ticker: "FREE", actionScore: 75, alphaScore: 70, dataQualityScore: 65 },
+  ],
+  { minNeeded: 2, minDataQuality: 42, existingTickers: ["OLD"] },
+);
+assert.deepEqual(
+  starvationBackfill.map((item) => item.ticker),
+  ["HELD", "FREE"],
+  "Starvation backfill should include held positions, skip cooldowns and low-DQ rows, and sort by actionScore",
+);
 const adjacentHorizonStats = buildFactorStatsFromOutcomes(
   Array.from({ length: 5 }, (_, index) => ({
     decisionId: `adjacent-${index}`,

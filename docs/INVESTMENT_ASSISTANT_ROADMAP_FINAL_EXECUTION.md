@@ -1346,6 +1346,87 @@ Contradictions:
 
 ---
 
+## WP24 — Sample-Accrual Guarantee — 2026-07-05
+
+Implemented Round 4 WP24.
+
+Changes:
+
+- Added `MIN_TRACKED_DECISIONS_PER_RUN` with default `5` and exposed it under `config.allStockAgent.minTrackedDecisionsPerRun`.
+- Added starvation backfill selection:
+  - after normal buy decisions are frozen, the agent fills any tracking shortfall from remaining evaluations by `actionScore`;
+  - candidates must meet `minDataQuality`;
+  - ticker cooldown and failed-thesis cooldown still suppress re-logging;
+  - held positions are allowed into the backfill pool because their signals are still useful training samples.
+- Backfill decisions are frozen as:
+  - `actionable:false`
+  - `status:"open"`
+  - `trackingEligible:true`
+  - `trackingReason:"starvation-backfill"`
+  - `hasPosition/hasAgentPosition/hasRealPosition` carried from the evaluation.
+- Paper book and Today actionable paths remain unchanged because they already require actionable decisions.
+- Outcome snapshots now preserve `trackingReason`, `actionable`, and `decisionStatus`.
+- Factor stats now expose `trackingReasonSplit` with `n/samples`, wins/losses/flats, and average excess return, so backfill samples are distinguishable from primary samples once outcomes mature.
+- Run summaries now include:
+  - `trackedDecisions`
+  - `starvationBackfill`
+  - `minTrackedDecisions`
+  - `consecutiveZeroTrackedDays`
+- Added a high-severity `all_stock_agent.zero_tracked` alert path for 3 consecutive zero-tracked runs.
+- Regenerated route inventory; route count remains 81.
+
+Verification:
+
+```text
+$ node --check server.mjs
+pass
+
+$ node --check lib/recommender_core.mjs
+pass
+
+$ node --check scripts/core_regression_tests.mjs
+pass
+
+$ node --check public/app.js
+pass
+
+$ node scripts/core_regression_tests.mjs
+core_regression_tests: ok
+
+$ node scripts/generate_route_inventory.mjs && node scripts/generate_route_inventory.mjs --check
+{"status":"ok","routes":81,"uiFetches":43,"storeKeys":26}
+{"status":"ok","routes":81,"uiFetches":43,"storeKeys":26}
+```
+
+Run-level check against the current store with prefetch disabled:
+
+```text
+$ PORT=5199 HOST=127.0.0.1 INTRADAY_WATCHER_ENABLED=false AGENT_DEBATE_DAILY_ENABLED=false FACTOR_RESEARCHER_ENABLED=false ALL_STOCK_AGENT_PREFETCH_ENABLED=false MIN_TRACKED_DECISIONS_PER_RUN=5 node server.mjs
+Market Pulse AI running at http://127.0.0.1:5199
+
+$ curl -m 120 -X POST http://127.0.0.1:5199/api/all-stock-agent/run
+trackedDecisions: 5
+starvationBackfill: 5
+buyCount: 5
+backfillCount: 5
+actionableBuy: 0
+paperOpenPositions: 0
+backfillInPaper: 0
+backfillActionable: 0
+```
+
+Regression fixtures added:
+
+- `selectStarvationBackfillEvaluations()` includes held positions, skips cooldown rows and low-DQ rows, and sorts by `actionScore`.
+- `buildFactorStatsFromOutcomes()` records `trackingReasonSplit.primary.n` and `trackingReasonSplit["starvation-backfill"].n`.
+
+Contradictions:
+
+- Full Agent verification with prefetch enabled did not return within a 240-second curl budget and wrote no new run. The WP24 backfill path was verified with the current store and `ALL_STOCK_AGENT_PREFETCH_ENABLED=false`; the slow prefetch path is an operational latency issue separate from the sample-accrual logic.
+- The live run cannot show `factorStats.trackingReasonSplit["starvation-backfill"]` until a backfill decision reaches an outcome horizon. The split is implemented and covered by a regression fixture.
+
+---
+
 ## WP22 — Save Path & Store Performance — 2026-07-05
 
 Implemented Round 4 WP22.

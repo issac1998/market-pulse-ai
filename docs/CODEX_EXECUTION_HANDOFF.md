@@ -287,7 +287,7 @@ The system silently served June-30 data as "today's" content for five days. Fres
 - **W4 — deadline-aware LLM budgets for scheduled runs**: pre-market runs must finish before the open. Scheduled (not manual) runs use a per-stage LLM ceiling (`SCHEDULE_LLM_STAGE_TIMEOUT_MS`, default 90 s; local fallback beyond) instead of the interactive `LLM_FULL_REPORT_TIMEOUT_MS=600 s` — a hung provider currently delays the morning report by 10+ minutes per stage.
 - **Verify**: restart the server across a missed scheduled time → catch-up run fires with `trigger:"catch-up"` + alert row; simulate a 3-day-old newest run → red Today banner and agent downgrades all buys with `stale_source_run`; scheduled-run LLM stages observed ≤ 90 s in audit timings.
 
-## ☐ WP24 — Sample-accrual guarantee (settings that starve the learning loop)
+## ☑ WP24 — Sample-accrual guarantee (settings that starve the learning loop)
 
 Even after WP1, live evidence shows **0 tracked buy decisions on recent runs**: every top scorer is either a held position (`allowAddToExisting=false` excludes it from `buyEligible` entirely) or stale-data-vetoed. Quiet/stale days produce zero outcome samples — the single biggest discount on the final outcome, because the learning loop cannot earn authority without samples.
 

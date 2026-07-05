@@ -41,6 +41,7 @@ import {
   outcomeIsUsable as recommendationOutcomeIsUsable,
   pathExcursions,
   scoreRecommendationFromFactorSnapshot,
+  selectStarvationBackfillEvaluations,
   stockHistoryPricePath as recommenderStockHistoryPricePath,
 } from "./lib/recommender_core.mjs";
 import {
@@ -1138,6 +1139,7 @@ const SCHEDULE_LLM_STAGE_TIMEOUT_MS = Math.max(15000, Number(process.env.SCHEDUL
 const ALL_STOCK_AGENT_ENABLED = parseBoolean(process.env.ALL_STOCK_AGENT_ENABLED, true);
 const AGENT_MAX_SOURCE_AGE_HOURS = Math.max(1, Number(process.env.AGENT_MAX_SOURCE_AGE_HOURS || 36));
 const ALL_STOCK_AGENT_BUY_LIMIT = Math.max(1, Number(process.env.ALL_STOCK_AGENT_BUY_LIMIT || 10));
+const MIN_TRACKED_DECISIONS_PER_RUN = Math.max(0, Number(process.env.MIN_TRACKED_DECISIONS_PER_RUN || 5));
 const ALL_STOCK_AGENT_UNIVERSE_LIMIT = Math.max(20, Number(process.env.ALL_STOCK_AGENT_UNIVERSE_LIMIT || 180));
 const ALL_STOCK_AGENT_DECISION_LIMIT = Math.max(100, Number(process.env.ALL_STOCK_AGENT_DECISION_LIMIT || 1200));
 const ALL_STOCK_AGENT_RUN_LIMIT = Math.max(10, Number(process.env.ALL_STOCK_AGENT_RUN_LIMIT || 90));
@@ -11122,6 +11124,37 @@ function appendMissedScheduleAlert(db = {}, due = {}) {
     elapsedMinutes: due.elapsedMinutes,
     catchUpMinutes: SCHEDULE_CATCH_UP_MINUTES,
   }, "warn", "scheduler");
+}
+
+function appendAllStockAgentZeroTrackedAlert(db = {}, agentRun = {}) {
+  const runId = agentRun.id || nowIso();
+  const alertKey = `all-stock-agent-zero-tracked:${runId}`;
+  const exists = (db.alerts || []).some((alert) => alert.alertKey === alertKey || alert.storyFingerprint === alertKey);
+  if (!exists) {
+    db.alerts = [
+      {
+        id: compactId("agent-starvation-alert"),
+        alertKey,
+        storyFingerprint: alertKey,
+        createdAt: nowIso(),
+        severity: "high",
+        ticker: "MKT",
+        title: "候选池 Agent 连续缺少追踪样本",
+        detail: `候选池 Agent 已连续 ${agentRun.summary?.consecutiveZeroTrackedDays || 3} 次没有可追踪买入样本；需要检查数据源、冷却期或阈值配置。`,
+        evidenceIds: ["all_stock_agent_zero_tracked", runId],
+        status: "active",
+        catalystClass: "agent_health",
+        novelty: "new",
+        score: 88,
+      },
+      ...(db.alerts || []),
+    ].slice(0, 300);
+  }
+  appendAuditEvent(db, "all_stock_agent.zero_tracked", {
+    runId,
+    trackedDecisions: agentRun.summary?.trackedDecisions || 0,
+    consecutiveZeroTrackedDays: agentRun.summary?.consecutiveZeroTrackedDays || 0,
+  }, "warn", "all-stock-agent");
 }
 
 function nextScheduledRuns(limit = 2) {
@@ -22673,7 +22706,79 @@ function allStockAgentDecisionFromEvaluation(evaluation, action, runId, trigger)
     positionReturnPct: evaluation.positionReturnPct,
     status: action === "买入" ? (isFallbackBuy ? "watch-buy" : "open") : "close-signal",
     thresholdMet: !isFallbackBuy,
+    trackingReason: evaluation.trackingReason || "",
+    hasPosition: Boolean(evaluation.hasPosition),
+    hasAgentPosition: Boolean(evaluation.hasAgentPosition),
+    hasRealPosition: Boolean(evaluation.hasRealPosition),
   };
+}
+
+function allStockAgentResearchTrackingGate(reason = "starvation_backfill") {
+  return {
+    id: reason,
+    label: "研究样本补足追踪",
+    action: "downgrade_research",
+    evidence: "本轮正式买入追踪样本不足；该标的只作为研究追踪样本，不进入纸面组合或今日可执行列表。",
+  };
+}
+
+function allStockAgentBackfillDecisionFromEvaluation(evaluation = {}, runId = "", trigger = "") {
+  const gate = allStockAgentResearchTrackingGate("starvation_backfill");
+  const adjusted = {
+    ...evaluation,
+    buyEligible: false,
+    trackingEligible: true,
+    actionableEligible: false,
+    trackingReason: "starvation-backfill",
+    actionability: {
+      ...(evaluation.actionability || {}),
+      eligible: false,
+      status: "research",
+      gates: [...(evaluation.actionability?.gates || []), gate],
+    },
+    gates: [...(evaluation.gates || []), gate],
+    risks: [
+      `${gate.label}：${gate.evidence}`,
+      ...(evaluation.risks || []),
+    ].slice(0, 7),
+  };
+  const decision = allStockAgentDecisionFromEvaluation(adjusted, "买入", runId, trigger);
+  return {
+    ...decision,
+    actionable: false,
+    status: "open",
+    thresholdMet: true,
+    trackingEligible: true,
+    trackingReason: "starvation-backfill",
+    hasPosition: Boolean(evaluation.hasPosition),
+    hasAgentPosition: Boolean(evaluation.hasAgentPosition),
+    hasRealPosition: Boolean(evaluation.hasRealPosition),
+  };
+}
+
+function allStockAgentTrackedBuyDecisionCount(decisions = []) {
+  return (decisions || []).filter((decision) =>
+    decision?.action === "买入" &&
+    allStockAgentDecisionTracksOutcome(decision) &&
+    decision.trackingEligible !== false
+  ).length;
+}
+
+function allStockAgentRunTrackedDecisionCount(run = {}) {
+  const reported = numberOrNull(run.summary?.trackedDecisions);
+  if (Number.isFinite(reported)) return reported;
+  return allStockAgentTrackedBuyDecisionCount(run.buyCandidates || []);
+}
+
+function allStockAgentConsecutiveZeroTrackedRuns(previousRuns = [], currentTracked = 0) {
+  if (currentTracked > 0) return 0;
+  let count = 1;
+  for (const run of previousRuns || []) {
+    const tracked = allStockAgentRunTrackedDecisionCount(run);
+    if (tracked > 0) break;
+    count += 1;
+  }
+  return count;
 }
 
 function allStockAgentSupplementalBuyAllowed(evaluation = {}, skill = {}) {
@@ -23079,6 +23184,9 @@ function buildAllStockAgentOutcomeSnapshots(state = {}, run = {}, db = {}, skill
         decisionAt,
         strategyVersion: decision.strategyVersion || decision.modelVersion || "",
         strategyConfigHash: decision.strategyConfigHash || "",
+        trackingReason: decision.trackingReason || "",
+        actionable: decision.actionable !== false,
+        decisionStatus: decision.status || "",
         regime: decision.regime || allStockAgentRegimeTagFromSnapshot(decision.factorSnapshot || {}).bucket,
         regimeTag: decision.regimeTag || allStockAgentRegimeTagFromSnapshot(decision.factorSnapshot || {}),
         horizonDays,
@@ -23784,7 +23892,7 @@ async function runAllStockAgentForRun(db, sourceRun, trigger = "manual", options
     (item) => item.buyEligible && !allStockAgentDecisionLogSuppressed(item),
   );
   let actionableCount = 0;
-  const buyDecisions = primaryBuyPool
+  let buyDecisions = primaryBuyPool
     .slice(0, buyLimit)
     .map((item) => {
       const canBeActionable = item.actionableEligible === true && actionableCount < actionableBuyLimit;
@@ -23814,6 +23922,20 @@ async function runAllStockAgentForRun(db, sourceRun, trigger = "manual", options
       };
       return allStockAgentDecisionFromEvaluation(capped, "买入", agentRunId, trigger);
     });
+  const trackedBeforeBackfill = allStockAgentTrackedBuyDecisionCount(buyDecisions);
+  const backfillNeeded = Math.max(0, MIN_TRACKED_DECISIONS_PER_RUN - trackedBeforeBackfill);
+  const starvationBackfillEvaluations = selectStarvationBackfillEvaluations(evaluations, {
+    minNeeded: backfillNeeded,
+    minDataQuality: numberOrNull(skill.settings?.minDataQuality) ?? 42,
+    existingTickers: buyDecisions.map((item) => item.ticker),
+  });
+  const starvationBackfillDecisions = starvationBackfillEvaluations
+    .map((item) => allStockAgentBackfillDecisionFromEvaluation(item, agentRunId, trigger));
+  if (starvationBackfillDecisions.length) {
+    buyDecisions = [...buyDecisions, ...starvationBackfillDecisions];
+  }
+  const trackedDecisions = allStockAgentTrackedBuyDecisionCount(buyDecisions);
+  const consecutiveZeroTrackedDays = allStockAgentConsecutiveZeroTrackedRuns(state.runs || [], trackedDecisions);
   const buyDecisionTickers = new Set(buyDecisions.map((item) => item.ticker));
   const watchBuyCandidates = evaluations
     .filter((item) => !buyDecisionTickers.has(item.ticker))
@@ -23881,6 +24003,10 @@ async function runAllStockAgentForRun(db, sourceRun, trigger = "manual", options
       newOutcomes: outcomeUpdate.added,
       skillChanges: skillUpdate.revision?.changes?.length || 0,
       trackedBuyLimit: buyLimit,
+      minTrackedDecisions: MIN_TRACKED_DECISIONS_PER_RUN,
+      trackedDecisions,
+      starvationBackfill: starvationBackfillDecisions.length,
+      consecutiveZeroTrackedDays,
       actionableBuyLimit,
       actionableBuy: buyDecisions.filter((item) => item.actionable !== false).length,
       researchDowngraded: buyDecisions.filter((item) => item.actionable === false || item.actionability?.status === "research").length,
@@ -24029,9 +24155,15 @@ async function runAllStockAgentForRun(db, sourceRun, trigger = "manual", options
     strategyVersion: strategyVersion.id,
     regime: regimeTag.bucket,
     buy: buyDecisions.length,
+    trackedDecisions,
+    starvationBackfill: starvationBackfillDecisions.length,
+    consecutiveZeroTrackedDays,
     watchBuy: watchBuyCandidates.length,
     sell: sellDecisions.length,
   });
+  if (consecutiveZeroTrackedDays >= 3) {
+    appendAllStockAgentZeroTrackedAlert(db, agentRun);
+  }
   if (options.scheduleKey) db.scheduleLog[options.scheduleKey] = agentRun.id;
   await saveStore(db);
   return agentRun;
@@ -38234,6 +38366,7 @@ function configForClient(db) {
       buyLimit: ALL_STOCK_AGENT_BUY_LIMIT,
       universeLimit: ALL_STOCK_AGENT_UNIVERSE_LIMIT,
       maxSourceAgeHours: AGENT_MAX_SOURCE_AGE_HOURS,
+      minTrackedDecisionsPerRun: MIN_TRACKED_DECISIONS_PER_RUN,
       shadowDebateDaily: {
         enabled: AGENT_DEBATE_DAILY_ENABLED,
         newYorkTime: AGENT_DEBATE_DAILY_NEW_YORK_TIME,
