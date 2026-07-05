@@ -262,7 +262,7 @@ The missing piece found in review: `admissionEvidenceForFactor` (server/factor_r
 - **S3 — gzip responses**: `sendJson`/static serving negotiate `Accept-Encoding` and gzip payloads > 64 KB (Node `zlib`). `/api/state` is 25.9 MB raw and JSON compresses ~8–10×; this is the single cheapest UX win in the repo.
 - **Verify**: request from another interface refused by default; 3 MB POST → 413; `curl -H 'Accept-Encoding: gzip' /api/state` returns `Content-Encoding: gzip` with size < 4 MB; UI loads normally.
 
-## ☐ WP22 — Save-path & store performance (the event-loop stalls)
+## ☑ WP22 — Save-path & store performance (the event-loop stalls)
 
 Every store mutation currently costs: structuredClone(full store) + stringify-pretty(full store) + full-payload string compare + rewrite of all run archives + a 2.9 s Python full re-sync. With the watcher enabled (2-min ticks that call `saveStore` even when nothing fired) this repeats all day.
 

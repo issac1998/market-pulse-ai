@@ -148,13 +148,17 @@ const RUN_ARCHIVE_ENABLED = parseBoolean(process.env.RUN_ARCHIVE_ENABLED, true);
 const RUN_ARCHIVE_DIR = path.join(DATA_DIR, process.env.RUN_ARCHIVE_DIR || "runs");
 const RUN_INLINE_FULL_LIMIT = Math.max(1, Number(process.env.RUN_INLINE_FULL_LIMIT || 6));
 const STORE_SIZE_WARN_BYTES = Math.max(1024 * 1024, Number(process.env.STORE_SIZE_WARN_BYTES || 80 * 1024 * 1024));
+const STORE_PRETTY_JSON = parseBoolean(process.env.STORE_PRETTY_JSON, false);
 const SQLITE_MIRROR_ENABLED = parseBoolean(process.env.SQLITE_MIRROR_ENABLED, true);
 const SQLITE_DB_FILE = path.join(DATA_DIR, process.env.SQLITE_DB_FILE || "market_pulse.sqlite");
 const SQLITE_SYNC_SCRIPT = path.join(__dirname, process.env.SQLITE_SYNC_SCRIPT || "scripts/sqlite_store_sync.py");
 const SQLITE_SYNC_PYTHON = process.env.SQLITE_SYNC_PYTHON || "python3";
 const SQLITE_SYNC_TIMEOUT_MS = Number(process.env.SQLITE_SYNC_TIMEOUT_MS || 120000);
 const SQLITE_MIRROR_AUTO_SYNC = parseBoolean(process.env.SQLITE_MIRROR_AUTO_SYNC, true);
+const SQLITE_MIRROR_INCREMENTAL_SYNC = parseBoolean(process.env.SQLITE_MIRROR_INCREMENTAL_SYNC, true);
 const SQLITE_MIRROR_SAVE_DEBOUNCE_MS = Number(process.env.SQLITE_MIRROR_SAVE_DEBOUNCE_MS || 5000);
+const HISTORICAL_BACKTEST_WORKER_SCRIPT = path.join(__dirname, "scripts", "historical_backtest_worker.mjs");
+const HISTORICAL_BACKTEST_WORKER_TIMEOUT_MS = Number(process.env.HISTORICAL_BACKTEST_WORKER_TIMEOUT_MS || 15 * 60 * 1000);
 const DEFAULT_COLLECTOR_TIMEOUT_MS = Number(process.env.COLLECTOR_TIMEOUT_MS || 300000);
 const COLLECTOR_TIMEOUTS = parseCollectorTimeouts(
   process.env.COLLECTOR_TIMEOUTS ||
@@ -1177,7 +1181,9 @@ let sqliteMirrorTimer = null;
 let sqliteMirrorLastResult = null;
 let storeCache = null;
 let storeCacheMtimeMs = 0;
-let storeLastSavedPayload = "";
+let storeLastSavedHash = "";
+let sqliteMirrorLastWatermark = "";
+const runArchiveContentHashes = new Map();
 let storePersistenceStatus = {
   status: "unknown",
   payloadBytes: 0,
@@ -1243,6 +1249,10 @@ function sha256Text(value = "") {
 
 function hashObject(value) {
   return sha256Text(stableJson(value));
+}
+
+function stringifyPersistedJson(value) {
+  return STORE_PRETTY_JSON ? JSON.stringify(value, null, 2) : JSON.stringify(value);
 }
 
 function collectorTimeoutForSource(source) {
@@ -3396,9 +3406,82 @@ function sanitizeAllStockAgentRun(run = {}) {
   };
 }
 
-function compactRunForStore(run = {}) {
+function compactAllStockAgentRunForSave(run = {}, index = 0) {
+  if (!run || typeof run !== "object" || index < 3) return run;
   return {
     ...run,
+    evaluations: [],
+    evaluationCount: Array.isArray(run.evaluations) ? run.evaluations.length : run.evaluationCount || 0,
+    summaryOnlyEvaluations: true,
+  };
+}
+
+function compactAllStockAgentStateForSave(value = {}) {
+  const state = normalizeAllStockAgentState(value);
+  return {
+    ...state,
+    runs: state.runs.map(compactAllStockAgentRunForSave),
+  };
+}
+
+function trimArrayTail(value, limit) {
+  return Array.isArray(value) && value.length > limit ? value.slice(-limit) : value;
+}
+
+function compactTechnicalForStore(technical = {}) {
+  if (!technical || typeof technical !== "object") return technical;
+  const next = { ...technical };
+  for (const key of ["bars", "candles", "history", "priceHistory", "ohlc"]) {
+    if (Array.isArray(next[key])) next[key] = trimArrayTail(next[key], 60);
+  }
+  return next;
+}
+
+function compactSocialHotRows(rows = []) {
+  const seen = new Set();
+  return (Array.isArray(rows) ? rows : []).filter((row) => {
+    const key = String(row?.id || row?.postId || row?.url || row?.link || `${row?.ticker || ""}:${row?.source || ""}:${row?.title || row?.hotReason || ""}`);
+    if (!key || seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  });
+}
+
+function compactStockNarrativesForStore(stockNarratives = {}, { keepFullText = true } = {}) {
+  if (!stockNarratives || typeof stockNarratives !== "object") return stockNarratives;
+  if (keepFullText) return stockNarratives;
+  return {
+    ...stockNarratives,
+    items: (stockNarratives.items || []).map((item) => ({
+      ticker: item.ticker,
+      companyName: item.companyName,
+      oneLine: item.oneLine,
+      investmentAngle: item.investmentAngle,
+      newsCatalyst: item.newsCatalyst,
+      socialReason: item.socialReason,
+      technicalView: item.technicalView,
+      riskNotes: Array.isArray(item.riskNotes) ? item.riskNotes.slice(0, 3) : item.riskNotes,
+      validationSteps: Array.isArray(item.validationSteps) ? item.validationSteps.slice(0, 3) : item.validationSteps,
+      provider: item.provider,
+      generatedAt: item.generatedAt,
+      summaryOnly: true,
+    })),
+  };
+}
+
+function compactRunForStore(run = {}, options = {}) {
+  const keepNarrativeFullText = options.keepNarrativeFullText !== false;
+  return {
+    ...run,
+    technicals: Array.isArray(run.technicals) ? run.technicals.map(compactTechnicalForStore) : [],
+    stockNarratives: compactStockNarrativesForStore(run.stockNarratives, { keepFullText: keepNarrativeFullText }),
+    socialHotStocks: run.socialHotStocks
+      ? {
+          ...run.socialHotStocks,
+          rising: compactSocialHotRows(run.socialHotStocks.rising),
+          candidates: compactSocialHotRows(run.socialHotStocks.candidates),
+        }
+      : run.socialHotStocks,
     options: Array.isArray(run.options) ? run.options.map(compactOptionChainForCache) : [],
   };
 }
@@ -3465,7 +3548,20 @@ async function archiveRuns(runs = []) {
     fullRuns.map(async (run) => {
       const file = runArchivePath(run.id);
       if (!file) return;
-      await writeFile(file, JSON.stringify(compactRunForStore(run), null, 2), "utf8");
+      const payload = stringifyPersistedJson(compactRunForStore(run, { keepNarrativeFullText: true }));
+      const hash = sha256Text(payload);
+      let existingHash = runArchiveContentHashes.get(run.id);
+      if (!existingHash && existsSync(file)) {
+        try {
+          existingHash = sha256Text(await readFile(file, "utf8"));
+          runArchiveContentHashes.set(run.id, existingHash);
+        } catch {
+          existingHash = "";
+        }
+      }
+      if (existingHash === hash) return;
+      await writeFile(file, payload, "utf8");
+      runArchiveContentHashes.set(run.id, hash);
     }),
   );
 }
@@ -3487,7 +3583,9 @@ function compactStoreForSave(db = {}) {
   return {
     ...db,
     runs: runs.map((run, index) =>
-      index < RUN_INLINE_FULL_LIMIT || run.summaryOnly ? (run.summaryOnly ? run : compactRunForStore(run)) : compactRunSummaryForStore(run),
+      index < RUN_INLINE_FULL_LIMIT || run.summaryOnly
+        ? (run.summaryOnly ? run : compactRunForStore(run, { keepNarrativeFullText: index < 3 }))
+        : compactRunSummaryForStore(run),
     ),
     chat: Array.isArray(db.chat) ? db.chat.slice(-80) : [],
     alerts: Array.isArray(db.alerts) ? db.alerts.slice(0, 200) : [],
@@ -3501,7 +3599,7 @@ function compactStoreForSave(db = {}) {
     intradayExplain: db.intradayExplain && typeof db.intradayExplain === "object" ? db.intradayExplain : {},
     auditEvents: normalizeAuditEvents(db.auditEvents),
     ibkrPortalFeed: normalizeIbkrPortalFeed(db.ibkrPortalFeed),
-    allStockAgent: normalizeAllStockAgentState(db.allStockAgent),
+    allStockAgent: compactAllStockAgentStateForSave(db.allStockAgent),
     factorRegistry: normalizeFactorRegistry(db.factorRegistry),
   };
 }
@@ -3773,7 +3871,7 @@ async function ensureStore() {
     };
     storeCache = cloneStoreValue(normalized);
     storeCacheMtimeMs = fileStat.mtimeMs;
-    storeLastSavedPayload = raw;
+    storeLastSavedHash = sha256Text(raw);
     updateStorePersistenceStatus({
       status: "loaded",
       payloadBytes: Buffer.byteLength(raw, "utf8"),
@@ -3820,20 +3918,25 @@ async function ensureStore() {
 
 async function saveStore(db) {
   await archiveRuns(db.runs || []);
-  const payload = JSON.stringify(compactStoreForSave(db), null, 2);
+  const started = Date.now();
+  const payload = stringifyPersistedJson(compactStoreForSave(db));
   const payloadBytes = Buffer.byteLength(payload, "utf8");
+  const payloadHash = sha256Text(payload);
   const writeTask = saveQueue.then(async () => {
     await mkdir(DATA_DIR, { recursive: true });
     storeCache = cloneStoreValue(db);
     updateStorePersistenceStatus({
       status: "pending",
       payloadBytes,
+      payloadHash,
     });
-    if (storeLastSavedPayload === payload) {
+    if (storeLastSavedHash === payloadHash) {
       updateStorePersistenceStatus({
         status: "skipped-clean",
         payloadBytes,
+        payloadHash,
         lastSkippedAt: nowIso(),
+        lastSaveMs: Date.now() - started,
       });
       return;
     }
@@ -3842,12 +3945,14 @@ async function saveStore(db) {
     await rename(temp, DB_FILE);
     const fileStat = await stat(DB_FILE);
     storeCacheMtimeMs = fileStat.mtimeMs;
-    storeLastSavedPayload = payload;
+    storeLastSavedHash = payloadHash;
     updateStorePersistenceStatus({
       status: "saved",
       payloadBytes,
+      payloadHash,
       lastSavedAt: nowIso(),
       mtimeMs: fileStat.mtimeMs,
+      lastSaveMs: Date.now() - started,
     });
     scheduleSqliteMirrorSync();
   });
@@ -3861,8 +3966,9 @@ function scheduleSqliteMirrorSync() {
   sqliteMirrorTimer = setTimeout(() => {
     sqliteMirrorTimer = null;
     sqliteMirrorQueue = sqliteMirrorQueue.then(async () => {
-      const result = await runSqliteStoreSync(false);
+      const result = await runSqliteStoreSync(false, { incremental: SQLITE_MIRROR_INCREMENTAL_SYNC });
       sqliteMirrorLastResult = { ...result, syncedAt: nowIso() };
+      if (result.status === "ok" && result.watermark) sqliteMirrorLastWatermark = result.watermark;
       return result;
     });
     sqliteMirrorQueue = sqliteMirrorQueue.catch((error) => {
@@ -3880,7 +3986,7 @@ function scheduleSqliteMirrorSync() {
   sqliteMirrorTimer.unref?.();
 }
 
-async function runSqliteStoreSync(statusOnly = false) {
+async function runSqliteStoreSync(statusOnly = false, options = {}) {
   if (!SQLITE_MIRROR_ENABLED) {
     return {
       status: "disabled",
@@ -3905,6 +4011,7 @@ async function runSqliteStoreSync(statusOnly = false) {
     SQLITE_DB_FILE,
   ];
   if (statusOnly) args.push("--status");
+  if (!statusOnly && options.incremental && sqliteMirrorLastWatermark) args.push("--since", sqliteMirrorLastWatermark);
   try {
     const payload = await runJsonCli(SQLITE_SYNC_PYTHON, args, SQLITE_SYNC_TIMEOUT_MS);
     return {
@@ -3924,6 +4031,26 @@ async function runSqliteStoreSync(statusOnly = false) {
       error: error.message,
     };
   }
+}
+
+async function runHistoricalBacktestOffThread(config = {}) {
+  if (!existsSync(HISTORICAL_BACKTEST_WORKER_SCRIPT)) {
+    return runHistoricalWalkForwardFromSqlite({
+      sqlitePath: SQLITE_DB_FILE,
+      config,
+    });
+  }
+  return runJsonCli(
+    process.execPath,
+    [
+      HISTORICAL_BACKTEST_WORKER_SCRIPT,
+      "--sqlite",
+      SQLITE_DB_FILE,
+      "--configJson",
+      JSON.stringify(config),
+    ],
+    Math.max(HISTORICAL_BACKTEST_WORKER_TIMEOUT_MS, Number(config.workerTimeoutMs || 0)),
+  );
 }
 
 function ibkrCpUrl(pathname, params = {}) {
@@ -37783,11 +37910,14 @@ function configForClient(db) {
     storage: {
       primary: "JSON",
       storeFile: path.relative(__dirname, DB_FILE),
+      prettyJson: STORE_PRETTY_JSON,
       status: storePersistenceStatus,
       warningThresholdBytes: STORE_SIZE_WARN_BYTES,
       sqliteMirror: {
         enabled: SQLITE_MIRROR_ENABLED,
         autoSync: SQLITE_MIRROR_AUTO_SYNC,
+        incrementalSync: SQLITE_MIRROR_INCREMENTAL_SYNC,
+        lastWatermark: sqliteMirrorLastWatermark,
         dbFile: path.relative(__dirname, SQLITE_DB_FILE),
         syncScript: path.relative(__dirname, SQLITE_SYNC_SCRIPT),
         timeoutMs: SQLITE_SYNC_TIMEOUT_MS,
@@ -38625,30 +38755,29 @@ async function handleApi(req, res, url) {
   if (req.method === "POST" && url.pathname === "/api/recommender/historical-backtest") {
     const body = await readBody(req);
     try {
-      const result = await runHistoricalWalkForwardFromSqlite({
-        sqlitePath: SQLITE_DB_FILE,
-        config: {
-          startDate: body.startDate || url.searchParams.get("startDate"),
-          endDate: body.endDate || url.searchParams.get("endDate"),
-          maxTickers: body.maxTickers || url.searchParams.get("maxTickers"),
-          maxDates: body.maxDates || url.searchParams.get("maxDates"),
-          topN: body.topN || url.searchParams.get("topN"),
-          minLookback: body.minLookback || url.searchParams.get("minLookback"),
-          horizons: Array.isArray(body.horizons)
-            ? body.horizons
-            : String(body.horizons || url.searchParams.get("horizons") || "")
-                .split(",")
-                .map((item) => item.trim())
-                .filter(Boolean),
-          primaryHorizon: body.primaryHorizon || url.searchParams.get("primaryHorizon"),
-          costBps: body.costBps || url.searchParams.get("costBps"),
-          slippageBps: body.slippageBps || url.searchParams.get("slippageBps"),
-          sqliteTimeoutMs: body.sqliteTimeoutMs || url.searchParams.get("sqliteTimeoutMs"),
-          bridgeTimeoutMs: body.bridgeTimeoutMs || url.searchParams.get("bridgeTimeoutMs"),
-          detailLimit: body.detailLimit || url.searchParams.get("detailLimit"),
-          compactResponse: body.compactResponse === false || url.searchParams.get("compactResponse") === "false" ? false : true,
-        },
-      });
+      const historicalConfig = {
+        startDate: body.startDate || url.searchParams.get("startDate"),
+        endDate: body.endDate || url.searchParams.get("endDate"),
+        maxTickers: body.maxTickers || url.searchParams.get("maxTickers"),
+        maxDates: body.maxDates || url.searchParams.get("maxDates"),
+        topN: body.topN || url.searchParams.get("topN"),
+        minLookback: body.minLookback || url.searchParams.get("minLookback"),
+        horizons: Array.isArray(body.horizons)
+          ? body.horizons
+          : String(body.horizons || url.searchParams.get("horizons") || "")
+              .split(",")
+              .map((item) => item.trim())
+              .filter(Boolean),
+        primaryHorizon: body.primaryHorizon || url.searchParams.get("primaryHorizon"),
+        costBps: body.costBps || url.searchParams.get("costBps"),
+        slippageBps: body.slippageBps || url.searchParams.get("slippageBps"),
+        sqliteTimeoutMs: body.sqliteTimeoutMs || url.searchParams.get("sqliteTimeoutMs"),
+        bridgeTimeoutMs: body.bridgeTimeoutMs || url.searchParams.get("bridgeTimeoutMs"),
+        workerTimeoutMs: body.workerTimeoutMs || url.searchParams.get("workerTimeoutMs"),
+        detailLimit: body.detailLimit || url.searchParams.get("detailLimit"),
+        compactResponse: body.compactResponse === false || url.searchParams.get("compactResponse") === "false" ? false : true,
+      };
+      const result = await runHistoricalBacktestOffThread(historicalConfig);
       const db = await ensureStore();
       const historicalRunForStore = compactHistoricalRun(result.run, { detailLimit: 20 });
       db.historicalBacktests = [historicalRunForStore, ...(db.historicalBacktests || []).filter((item) => item.id !== result.run.id)].slice(0, 50);
@@ -40692,10 +40821,16 @@ async function runIntradayWatcherAndSave(options = {}) {
     options,
   );
   for (const event of result.auditEvents || []) appendAuditEventRecord(db, event);
-  if (result.status !== "disabled" && result.status !== "outside_market_window") {
+  const changed =
+    (result.alerts || []).length ||
+    (result.consensusSnapshots || []).length ||
+    (result.auditEvents || []).length ||
+    (result.pushResults || []).some((item) => item?.status && item.status !== "disabled" && item.status !== "skipped") ||
+    (result.errors || []).length;
+  if (result.status !== "disabled" && result.status !== "outside_market_window" && changed) {
     await saveStore(db);
   }
-  return result;
+  return { ...result, saved: Boolean(changed && result.status !== "disabled" && result.status !== "outside_market_window") };
 }
 
 function intradayExplainCacheRows(db = {}, ticker = "") {

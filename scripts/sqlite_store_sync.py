@@ -33,6 +33,22 @@ def load_json(path: Path) -> dict[str, Any]:
     return payload if isinstance(payload, dict) else {}
 
 
+def run_watermark(run: dict[str, Any]) -> str:
+    return text(run.get("completedAt") or run.get("generatedAt") or run.get("startedAt") or run.get("id"))
+
+
+def run_after_since(run: dict[str, Any], since: str = "") -> bool:
+    if not since:
+        return True
+    watermark = run_watermark(run)
+    return bool(watermark and watermark > since)
+
+
+def latest_store_watermark(store: dict[str, Any]) -> str:
+    values = [run_watermark(run) for run in store.get("runs") or [] if isinstance(run, dict)]
+    return max([value for value in values if value], default="")
+
+
 def run_summary(run: dict[str, Any]) -> dict[str, Any]:
     return {
         "id": run.get("id", ""),
@@ -160,6 +176,18 @@ def same_ymd(a: Any, b: Any) -> bool:
     ay = text(a)[:10]
     by = text(b)[:10]
     return bool(ay and by and ay == by)
+
+
+def row_after_since(row: dict[str, Any], since: str = "", fields: tuple[str, ...] = ("createdAt", "updatedAt")) -> bool:
+    if not since:
+        return True
+    if not isinstance(row, dict):
+        return False
+    for field in fields:
+        value = text(row.get(field))
+        if value:
+            return value > since
+    return False
 
 
 def normalize_trade_side(value: Any) -> str:
@@ -495,7 +523,7 @@ def init_schema(conn: sqlite3.Connection) -> None:
     ensure_column(conn, "factor_stats", "regime", "TEXT")
 
 
-def sync_store(conn: sqlite3.Connection, store: dict[str, Any]) -> dict[str, int]:
+def sync_store(conn: sqlite3.Connection, store: dict[str, Any], since: str = "") -> dict[str, int]:
     init_schema(conn)
     counts = {
         "runs": 0,
@@ -520,8 +548,9 @@ def sync_store(conn: sqlite3.Connection, store: dict[str, Any]) -> dict[str, int
         "tradeRecommendationReconciliation": 0,
         "userPaperAcceptances": 0,
     }
+    runs_to_sync = [run for run in store.get("runs") or [] if isinstance(run, dict) and run_after_since(run, since)]
     with conn:
-        for run in store.get("runs") or []:
+        for run in runs_to_sync:
             if not isinstance(run, dict) or not run.get("id"):
                 continue
             summary = run_summary(run)
@@ -707,6 +736,8 @@ def sync_store(conn: sqlite3.Connection, store: dict[str, Any]) -> dict[str, int
             for key, row in article_cache.items():
                 if not isinstance(row, dict):
                     continue
+                if not row_after_since(row, since, ("updatedAt", "fetchedAt", "cachedAt", "publishedAt")):
+                    continue
                 conn.execute(
                     """
                     INSERT INTO article_cache(cache_key, ticker, url, updated_at, status, json)
@@ -732,6 +763,8 @@ def sync_store(conn: sqlite3.Connection, store: dict[str, Any]) -> dict[str, int
         for row in store.get("stockHistory") or []:
             if not isinstance(row, dict):
                 continue
+            if not row_after_since(row, since, ("capturedAt", "createdAt", "updatedAt")):
+                continue
             row_id = text(row.get("id") or f"{row.get('runId','')}:{row.get('ticker','')}:{row.get('capturedAt','')}")
             if not row_id:
                 continue
@@ -750,7 +783,7 @@ def sync_store(conn: sqlite3.Connection, store: dict[str, Any]) -> dict[str, int
             counts["stockHistory"] += 1
 
         post_rows: dict[str, dict[str, Any]] = {}
-        for run in store.get("runs") or []:
+        for run in runs_to_sync:
             if isinstance(run, dict):
                 for post in run.get("socialPosts") or []:
                     if isinstance(post, dict):
@@ -825,6 +858,8 @@ def sync_store(conn: sqlite3.Connection, store: dict[str, Any]) -> dict[str, int
                         if isinstance(decision, dict) and decision.get("id"):
                             decision_rows[text(decision.get("id"))] = decision
             for decision_id, row in decision_rows.items():
+                if not row_after_since(row, since, ("generatedAt", "createdAt", "updatedAt")):
+                    continue
                 conn.execute(
                     """
                     INSERT INTO recommendation_decisions(
@@ -910,6 +945,8 @@ def sync_store(conn: sqlite3.Connection, store: dict[str, Any]) -> dict[str, int
                     continue
                 ticker = safe_ticker(trade.get("ticker"))
                 executed_at = text(trade.get("executedAt") or trade.get("date") or trade.get("time"))
+                if since and executed_at <= since:
+                    continue
                 if not ticker or not executed_at:
                     continue
                 same_day = [
@@ -982,6 +1019,8 @@ def sync_store(conn: sqlite3.Connection, store: dict[str, Any]) -> dict[str, int
                             if outcome_id:
                                 outcome_rows[outcome_id] = outcome
             for outcome_id, row in outcome_rows.items():
+                if not row_after_since(row, since, ("evaluatedAt", "createdAt", "updatedAt")):
+                    continue
                 conn.execute(
                     """
                     INSERT INTO recommendation_outcomes(
@@ -1022,6 +1061,8 @@ def sync_store(conn: sqlite3.Connection, store: dict[str, Any]) -> dict[str, int
 
             for run in agent.get("runs") or []:
                 if not isinstance(run, dict):
+                    continue
+                if not run_after_since(run, since):
                     continue
                 run_id = text(run.get("id"))
                 factor_stats = run.get("factorStats") or {}
@@ -1164,6 +1205,8 @@ def sync_store(conn: sqlite3.Connection, store: dict[str, Any]) -> dict[str, int
         for row in store.get("auditEvents") or []:
             if not isinstance(row, dict):
                 continue
+            if not row_after_since(row, since, ("createdAt", "updatedAt")):
+                continue
             row_id = text(row.get("id") or f"{row.get('eventType','')}:{row.get('createdAt','')}")
             if not row_id:
                 continue
@@ -1191,6 +1234,8 @@ def sync_store(conn: sqlite3.Connection, store: dict[str, Any]) -> dict[str, int
 
         for row in store.get("consensusSnapshots") or []:
             if not isinstance(row, dict):
+                continue
+            if not row_after_since(row, since, ("capturedAt", "createdAt", "updatedAt")):
                 continue
             row_id = text(row.get("id") or f"{row.get('ticker','')}:{row.get('eventDate','')}:{row.get('capturedAt','')}")
             if not row_id:
@@ -1257,7 +1302,7 @@ def sync_store(conn: sqlite3.Connection, store: dict[str, Any]) -> dict[str, int
             )
             counts["sueHistory"] += 1
 
-        for run in store.get("runs") or []:
+        for run in runs_to_sync:
             if not isinstance(run, dict):
                 continue
             captured_at = text(run.get("completedAt") or run.get("generatedAt") or run.get("startedAt"))
@@ -1356,6 +1401,7 @@ def main() -> None:
     parser.add_argument("--store-json", required=True)
     parser.add_argument("--db", required=True)
     parser.add_argument("--status", action="store_true")
+    parser.add_argument("--since", default="")
     args = parser.parse_args()
     db_path = Path(args.db)
     db_path.parent.mkdir(parents=True, exist_ok=True)
@@ -1365,7 +1411,14 @@ def main() -> None:
             payload = {"status": "ok", "db": str(db_path), **status(conn)}
         else:
             store = load_json(Path(args.store_json))
-            payload = {"status": "ok", "db": str(db_path), "synced": sync_store(conn, store), **status(conn)}
+            payload = {
+                "status": "ok",
+                "db": str(db_path),
+                "since": args.since,
+                "watermark": latest_store_watermark(store) or args.since,
+                "synced": sync_store(conn, store, since=args.since),
+                **status(conn),
+            }
         print(json.dumps(payload, ensure_ascii=False))
     finally:
         conn.close()

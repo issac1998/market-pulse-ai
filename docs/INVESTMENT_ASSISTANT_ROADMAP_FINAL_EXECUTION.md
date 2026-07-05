@@ -1344,6 +1344,81 @@ Contradictions:
 
 - None.
 
+---
+
+## WP22 — Save Path & Store Performance — 2026-07-05
+
+Implemented Round 4 WP22.
+
+Changes:
+
+- Changed store persistence to compact JSON by default; `STORE_PRETTY_JSON=true` remains the debug escape hatch.
+- Replaced retained full-payload string comparison with `sha256` payload hash comparison.
+- Added save timing and payload hash fields to `storePersistenceStatus`.
+- Changed run archives to content-hash incremental writes; unchanged archived runs are not rewritten.
+- Trimmed retained display payloads without touching frozen decisions/outcomes:
+  - K-line-like arrays inside run `technicals` are capped to the latest 60 bars.
+  - full stock narrative text is kept only for the latest 3 retained collection runs; older runs keep per-ticker summaries.
+  - `socialHotStocks` rows are deduped within each retained run.
+  - old all-stock-agent runs keep decisions/candidates/summary but drop `evaluations`; latest 3 remain full.
+- Added dirty-aware intraday watcher save behavior: empty ticks without alerts, consensus snapshots, audit events, push results, or errors skip `saveStore`.
+- Added SQLite mirror incremental mode:
+  - server auto-sync passes the last watermark when `SQLITE_MIRROR_INCREMENTAL_SYNC=true`.
+  - `scripts/sqlite_store_sync.py` accepts `--since` and filters growing append tables by run/timestamp.
+  - manual `/api/sqlite/sync` remains full sync.
+- Added `scripts/historical_backtest_worker.mjs`.
+- Routed `/api/recommender/historical-backtest` through a child Node process so the main HTTP event loop remains responsive during walk-forward computation.
+- Regenerated route inventory; route count remains 81.
+
+Verification:
+
+```text
+$ node --check server.mjs
+pass
+
+$ node --check scripts/historical_backtest_worker.mjs
+pass
+
+$ python3 -m py_compile scripts/sqlite_store_sync.py
+pass
+
+$ node scripts/core_regression_tests.mjs
+core_regression_tests: ok
+
+$ node scripts/generate_route_inventory.mjs --check
+{"status":"ok","routes":81,"uiFetches":43,"storeKeys":26}
+
+$ du -h data/store.json
+131M data/store.json
+
+$ curl -H 'Content-Type: application/json' --data '{"tickers":["AAPL"]}' http://127.0.0.1:5188/api/watchlist/add
+{"watchlist":["AAPL","MSFT","NVDA","GOOGL","AMZN","META","TSLA","MRVL"],"count":8,"limit":100,"added":[],"skipped":["AAPL"]}
+
+$ du -h data/store.json
+57M data/store.json
+
+$ python3 scripts/sqlite_store_sync.py --store-json data/store.json --db /tmp/market-pulse-wp22.sqlite --since 9999-12-31T00:00:00Z
+status ok; runs=0, articleCache=0, stockHistory=0, recommendationDecisions=0, recommendationOutcomes=0, factorStats=0; small registry/strategy tables still upsert.
+
+$ node scripts/historical_backtest_worker.mjs --sqlite data/market_pulse.sqlite --configJson '{"maxTickers":3,"maxDates":3,"compactResponse":true,"detailLimit":2,"sqliteTimeoutMs":30000,"bridgeTimeoutMs":30000}'
+status ok; persisted true; detailCounts present.
+
+$ curl ... /api/recommender/historical-backtest  # maxTickers=3,maxDates=20
+200 4.490993
+{"schema":"historical-backtest-response-v1","status":"ok","detailCounts":{"decisions":60,"outcomes":198,"daily":21},"persisted":true}
+
+$ curl /api/run/status during that backtest
+status_1 200 0.010343
+status_2 200 0.001943
+status_3 200 0.000895
+status_4 200 0.195059
+status_5 200 0.135898
+```
+
+Contradictions:
+
+- The full 20 consecutive watcher-tick p95 save benchmark was not run in this session. The implementation records per-save `lastSaveMs`; the verified compact save reduced `store.json` from 131 MB to 57 MB, and the event-loop worker check stayed below 500 ms on concurrent status requests.
+
 ## WP18 — Live Shadow Factors + Promotion Emitters — 2026-07-05
 
 Implemented Round 3 WP18.
