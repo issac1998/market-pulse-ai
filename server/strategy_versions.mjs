@@ -221,6 +221,143 @@ export function candidateStrategyVersionFromSubSignalComposites(factorStats = {}
   };
 }
 
+export function candidateStrategyVersionForShadowPromotion(factor = {}, options = {}) {
+  const factorId = String(factor.factorId || options.factorId || "").trim();
+  if (!factorId) return null;
+  const baseVersion = options.baseVersion && typeof options.baseVersion === "object" ? options.baseVersion : null;
+  const previousWeights = normalizeRecommendationFactorWeights(
+    baseVersion?.weights || options.previousWeights || options.fallbackWeights || {},
+    options.fallbackWeights || {},
+  );
+  const seedWeight = numberOrNull(options.seedWeight) ?? 0.015;
+  const weights = normalizeRecommendationFactorWeights(
+    { ...previousWeights, [factorId]: Math.max(0.0001, seedWeight) },
+    previousWeights,
+  );
+  const source = String(options.source || "shadow-factor-promotion-candidate");
+  const configHash = hashObject({
+    strategyType: options.strategyType || "all-stock-agent",
+    baseVersionId: baseVersion?.id || options.baseVersionId || "",
+    factorId,
+    seedWeight,
+    evidence: options.evidence || null,
+    weights,
+  });
+  const createdAt = options.createdAt || nowIso();
+  return {
+    schemaVersion: "strategy-version-v2",
+    id: `candidate-shadow-${configHash.slice(0, 12)}`,
+    strategyType: options.strategyType || "all-stock-agent",
+    configHash,
+    createdAt,
+    activeFrom: "",
+    activeTo: "",
+    status: "candidate",
+    active: false,
+    source,
+    sourceRunId: String(options.sourceRunId || ""),
+    baseVersionId: baseVersion?.id || options.baseVersionId || "",
+    baseConfigHash: baseVersion?.configHash || options.baseConfigHash || "",
+    changeReason: "mechanical-shadow-factor-promotion-candidate",
+    changelog: [
+      {
+        at: createdAt,
+        type: "shadow-factor-promotion",
+        factorId,
+        summary: `Shadow 因子 ${factorId} 达到 live outcome 与历史 IC 符号门槛，生成 1.5% 初始权重候选；仍需人工 validate/promote。`,
+        evidence: options.evidence || null,
+      },
+    ],
+    evaluationSummary: {
+      schemaVersion: "shadow-factor-promotion-summary-v1",
+      factorId,
+      source,
+      sourceRunId: String(options.sourceRunId || ""),
+      evidence: options.evidence || null,
+    },
+    weights,
+    previousWeights,
+    validationRecords: [],
+    validationStatus: "pending_validation",
+    llmWritable: false,
+    json: {
+      schemaVersion: "all-stock-agent-weight-overlay-v1",
+      weights,
+      baseVersionId: baseVersion?.id || options.baseVersionId || "",
+      source,
+    },
+  };
+}
+
+export function candidateStrategyVersionForFactorFloor(factorIdInput = "", options = {}) {
+  const factorId = String(factorIdInput || options.factorId || "").trim();
+  if (!factorId) return null;
+  const baseVersion = options.baseVersion && typeof options.baseVersion === "object" ? options.baseVersion : null;
+  const previousWeights = normalizeRecommendationFactorWeights(
+    baseVersion?.weights || options.previousWeights || options.fallbackWeights || {},
+    options.fallbackWeights || {},
+  );
+  if (!Object.prototype.hasOwnProperty.call(previousWeights, factorId)) return null;
+  const floorWeight = numberOrNull(options.floorWeight) ?? 0.005;
+  const weights = normalizeRecommendationFactorWeights(
+    { ...previousWeights, [factorId]: Math.max(0, floorWeight) },
+    previousWeights,
+  );
+  const source = String(options.source || "decayed-factor-floor-candidate");
+  const configHash = hashObject({
+    strategyType: options.strategyType || "all-stock-agent",
+    baseVersionId: baseVersion?.id || options.baseVersionId || "",
+    factorId,
+    floorWeight,
+    evidence: options.evidence || null,
+    weights,
+  });
+  const createdAt = options.createdAt || nowIso();
+  return {
+    schemaVersion: "strategy-version-v2",
+    id: `candidate-floor-${configHash.slice(0, 12)}`,
+    strategyType: options.strategyType || "all-stock-agent",
+    configHash,
+    createdAt,
+    activeFrom: "",
+    activeTo: "",
+    status: "candidate",
+    active: false,
+    source,
+    sourceRunId: String(options.sourceRunId || ""),
+    baseVersionId: baseVersion?.id || options.baseVersionId || "",
+    baseConfigHash: baseVersion?.configHash || options.baseConfigHash || "",
+    changeReason: "mechanical-decayed-factor-floor-candidate",
+    changelog: [
+      {
+        at: createdAt,
+        type: "factor-floor",
+        factorId,
+        summary: `因子 ${factorId} 触发 decay，生成 0.5% floor 权重候选；仍需人工 validate/promote。`,
+        evidence: options.evidence || null,
+      },
+    ],
+    evaluationSummary: {
+      schemaVersion: "decayed-factor-floor-summary-v1",
+      factorId,
+      source,
+      sourceRunId: String(options.sourceRunId || ""),
+      evidence: options.evidence || null,
+    },
+    weights,
+    previousWeights,
+    validationRecords: [],
+    validationStatus: "pending_validation",
+    llmWritable: false,
+    json: {
+      schemaVersion: "all-stock-agent-weight-overlay-v1",
+      weights,
+      baseVersionId: baseVersion?.id || options.baseVersionId || "",
+      source,
+    },
+  };
+}
+
 export function attachValidationRecord(rows = [], candidateId = "", record = {}) {
   const id = String(candidateId || record.candidateId || "").trim();
   return normalizeStrategyVersions(rows).map((row) => {

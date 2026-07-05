@@ -78,6 +78,8 @@ import {
   buildPromotionValidationRecord,
   buildRegimeSplitEvaluationPayload,
   candidateStrategyVersionFromLearning,
+  candidateStrategyVersionForFactorFloor,
+  candidateStrategyVersionForShadowPromotion,
   candidateStrategyVersionFromSubSignalComposites,
   normalizeStrategyVersions as normalizeStrategyVersionRows,
   promoteStrategyVersion,
@@ -103,6 +105,7 @@ import {
 } from "./server/runtime_utils.mjs";
 import { serveStatic } from "./server/static_files.mjs";
 import { errorZh } from "./server/text_utils.mjs";
+import { evaluateFactorSpec } from "./lib/factor_spec.mjs";
 
 installProcessErrorHandlers();
 
@@ -1191,6 +1194,15 @@ let gdeltNextRequestAt = 0;
 
 function nowIso() {
   return new Date().toISOString();
+}
+
+function ymd(value = "") {
+  const raw = String(value || "").trim();
+  if (!raw) return "";
+  const compact = raw.replace(/[^\d]/g, "");
+  if (/^\d{8}$/.test(compact)) return `${compact.slice(0, 4)}-${compact.slice(4, 6)}-${compact.slice(6, 8)}`;
+  const parsed = new Date(raw);
+  return Number.isFinite(parsed.getTime()) ? parsed.toISOString().slice(0, 10) : raw.slice(0, 10);
 }
 
 function stableJson(value) {
@@ -20621,6 +20633,7 @@ function allStockAgentTickerContext(run = {}, ticker = "", state = {}) {
   const agentDebateLLM = narrative?.agentDebateLLM || narrative?.decisionDashboard?.agentDebateLLM || null;
   const expectationGap = buildReverseDcfExpectationGap({ quote, fundamental, researchPack });
   return {
+    run,
     ticker: symbol,
     asOf: run.completedAt || run.generatedAt || nowIso(),
     row,
@@ -21255,6 +21268,189 @@ function scoreSocialAttentionFactor(ctx = {}) {
   );
 }
 
+function shadowChartBars(ctx = {}) {
+  const symbol = safeTicker(ctx.ticker);
+  return (ctx.technical?.chart || [])
+    .map((row) => ({
+      ticker: symbol,
+      date: ymd(row.date || row.time || row.timestamp || row.capturedAt),
+      open: numberOrNull(row.open ?? row.o ?? row.close ?? row.price),
+      high: numberOrNull(row.high ?? row.h ?? row.close ?? row.price),
+      low: numberOrNull(row.low ?? row.l ?? row.close ?? row.price),
+      close: numberOrNull(row.close ?? row.c ?? row.price),
+      volume: numberOrNull(row.volume ?? row.v),
+      source: ctx.technical?.provider || "run-technical-chart",
+    }))
+    .filter((row) => row.date && Number.isFinite(row.close))
+    .sort((a, b) => a.date.localeCompare(b.date));
+}
+
+function shadowDatasetForContext(ctx = {}) {
+  const symbol = safeTicker(ctx.ticker);
+  const asOf = ctx.asOf || nowIso();
+  const researchSummary = ctx.researchPack?.summary || {};
+  const rating = researchSummary.ratingDistribution || {};
+  const ratingTotal = Number(rating.total || 0);
+  const buyRatio = ratingTotal ? Number(rating.buy || 0) / ratingTotal : null;
+  const shortPositions = researchSummary.shortPositions || {};
+  const optionsSummary = ctx.options?.summary || ctx.options || {};
+  const ivAtm = firstFiniteNumber(optionsSummary.ivAtm, optionsSummary.iv_atm, optionsSummary.iv, optionsSummary.impliedVolatility);
+  const putCallRatio = firstFiniteNumber(optionsSummary.putCallRatio, optionsSummary.put_call_ratio);
+  const consensus = researchSummary.consensus || {};
+  const fundamental = ctx.fundamental || {};
+  const pitFields = {
+    sue_score: firstFiniteNumber(fundamental.sueScore, fundamental.sue_score),
+    shares_outstanding: firstFiniteNumber(fundamental.sharesOutstanding, fundamental.shares_outstanding, fundamental.marketCap && ctx.quote?.price ? fundamental.marketCap / ctx.quote.price : null),
+    gross_profitability: firstFiniteNumber(fundamental.grossProfitability, fundamental.gross_profitability),
+    total_assets: firstFiniteNumber(fundamental.totalAssets, fundamental.total_assets),
+  };
+  return {
+    bars: shadowChartBars(ctx),
+    pit: Object.entries(pitFields)
+      .filter(([, value]) => Number.isFinite(value))
+      .map(([field, value]) => ({ ticker: symbol, date: asOf, field, [field]: value, value })),
+    revisions: [{
+      ticker: symbol,
+      date: asOf,
+      upgrades: numberOrNull(rating.buy),
+      downgrades: numberOrNull(rating.sell),
+      buy_ratio: Number.isFinite(buyRatio) ? buyRatio : null,
+      consensus_eps: firstFiniteNumber(consensus.epsEstimate, researchSummary.forecastEps?.forecast_eps_mean),
+    }],
+    shortInterest: [{
+      ticker: symbol,
+      date: asOf,
+      short_interest: firstFiniteNumber(shortPositions.shortInterest, shortPositions.currentSharesShort, shortPositions.shortVolume),
+      days_to_cover: firstFiniteNumber(shortPositions.daysToCover, shortPositions.days_to_cover),
+    }],
+    ivHistory: Number.isFinite(ivAtm) || Number.isFinite(putCallRatio)
+      ? [{ ticker: symbol, date: asOf, iv_atm: ivAtm, put_call_ratio: putCallRatio }]
+      : [],
+    consensus: [{
+      ticker: symbol,
+      date: asOf,
+      eps: firstFiniteNumber(consensus.epsEstimate, researchSummary.forecastEps?.forecast_eps_mean),
+      revenue: firstFiniteNumber(consensus.revenueEstimate),
+    }],
+  };
+}
+
+function dailyReturnsFromBars(bars = []) {
+  const rows = (bars || []).filter((row) => Number.isFinite(row.close)).sort((a, b) => a.date.localeCompare(b.date));
+  const out = [];
+  for (let index = 1; index < rows.length; index += 1) {
+    const previous = numberOrNull(rows[index - 1]?.close);
+    const current = numberOrNull(rows[index]?.close);
+    if (Number.isFinite(previous) && previous > 0 && Number.isFinite(current)) out.push(current / previous - 1);
+  }
+  return out;
+}
+
+function sampleStd(values = []) {
+  const rows = values.filter(Number.isFinite);
+  if (rows.length < 2) return null;
+  const avgValue = rows.reduce((sum, value) => sum + value, 0) / rows.length;
+  return Math.sqrt(rows.reduce((sum, value) => sum + (value - avgValue) ** 2, 0) / (rows.length - 1));
+}
+
+function returnFromBars(bars = [], window = 60) {
+  const rows = (bars || []).filter((row) => Number.isFinite(row.close)).sort((a, b) => a.date.localeCompare(b.date));
+  if (rows.length <= window) return null;
+  const start = rows[rows.length - window - 1];
+  const end = rows.at(-1);
+  return start?.close > 0 && Number.isFinite(end?.close) ? end.close / start.close - 1 : null;
+}
+
+function technicalByTicker(run = {}, ticker = "") {
+  const symbol = safeTicker(ticker);
+  return (run.technicals || []).find((item) => safeTicker(item.ticker) === symbol) || null;
+}
+
+function benchmarkReturnFromRun(ctx = {}, window = 60) {
+  const known = knownEquityProfile(ctx.ticker) || {};
+  const profile = ctx.fundamental || known;
+  const industryText = [ctx.fundamental?.industry, known.industry, ctx.fundamental?.mainBusiness, known.mainBusiness].filter(Boolean).join(" ");
+  const basket = buildBenchmarkBasket(ctx.ticker, profile, industryText);
+  const components = (basket?.components || basket || []).filter(Boolean);
+  const rows = [];
+  for (const component of components) {
+    const ticker = safeTicker(component.ticker || component.symbol);
+    const weight = numberOrNull(component.weight) ?? 0;
+    const technical = technicalByTicker(ctx.run || {}, ticker);
+    const value = returnFromBars(shadowChartBars({ ...ctx, ticker, technical }), window);
+    if (Number.isFinite(value) && weight > 0) rows.push({ value, weight });
+  }
+  const weightSum = rows.reduce((sum, row) => sum + row.weight, 0);
+  return weightSum > 0 ? rows.reduce((sum, row) => sum + row.value * (row.weight / weightSum), 0) : null;
+}
+
+function shadowNativeEvaluation(factor = {}, ctx = {}) {
+  const id = normalizeDisplayText(factor.factorId);
+  const bars = shadowChartBars(ctx);
+  if (id === "ivRvSpread") {
+    const ivRaw = firstFiniteNumber(ctx.options?.summary?.ivAtm, ctx.options?.ivAtm, ctx.options?.summary?.iv, ctx.options?.summary?.impliedVolatility);
+    const returns = dailyReturnsFromBars(bars).slice(-21);
+    const rv = sampleStd(returns);
+    if (!Number.isFinite(ivRaw) || !Number.isFinite(rv)) return { status: "insufficient-data", reason: "缺少 ATM IV 或 21 日实现波动率。", n: Math.min(Number.isFinite(ivRaw) ? 1 : 0, returns.length) };
+    const ivPct = ivRaw > 3 ? ivRaw : ivRaw * 100;
+    const rvPct = rv * Math.sqrt(252) * 100;
+    return { status: "ok", value: ivPct - rvPct, raw: { ivPct, rvPct }, n: returns.length };
+  }
+  if (id === "residualMomentum") {
+    const tickerReturn = returnFromBars(bars, 60);
+    const benchmarkReturnValue = benchmarkReturnFromRun(ctx, 60);
+    if (!Number.isFinite(tickerReturn) || !Number.isFinite(benchmarkReturnValue)) {
+      return { status: "insufficient-data", reason: "缺少本标的或 SPY/行业 ETF 60 日 K 线，不能计算残差动量。", n: bars.length };
+    }
+    return { status: "ok", value: (tickerReturn - benchmarkReturnValue) * 100, raw: { tickerReturnPct: tickerReturn * 100, benchmarkReturnPct: benchmarkReturnValue * 100 }, n: bars.length };
+  }
+  if (id === "amihudIlliquidity21") {
+    const rows = bars.slice(-22);
+    const values = [];
+    for (let index = 1; index < rows.length; index += 1) {
+      const previous = rows[index - 1];
+      const current = rows[index];
+      const ret = previous?.close > 0 ? Math.abs(current.close / previous.close - 1) : null;
+      const dollarVolume = Number.isFinite(current.close) && Number.isFinite(current.volume) ? current.close * current.volume : null;
+      if (Number.isFinite(ret) && Number.isFinite(dollarVolume) && dollarVolume > 0) values.push(ret / dollarVolume);
+    }
+    if (!values.length) return { status: "insufficient-data", reason: "缺少 21 日收益率或成交额。", n: 0 };
+    return { status: "ok", value: values.reduce((sum, value) => sum + value, 0) / values.length * 1e9, raw: { scale: "mean_abs_return_per_dollar_volume_x1e9" }, n: values.length };
+  }
+  if (id === "insiderClusterBuy") {
+    const rows = ctx.researchPack?.summary?.insiderTrades?.rows || ctx.researchPack?.summary?.insiderTrades?.items || [];
+    const cutoff = Date.now() - 30 * 24 * 60 * 60 * 1000;
+    const buys = rows.filter((row) => /buy|purchase|买/i.test(`${row.action || row.transaction || row.type || ""}`));
+    const recent = buys.filter((row) => {
+      const ms = new Date(row.date || row.filedAt || row.transactionDate || row.reportedAt || 0).getTime();
+      return Number.isFinite(ms) && ms >= cutoff;
+    });
+    const insiders = new Set(recent.map((row) => normalizeDisplayText(row.name || row.ownerName || row.reportingOwner || row.insiderName)).filter(Boolean));
+    if (!recent.length) return { status: "insufficient-data", reason: "近 30 日 Form 4 买入记录为空。", n: 0 };
+    if (!insiders.size) return { status: "blocked-data-depth", reason: "Form 4 行缺少可区分的 insider identity，不能计算 cluster buy。", n: recent.length };
+    return { status: "ok", value: insiders.size >= 2 ? 1 : 0, raw: { distinctInsiders: insiders.size, buyRows: recent.length }, n: recent.length };
+  }
+  if (id === "institutionalBreadthDelta") {
+    return { status: "blocked-data-depth", reason: "当前 13F 同步仍缺 holdings-level PIT holder breadth，不能计算机构广度变化。", n: 0 };
+  }
+  return { status: "insufficient-data", reason: `未注册 native evaluator：${id}`, n: 0 };
+}
+
+function shadowFactorEvaluation(factor = {}, ctx = {}) {
+  if ((factor.implementation || "dsl") === "native") return shadowNativeEvaluation(factor, ctx);
+  try {
+    const dataset = shadowDatasetForContext(ctx);
+    const result = evaluateFactorSpec(factor.spec, dataset, { asOf: ctx.asOf || nowIso() });
+    const latest = result.latest || null;
+    if (!Number.isFinite(numberOrNull(latest?.value))) {
+      return { status: "insufficient-data", reason: "DSL spec 在当前 run context 中没有可计算值。", n: result.n || 0 };
+    }
+    return { status: "ok", value: numberOrNull(latest.value), raw: { latest, opSequence: result.opSequence }, n: result.n || 0 };
+  } catch (error) {
+    return { status: "error", reason: error.message, n: 0 };
+  }
+}
+
 function shadowFactorsForContext(registryInput = null, ctx = {}) {
   const registry = normalizeFactorRegistry(registryInput || {});
   const rows = {};
@@ -21262,6 +21458,8 @@ function shadowFactorsForContext(registryInput = null, ctx = {}) {
     if (factor.state !== "shadow") continue;
     const id = normalizeDisplayText(factor.factorId);
     if (!id || RECOMMENDER_FACTOR_WEIGHTS[id]) continue;
+    const evaluation = shadowFactorEvaluation(factor, ctx);
+    const ok = evaluation.status === "ok" && Number.isFinite(numberOrNull(evaluation.value));
     rows[id] = {
       id,
       label: factor.factorId,
@@ -21270,15 +21468,22 @@ function shadowFactorsForContext(registryInput = null, ctx = {}) {
         implementation: factor.implementation || "dsl",
         evidenceStatus: factor.evidence?.status || factor.evidence?.admission?.status || "not-evaluated-live",
         ticker: ctx.ticker || "",
+        status: evaluation.status,
+        n: evaluation.n || 0,
+        ...(evaluation.raw || {}),
       },
-      score: 50,
-      heuristicScore: 50,
-      quality: 0,
+      score: ok ? numberOrNull(evaluation.value) : null,
+      heuristicScore: ok ? numberOrNull(evaluation.value) : null,
+      quality: ok ? Math.max(25, Math.min(90, 35 + Number(evaluation.n || 0))) : 0,
       source: ["factor-registry-shadow"],
-      missingReason: "Shadow factor is tracked for outcomes only and has zero decision weight until human strategy-version promotion.",
+      missingReason: ok
+        ? "Shadow factor is outcome-tracked only and has zero decision weight until human strategy-version promotion."
+        : evaluation.reason || "Shadow factor cannot be computed for this ticker in the current run context.",
       lifecycleState: "shadow",
       weightEligible: false,
-      normalization: { method: "shadow-neutral", factorId: id, score: 50 },
+      normalization: ok
+        ? { method: "pending-cross-sectional-normalization", factorId: id, score: numberOrNull(evaluation.value) }
+        : { method: "missing", factorId: id, score: null },
       subSignals: [],
     };
   }
@@ -21483,6 +21688,92 @@ function buildAllStockAgentFactorWeightLearning(factorStats = {}, currentWeights
     generatedAt: nowIso(),
     source,
   });
+}
+
+function factorStatsSamples(row = {}) {
+  return Number(row.effectiveN ?? row.samples ?? row.n ?? 0) || 0;
+}
+
+function factorHistoricalRankIC(factor = {}) {
+  return numberOrNull(
+    factor.evidence?.admission?.rankIC ??
+      factor.evidence?.latestAdmission?.rankIC ??
+      factor.evidence?.rankIC,
+  );
+}
+
+function maxCorrelationForFactor(matrix = null, factorId = "") {
+  const id = normalizeDisplayText(factorId);
+  let max = null;
+  for (const pair of matrix?.highCorrelationPairs || []) {
+    if (pair.left === id || pair.right === id) {
+      const rho = Math.abs(numberOrNull(pair.rho));
+      if (Number.isFinite(rho)) max = Math.max(max ?? 0, rho);
+    }
+  }
+  const row = (matrix?.rows || []).find((item) => item.factorId === id);
+  for (const [otherId, cell] of Object.entries(row?.correlations || {})) {
+    if (otherId === id) continue;
+    const rho = Math.abs(numberOrNull(cell?.rho));
+    if (Number.isFinite(rho)) max = Math.max(max ?? 0, rho);
+  }
+  return max ?? 0;
+}
+
+function buildShadowPromotionCandidates({ registry, factorStats, factorCorrelationMatrix, strategyVersion, currentWeights, sourceRunId }) {
+  const normalized = normalizeFactorRegistry(registry || {});
+  const candidates = [];
+  const skipped = [];
+  for (const factor of normalized.factors || []) {
+    if (factor.state !== "shadow") continue;
+    const id = normalizeDisplayText(factor.factorId);
+    const stats = factorStats?.[id] || {};
+    const samples = factorStatsSamples(stats);
+    const liveRankIC = numberOrNull(stats.rankIC);
+    const historicalRankIC = factorHistoricalRankIC(factor);
+    const maxCorr = maxCorrelationForFactor(factorCorrelationMatrix, id);
+    const signMatchesHistorical =
+      Number.isFinite(liveRankIC) &&
+      Number.isFinite(historicalRankIC) &&
+      Math.sign(liveRankIC) === Math.sign(historicalRankIC) &&
+      Math.sign(liveRankIC) !== 0;
+    const eligible = samples >= 50 && signMatchesHistorical && maxCorr < 0.6;
+    const evidence = {
+      schemaVersion: "shadow-promotion-evidence-v1",
+      factorId: id,
+      liveRankIC: Number.isFinite(liveRankIC) ? liveRankIC : null,
+      historicalRankIC: Number.isFinite(historicalRankIC) ? historicalRankIC : null,
+      samples,
+      minSamples: 50,
+      maxCorrelation: maxCorr,
+      signMatchesHistorical,
+    };
+    if (!eligible) {
+      skipped.push({
+        ...evidence,
+        reason: samples < 50
+          ? "live outcome 样本不足"
+          : !signMatchesHistorical
+            ? "live IC 与历史 IC 符号不一致或缺失"
+            : "相关性门槛未通过",
+      });
+      continue;
+    }
+    const candidate = candidateStrategyVersionForShadowPromotion(factor, {
+      baseVersion: strategyVersion,
+      previousWeights: currentWeights,
+      fallbackWeights: RECOMMENDER_FACTOR_WEIGHTS,
+      sourceRunId,
+      evidence,
+    });
+    if (candidate) candidates.push(candidate);
+  }
+  return {
+    schemaVersion: "shadow-factor-promotion-candidates-v1",
+    generatedAt: nowIso(),
+    candidates,
+    skipped,
+  };
 }
 
 function scoreRecommendationFromFactors(factorSnapshot = {}, options = {}) {
@@ -23221,6 +23512,7 @@ async function runAllStockAgentForRun(db, sourceRun, trigger = "manual", options
   });
   strategyVersion = activeStrategyVersion(state.strategyVersions) || skillStrategyVersion;
   const activeSubSignalCompositeOptions = subSignalCompositeOptionsFromStrategyVersion(strategyVersion);
+  const agentRunId = `${Date.now()}-all-stock-agent`;
   const subSignalCompositeCandidate = candidateStrategyVersionFromSubSignalComposites(factorStats, {
     source: factorStatsSource,
     sourceRunId: agentRunId,
@@ -23233,6 +23525,14 @@ async function runAllStockAgentForRun(db, sourceRun, trigger = "manual", options
       .map((snapshot) => [safeTicker(snapshot.ticker), snapshot]),
   );
   const factorCorrelationMatrix = buildFactorCorrelationMatrix([...factorSnapshotMap.values()], { minN: 3 });
+  const shadowPromotionPlan = buildShadowPromotionCandidates({
+    registry: db.factorRegistry,
+    factorStats,
+    factorCorrelationMatrix,
+    strategyVersion,
+    currentWeights: activeFactorWeights,
+    sourceRunId: agentRunId,
+  });
   const evaluations = universe
     .map((item) => buildAllStockAgentEvaluation(source, item, state, skill, {
       factorWeights: activeFactorWeights,
@@ -23255,7 +23555,6 @@ async function runAllStockAgentForRun(db, sourceRun, trigger = "manual", options
     Number(skill.settings?.actionableBuyLimit) || ALL_STOCK_AGENT_ACTIONABLE_BUY_LIMIT,
     buyLimit,
   );
-  const agentRunId = `${Date.now()}-all-stock-agent`;
   const primaryBuyPool = evaluations.filter(
     (item) => item.buyEligible && !allStockAgentDecisionLogSuppressed(item),
   );
@@ -23385,6 +23684,11 @@ async function runAllStockAgentForRun(db, sourceRun, trigger = "manual", options
           : "equal-weight-composite; IC weighting requires strategy-version promotion",
         candidateStrategyVersionId: subSignalCompositeCandidate?.id || "",
       },
+      shadowFactors: {
+        computedInLiveRun: true,
+        promotionCandidates: shadowPromotionPlan.candidates.map((item) => item.id),
+        skipped: shadowPromotionPlan.skipped.slice(0, 12),
+      },
     },
     universeCoverage: {
       labels: [...new Set(universe.flatMap((item) => item.labels || []))],
@@ -23403,6 +23707,7 @@ async function runAllStockAgentForRun(db, sourceRun, trigger = "manual", options
     ruleStats,
     factorStats,
     factorCorrelationMatrix,
+    shadowPromotionPlan,
     factorStatsSource,
     factorStatsBacktest: factorStatsBacktest
       ? {
@@ -23455,6 +23760,9 @@ async function runAllStockAgentForRun(db, sourceRun, trigger = "manual", options
   }
   if (subSignalCompositeCandidate) {
     nextStrategyVersions = upsertStrategyVersion(nextStrategyVersions, subSignalCompositeCandidate);
+  }
+  for (const candidate of shadowPromotionPlan.candidates) {
+    nextStrategyVersions = upsertStrategyVersion(nextStrategyVersions, candidate);
   }
   const nextState = normalizeAllStockAgentState({
     ...stateWithOutcomes,
@@ -38069,6 +38377,25 @@ async function handleApi(req, res, url) {
       corpusTimeoutMs: body.corpusTimeoutMs,
     });
     db.factorRegistry = { ...result.registry, performanceReport };
+    const activeVersion = activeStrategyVersion(state.strategyVersions);
+    const activeWeights = activeStrategyWeights(state.strategyVersions, RECOMMENDER_FACTOR_WEIGHTS);
+    const floorCandidates = [];
+    for (const transition of result.transitions || []) {
+      if (transition.to !== "decayed" || !Object.prototype.hasOwnProperty.call(activeWeights, transition.factorId)) continue;
+      const candidate = candidateStrategyVersionForFactorFloor(transition.factorId, {
+        baseVersion: activeVersion,
+        previousWeights: activeWeights,
+        fallbackWeights: RECOMMENDER_FACTOR_WEIGHTS,
+        sourceRunId: state.runs[0]?.id || "",
+        evidence: transition.evidence || null,
+      });
+      if (candidate) floorCandidates.push(candidate);
+    }
+    if (floorCandidates.length) {
+      let strategyVersions = normalizeStrategyVersions(state.strategyVersions);
+      for (const candidate of floorCandidates) strategyVersions = upsertStrategyVersion(strategyVersions, candidate);
+      db.allStockAgent = normalizeAllStockAgentState({ ...state, strategyVersions });
+    }
     const postmortem = await appendFactorPostmortemsForTransitions(db, result.transitions, performanceReport, {
       invoker: body.postmortemInvoker || body.invoker || FACTOR_RESEARCHER_INVOKER,
     });
@@ -38078,10 +38405,17 @@ async function handleApi(req, res, url) {
       transitions: result.transitions,
       trialEntries: result.trialEntries.length,
       postmortems: postmortem.lessons.length,
+      floorCandidateStrategyVersions: floorCandidates.map((item) => item.id),
       factorStatsOverride: Boolean(body.factorStatsOverride),
     }, result.transitions.length ? "ok" : "warn");
     await saveStore(db);
-    return sendJson(res, { evaluation: result.report, transitions: result.transitions, postmortems: postmortem.lessons, registry: db.factorRegistry });
+    return sendJson(res, {
+      evaluation: result.report,
+      transitions: result.transitions,
+      postmortems: postmortem.lessons,
+      floorCandidateStrategyVersions: floorCandidates,
+      registry: db.factorRegistry,
+    });
   }
 
   if (req.method === "POST" && url.pathname === "/api/factors/research") {

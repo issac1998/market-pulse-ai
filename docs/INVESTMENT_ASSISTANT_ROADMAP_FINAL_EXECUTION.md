@@ -1343,3 +1343,63 @@ Regression fixtures added:
 Contradictions:
 
 - None.
+
+---
+
+## WP18 — Live Shadow Factors + Promotion Emitters — 2026-07-05
+
+Implemented Round 3 WP18.
+
+Changes:
+
+- Replaced constant live shadow factor injection in `server.mjs`:
+  - shadow factors now evaluate from current run context using technical chart bars, options summaries, research packs, consensus, short-interest, and PIT-like fields where present.
+  - DSL shadow factors use `evaluateFactorSpec()`.
+  - native shadow factors use a dispatch path for `ivRvSpread`, `residualMomentum`, `amihudIlliquidity21`, `insiderClusterBuy`, and `institutionalBreadthDelta`.
+  - `weightEligible:false` remains unchanged, so shadow factors still cannot influence live decision weights.
+- Preserved missing shadow factors as `score:null` during cross-sectional normalization instead of fabricating neutral 50 values.
+- Added candidate-only strategy version emitters in `server/strategy_versions.mjs`:
+  - `candidateStrategyVersionForShadowPromotion()` adds an eligible shadow factor at a small positive seed weight.
+  - `candidateStrategyVersionForFactorFloor()` floors an active-weighted decayed factor through a candidate version.
+  - both set `status:"candidate"`, `active:false`, and `llmWritable:false`.
+- Wired all-stock-agent runs to emit shadow promotion candidate versions when live stats meet:
+  - `effectiveN/samples >= 50`
+  - live rankIC sign matches historical rankIC
+  - max live correlation is below 0.6
+- Wired `/api/factors/evaluate` decay transitions to emit factor-floor candidate strategy versions when the decayed factor exists in active weights.
+- Moved `agentRunId` definition before candidate generation so all candidate emitters use the same run id.
+- Regenerated route inventory.
+
+Verification:
+
+```text
+$ node --check server.mjs
+pass
+
+$ node --check lib/recommender_core.mjs
+pass
+
+$ node --check server/strategy_versions.mjs
+pass
+
+$ node --check public/app.js
+pass
+
+$ node scripts/core_regression_tests.mjs
+core_regression_tests: ok
+
+$ node scripts/generate_route_inventory.mjs
+{"status":"ok","routes":81,"uiFetches":43,"storeKeys":26}
+```
+
+Regression fixtures added:
+
+- Live shadow fixture proves different raw inputs produce non-constant cross-sectional scores.
+- Missing shadow fixture proves missing shadow factors remain `score:null`.
+- Shadow promotion fixture proves the result is a candidate strategy version and never active.
+- Decay floor fixture proves an active-weighted factor decay emits a candidate version with a reduced weight.
+
+Contradictions:
+
+- `institutionalBreadthDelta` remains `blocked-data-depth` because holdings-level point-in-time 13F holder breadth is still unavailable.
+- `insiderClusterBuy` returns `blocked-data-depth` when Form 4 rows lack a distinct insider identity field; no cluster buy signal is fabricated.

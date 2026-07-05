@@ -58,7 +58,9 @@ import {
   buildLiveParityPayload,
   buildPromotionValidationRecord,
   buildRegimeSplitEvaluationPayload,
+  candidateStrategyVersionForFactorFloor,
   candidateStrategyVersionFromLearning,
+  candidateStrategyVersionForShadowPromotion,
   candidateStrategyVersionFromSubSignalComposites,
   promoteStrategyVersion,
   rollbackStrategyVersions,
@@ -481,6 +483,87 @@ assert.equal(
   "historical-corpus",
   "B3 seed admission should record the computed corpus evidence source",
 );
+const shadowNormalized = applyCrossSectionalNormalization(
+  [
+    {
+      ticker: "AAA",
+      peerGroup: {},
+      factors: {
+        liveShadowAlpha: {
+          id: "liveShadowAlpha",
+          lifecycleState: "shadow",
+          weightEligible: false,
+          heuristicScore: 1,
+          score: 1,
+          quality: 80,
+        },
+      },
+    },
+    {
+      ticker: "BBB",
+      peerGroup: {},
+      factors: {
+        liveShadowAlpha: {
+          id: "liveShadowAlpha",
+          lifecycleState: "shadow",
+          weightEligible: false,
+          heuristicScore: 3,
+          score: 3,
+          quality: 80,
+        },
+      },
+    },
+    {
+      ticker: "CCC",
+      peerGroup: {},
+      factors: {
+        liveShadowAlpha: {
+          id: "liveShadowAlpha",
+          lifecycleState: "shadow",
+          weightEligible: false,
+          heuristicScore: null,
+          score: null,
+          quality: 0,
+          missingReason: "fixture missing",
+        },
+      },
+    },
+  ],
+  { minCrossSection: 2 },
+).snapshots;
+assert.notEqual(
+  shadowNormalized[0].factors.liveShadowAlpha.score,
+  shadowNormalized[1].factors.liveShadowAlpha.score,
+  "Live shadow factors with different raw inputs should produce non-constant cross-sectional scores",
+);
+assert.equal(
+  shadowNormalized[2].factors.liveShadowAlpha.score,
+  null,
+  "Missing live shadow factors should remain missing rather than fabricated as neutral 50",
+);
+const shadowPromotionCandidate = candidateStrategyVersionForShadowPromotion(
+  { factorId: "liveShadowAlpha" },
+  {
+    baseVersion: { id: "active-fixture", configHash: "active-fixture", weights: { momentum: 0.5, qualityGrowth: 0.5 } },
+    previousWeights: { momentum: 0.5, qualityGrowth: 0.5 },
+    fallbackWeights: { momentum: 0.5, qualityGrowth: 0.5 },
+    evidence: { samples: 55, liveRankIC: 0.08, historicalRankIC: 0.07, maxCorrelation: 0.2 },
+  },
+);
+assert.equal(shadowPromotionCandidate.status, "candidate", "Shadow promotion should only emit a candidate strategy version");
+assert.equal(shadowPromotionCandidate.active, false, "Shadow promotion candidate must not become active automatically");
+assert.ok(
+  Number(shadowPromotionCandidate.weights.liveShadowAlpha) > 0,
+  "Shadow promotion candidate should include the promoted factor at a small positive weight",
+);
+const floorCandidate = candidateStrategyVersionForFactorFloor("momentum", {
+  baseVersion: { id: "active-fixture", configHash: "active-fixture", weights: { momentum: 0.2, qualityGrowth: 0.8 } },
+  previousWeights: { momentum: 0.2, qualityGrowth: 0.8 },
+  fallbackWeights: { momentum: 0.2, qualityGrowth: 0.8 },
+  evidence: { status: "decay", rankIC: -0.02, n: 120 },
+});
+assert.equal(floorCandidate.status, "candidate", "Decay floor should be emitted as a candidate strategy version");
+assert.ok(floorCandidate.weights.momentum < 0.2, "Decay floor candidate should reduce the decayed factor weight");
 const evaluatedRegistry = evaluateFactorRegistry(registryWithSeeds, {
   evidenceOverrides: {
     week52HighProximity: {
