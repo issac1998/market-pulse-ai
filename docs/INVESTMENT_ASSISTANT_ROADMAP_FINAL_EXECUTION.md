@@ -1403,3 +1403,61 @@ Contradictions:
 
 - `institutionalBreadthDelta` remains `blocked-data-depth` because holdings-level point-in-time 13F holder breadth is still unavailable.
 - `insiderClusterBuy` returns `blocked-data-depth` when Form 4 rows lack a distinct insider identity field; no cluster buy signal is fabricated.
+
+---
+
+## WP19 — Registry Integrity, Trial Ledger, Decay Windows — 2026-07-05
+
+Implemented Round 3 WP19.
+
+Changes:
+
+- Fixed factor id clobber in `addFactorCandidate()`:
+  - submissions reusing an existing non-rejected `factorId` are rejected.
+  - existing `candidate/shadow/active/decayed/retired` factors are not overwritten.
+  - rejected ids may still be reused.
+- Added `specHash` to normalized registry factors and trial entries.
+- Changed trial ledger semantics:
+  - candidate submission entries count as trials.
+  - first admission evaluation for a distinct spec hash counts as a trial.
+  - routine evaluator runs and decay monitoring do not count as trials.
+  - inflated historical counts are corrected through an append-only `ledger-correction` entry.
+- Reworked decay monitoring:
+  - decay now uses trailing factor outcome rows rather than pooled factorStats.
+  - active factors demote only after two consecutive 60-outcome windows with non-positive rankIC and negative weighted contribution.
+  - decayed factors recover to shadow when the next 60-outcome window turns IC-positive.
+  - redundancy evidence records retirement recommendations when a factor has |rho| > 0.85 against a higher-IC factor.
+- `/api/factors/evaluate` now passes live `outcomeSnapshots` and the latest factor correlation matrix into the evaluator.
+- Confirmed originality score-series correlation is ticker/date aligned from WP17.
+
+Verification:
+
+```text
+$ node --check server/factor_registry.mjs
+pass
+
+$ node --check server.mjs
+pass
+
+$ node --check public/app.js
+pass
+
+$ node scripts/core_regression_tests.mjs
+core_regression_tests: ok
+
+$ node scripts/generate_route_inventory.mjs
+{"status":"ok","routes":81,"uiFetches":43,"storeKeys":26}
+```
+
+Regression fixtures added:
+
+- Reusing a shadow factor id is rejected and the existing shadow factor remains intact.
+- Three routine evaluator runs over an unchanged registry add zero new trials.
+- Inflated legacy trial ledger count gets an append-only correction entry.
+- One bad 60-outcome window does not demote an active factor.
+- Two consecutive bad 60-outcome windows demote active to decayed.
+- A positive trailing 60-outcome window recovers decayed to shadow.
+
+Contradictions:
+
+- None.

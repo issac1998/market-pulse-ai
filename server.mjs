@@ -38367,6 +38367,8 @@ async function handleApi(req, res, url) {
       actor: "system:evaluator",
       performanceReport,
       factorStats: body.factorStatsOverride || state.runs[0]?.factorStats || {},
+      outcomeSnapshots: body.outcomeSnapshotsOverride || state.outcomeSnapshots || [],
+      factorCorrelationMatrix: state.runs[0]?.factorCorrelationMatrix || null,
       evidenceOverrides: body.evidenceOverrides || {},
       sqlitePath: body.sqlitePath || SQLITE_DB_FILE,
       universe: Array.isArray(body.universe) ? body.universe : null,

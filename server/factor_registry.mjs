@@ -5,6 +5,7 @@ import {
 } from "../lib/factor_spec.mjs";
 import { numberOrNull } from "../lib/market_core.mjs";
 import { execFile } from "node:child_process";
+import crypto from "node:crypto";
 
 const REGISTRY_SCHEMA = "factor-registry-v1";
 const STATES = new Set(["candidate", "shadow", "active", "decayed", "retired", "rejected"]);
@@ -32,6 +33,15 @@ function ymd(value = "") {
 
 function compactId(prefix = "factor") {
   return `${prefix}-${Date.now()}-${Math.random().toString(16).slice(2, 8)}`;
+}
+
+function hashObject(value) {
+  return crypto.createHash("sha256").update(JSON.stringify(value ?? null)).digest("hex");
+}
+
+function factorSpecHash(factorOrSpec = {}) {
+  const spec = factorOrSpec.spec || factorOrSpec;
+  return hashObject(spec);
 }
 
 function sqlText(value = "") {
@@ -286,6 +296,47 @@ export function defaultFactorRegistrySeeds() {
   return specs;
 }
 
+function ledgerEntryCountsAsTrial(entry = {}, seenAdmissionSpecs = new Set()) {
+  if (entry.type === "candidate-submission" || String(entry.id || "").startsWith("factor-trial")) return true;
+  if (entry.type === "admission-evaluation") {
+    const specHash = text(entry.specHash || "");
+    if (!specHash || seenAdmissionSpecs.has(specHash)) return false;
+    seenAdmissionSpecs.add(specHash);
+    return true;
+  }
+  return false;
+}
+
+function normalizeTrialLedger(ledgerInput = {}) {
+  const entries = Array.isArray(ledgerInput.entries) ? ledgerInput.entries : [];
+  const rawCount = Number(ledgerInput.count ?? entries.length ?? 0) || 0;
+  const seenAdmissionSpecs = new Set();
+  let correctedCount = 0;
+  for (const entry of entries.slice().reverse()) {
+    if (ledgerEntryCountsAsTrial(entry, seenAdmissionSpecs)) correctedCount += 1;
+  }
+  const hasCorrection = entries.some((entry) => entry.type === "ledger-correction" && entry.rule === "wp19-trial-honesty");
+  const nextEntries = rawCount !== correctedCount && !hasCorrection
+    ? [
+        {
+          id: compactId("factor-ledger-correction"),
+          type: "ledger-correction",
+          rule: "wp19-trial-honesty",
+          at: nowIso(),
+          oldCount: rawCount,
+          newCount: correctedCount,
+          reason: "Routine evaluator and decay-monitor entries no longer count as distinct factor trials.",
+          appendOnly: true,
+        },
+        ...entries,
+      ]
+    : entries;
+  return {
+    count: correctedCount,
+    entries: nextEntries.slice(0, 1000),
+  };
+}
+
 export function normalizeFactorRegistry(value = {}) {
   const registry = value && typeof value === "object" ? value : {};
   const existing = Array.isArray(registry.factors) ? registry.factors : [];
@@ -297,9 +348,10 @@ export function normalizeFactorRegistry(value = {}) {
       state: STATES.has(factor.state) ? factor.state : "candidate",
       stateHistory: Array.isArray(factor.stateHistory) ? factor.stateHistory : [],
       evidence: factor.evidence && typeof factor.evidence === "object" ? factor.evidence : {},
+      specHash: factor.specHash || factorSpecHash(factor),
     });
   }
-  const trialEntries = Array.isArray(registry.trialLedger?.entries) ? registry.trialLedger.entries : [];
+  const trialLedger = normalizeTrialLedger(registry.trialLedger || {});
   return {
     schemaVersion: REGISTRY_SCHEMA,
     generatedAt: registry.generatedAt || nowIso(),
@@ -310,8 +362,8 @@ export function normalizeFactorRegistry(value = {}) {
         }
       : { schemaVersion: "factor-episodic-memory-v1", lessons: [] },
     trialLedger: {
-      count: Number(registry.trialLedger?.count || trialEntries.length || 0),
-      entries: trialEntries.slice(0, 1000),
+      count: trialLedger.count,
+      entries: trialLedger.entries,
     },
     factors: [...byId.values()],
     performanceReport: registry.performanceReport || null,
@@ -419,6 +471,14 @@ export function addFactorCandidate(registryInput = {}, payload = {}, options = {
     gate = { ok: false, reason: error.message, checks: [] };
   }
   const factorId = text(payload.factorId || parsed?.factorId || `candidate_${registry.trialLedger.count + 1}`);
+  const conflict = registry.factors.find((item) => item.factorId === factorId && item.state !== "rejected");
+  if (conflict) {
+    gate = {
+      ok: false,
+      reason: `factorId conflict with existing ${conflict.state} factor ${factorId}`,
+      checks: [{ type: "factor-id-conflict", factorId, state: conflict.state }],
+    };
+  }
   const now = options.now || nowIso();
   const factor = {
     factorId,
@@ -432,18 +492,32 @@ export function addFactorCandidate(registryInput = {}, payload = {}, options = {
     createdBy: options.createdBy || payload.createdBy || "human",
     createdAt: now,
     implementation: "dsl",
+    specHash: parsed ? factorSpecHash(parsed) : factorSpecHash(payload.spec || payload),
     stateHistory: [{ at: now, from: "", to: gate.ok ? "candidate" : "rejected", reason: gate.reason, actor: options.actor || "human" }],
     evidence: { status: gate.ok ? "pending-evaluation" : "rejected", originality: gate, n: 0 },
   };
   const trialEntry = {
     id: compactId("factor-trial"),
+    type: "candidate-submission",
     at: now,
     factorId,
+    specHash: factor.specHash,
     actor: options.actor || "human",
     accepted: gate.ok,
     reason: gate.reason,
     checks: gate.checks,
   };
+  if (conflict) {
+    const next = {
+      ...registry,
+      trialLedger: {
+        count: registry.trialLedger.count + 1,
+        entries: [trialEntry, ...(registry.trialLedger.entries || [])].slice(0, 1000),
+      },
+      factors: registry.factors,
+    };
+    return { registry: next, factor, trialEntry, gate };
+  }
   const next = {
     ...registry,
     trialLedger: {
@@ -948,17 +1022,109 @@ function admissionEvidenceForFactor(factor = {}, context = {}) {
 
 function decayEvidenceForFactor(factor = {}, context = {}) {
   const liveStats = context.performanceReport?.factorStats?.[factor.factorId] || context.factorStats?.[factor.factorId] || {};
-  const n = numberOrNull(liveStats.n ?? liveStats.samples);
-  const rankIC = numberOrNull(liveStats.rankIC);
-  const avgExcessPct = numberOrNull(liveStats.avgExcessPct);
-  const shouldDecay = Number.isFinite(n) && n >= 60 && Number.isFinite(rankIC) && rankIC <= 0 && Number.isFinite(avgExcessPct) && avgExcessPct < 0;
-  const shouldRecover = factor.state === "decayed" && Number.isFinite(n) && n >= 60 && Number.isFinite(rankIC) && rankIC > 0;
+  const rows = factorOutcomeRowsForDecay(factor.factorId, context);
+  const windows = decayWindows(rows, factor.expectedSign || 1);
+  const trailing = windows.at(-1) || null;
+  const previous = windows.at(-2) || null;
+  const n = numberOrNull(trailing?.n ?? liveStats.n ?? liveStats.samples);
+  const rankIC = numberOrNull(trailing?.rankIC ?? liveStats.rankIC);
+  const avgExcessPct = numberOrNull(trailing?.avgExcessPct ?? liveStats.avgExcessPct);
+  const twoBadWindows = Boolean(previous?.negative && trailing?.negative);
+  const shouldDecay = factor.state === "active" && twoBadWindows;
+  const shouldRecover = factor.state === "decayed" && Boolean(trailing?.rankICPositive);
+  const redundancy = redundancyEvidenceForFactor(factor.factorId, liveStats, context);
   return {
     status: shouldDecay ? "decay" : shouldRecover ? "recover" : "hold",
     n: Number.isFinite(n) ? n : 0,
     rankIC: Number.isFinite(rankIC) ? rankIC : null,
     avgExcessPct: Number.isFinite(avgExcessPct) ? avgExcessPct : null,
+    windows,
+    twoBadWindows,
+    redundancy,
+    reason: rows.length
+      ? shouldDecay
+        ? "two-consecutive-negative-60-outcome-windows"
+        : shouldRecover
+          ? "trailing-60-window-ic-positive"
+          : "decay-window-gates-not-met"
+      : "missing-factor-outcome-rows",
   };
+}
+
+function factorOutcomeRowsForDecay(factorId = "", context = {}) {
+  const id = text(factorId);
+  const explicit = context.factorOutcomes?.[id] || context.factorOutcomeRows?.[id] || [];
+  const sourceRows = explicit.length ? explicit : context.outcomeSnapshots || context.outcomes || [];
+  return (sourceRows || [])
+    .map((row) => {
+      const factor = row.factorSnapshot?.factors?.[id] || row.factors?.[id] || {};
+      return {
+        ticker: safeTicker(row.ticker),
+        date: ymd(row.decisionAt || row.generatedAt || row.asOf || row.completedAt || row.date),
+        score: numberOrNull(row.score ?? factor.score),
+        excessPct: numberOrNull(row.excessPct ?? row.performancePct ?? row.returnPct),
+        outcomeQualityStatus: text(row.outcomeQualityStatus || row.qualityStatus || ""),
+        outcomeUsable: row.outcomeUsable !== false,
+      };
+    })
+    .filter((row) =>
+      row.date &&
+      row.outcomeUsable !== false &&
+      row.outcomeQualityStatus !== "suspect_price" &&
+      Number.isFinite(row.score) &&
+      Number.isFinite(row.excessPct),
+    )
+    .sort((a, b) => a.date.localeCompare(b.date) || a.ticker.localeCompare(b.ticker));
+}
+
+function decayWindows(rows = [], expectedSign = 1) {
+  const windowSize = 60;
+  const usable = rows.slice(-windowSize * 2);
+  const chunks = [];
+  if (usable.length > windowSize) chunks.push(usable.slice(0, Math.max(0, usable.length - windowSize)));
+  if (usable.length >= windowSize) chunks.push(usable.slice(-windowSize));
+  return chunks
+    .filter((chunk) => chunk.length >= windowSize)
+    .map((chunk) => {
+      const rankIC = rankCorrelation(chunk.map((row) => row.score), chunk.map((row) => row.excessPct));
+      const avgExcessPct = mean(chunk.map((row) => row.excessPct));
+      const contribution = chunk.reduce((sum, row) => sum + ((row.score - 50) / 50) * row.excessPct * expectedSign, 0);
+      const negative = Number.isFinite(rankIC) && rankIC <= 0 && Number.isFinite(contribution) && contribution < 0;
+      return {
+        n: chunk.length,
+        startDate: chunk[0]?.date || "",
+        endDate: chunk.at(-1)?.date || "",
+        rankIC: Number.isFinite(rankIC) ? rankIC : null,
+        avgExcessPct: Number.isFinite(avgExcessPct) ? avgExcessPct : null,
+        cumulativeWeightedContribution: Number.isFinite(contribution) ? contribution : null,
+        negative,
+        rankICPositive: Number.isFinite(rankIC) && rankIC > 0,
+      };
+    });
+}
+
+function redundancyEvidenceForFactor(factorId = "", liveStats = {}, context = {}) {
+  const correlations = context.factorCorrelationMatrix || context.performanceReport?.correlationMatrix || context.correlationMatrix || null;
+  const stats = context.performanceReport?.factorStats || context.factorStats || {};
+  const id = text(factorId);
+  const row = (correlations?.rows || []).find((item) => item.factorId === id);
+  let best = null;
+  for (const [otherId, cell] of Object.entries(row?.correlations || {})) {
+    if (otherId === id) continue;
+    const rho = Math.abs(numberOrNull(cell?.rho));
+    const otherRankIC = numberOrNull(stats[otherId]?.rankIC);
+    const selfRankIC = numberOrNull(liveStats.rankIC);
+    if (Number.isFinite(rho) && rho > 0.85 && Number.isFinite(otherRankIC) && (!Number.isFinite(selfRankIC) || Math.abs(otherRankIC) > Math.abs(selfRankIC))) {
+      if (!best || rho > best.rho) best = { factorId: otherId, rho, n: Number(cell?.n || 0), otherRankIC, selfRankIC: Number.isFinite(selfRankIC) ? selfRankIC : null };
+    }
+  }
+  return best ? { status: "retirement-recommended", ...best } : { status: "none" };
+}
+
+function trialLedgerHasAdmissionEvaluation(registry = {}, specHash = "") {
+  const hash = text(specHash);
+  if (!hash) return false;
+  return (registry.trialLedger?.entries || []).some((entry) => entry.type === "admission-evaluation" && entry.specHash === hash);
 }
 
 export function evaluateFactorRegistry(registryInput = {}, context = {}) {
@@ -967,43 +1133,43 @@ export function evaluateFactorRegistry(registryInput = {}, context = {}) {
   const trialEntries = [];
   const transitions = [];
   const factors = registry.factors.map((factor) => {
-    const trialEntry = {
-      id: compactId("factor-eval"),
-      at: now,
-      factorId: factor.factorId,
-      actor: context.actor || "system:evaluator",
-      accepted: false,
-      reason: "evaluated",
-      checks: [],
-    };
-    trialEntries.push(trialEntry);
     if (factor.state === "candidate") {
-      const evidence = admissionEvidenceForFactor(factor, { ...context, trialCount: registry.trialLedger.count + trialEntries.length });
-      trialEntry.accepted = evidence.status === "passed";
-      trialEntry.reason = evidence.status === "passed" ? "candidate admitted to shadow" : "candidate gate failed";
-      trialEntry.checks = [evidence];
+      const specHash = factor.specHash || factorSpecHash(factor);
+      const shouldRecordTrial = !trialLedgerHasAdmissionEvaluation(registry, specHash);
+      const evidence = admissionEvidenceForFactor(factor, { ...context, trialCount: registry.trialLedger.count + (shouldRecordTrial ? 1 : 0) });
+      if (shouldRecordTrial) {
+        trialEntries.push({
+          id: compactId("factor-eval"),
+          type: "admission-evaluation",
+          at: now,
+          factorId: factor.factorId,
+          specHash,
+          actor: context.actor || "system:evaluator",
+          accepted: evidence.status === "passed",
+          reason: evidence.status === "passed" ? "candidate admitted to shadow" : "candidate gate failed",
+          checks: [evidence],
+        });
+      }
       if (evidence.status === "passed") {
         transitions.push({ factorId: factor.factorId, from: factor.state, to: "shadow", evidence });
         return {
           ...factor,
           state: "shadow",
           evidence: { ...(factor.evidence || {}), admission: evidence, status: "shadow" },
-          stateHistory: [{ at: now, from: factor.state, to: "shadow", reason: "mechanical admission gates passed", actor: context.actor || "system:evaluator" }, ...(factor.stateHistory || [])],
+          stateHistory: [{ at: now, from: factor.state, to: "shadow", reason: `mechanical admission gates passed via ${evidence.source}`, actor: context.actor || "system:evaluator" }, ...(factor.stateHistory || [])],
         };
       }
       return { ...factor, evidence: { ...(factor.evidence || {}), latestAdmission: evidence } };
     }
     if (factor.state === "active" || factor.state === "decayed") {
       const decay = decayEvidenceForFactor(factor, context);
-      trialEntry.reason = `decay monitor: ${decay.status}`;
-      trialEntry.checks = [decay];
       if (decay.status === "decay") {
         transitions.push({ factorId: factor.factorId, from: factor.state, to: "decayed", evidence: decay });
         return {
           ...factor,
           state: "decayed",
           evidence: { ...(factor.evidence || {}), latestDecay: decay },
-          stateHistory: [{ at: now, from: factor.state, to: "decayed", reason: "rolling IC <= 0 and avg contribution negative", actor: context.actor || "system:evaluator" }, ...(factor.stateHistory || [])],
+          stateHistory: [{ at: now, from: factor.state, to: "decayed", reason: "two consecutive trailing 60-outcome windows had non-positive IC and negative weighted contribution", actor: context.actor || "system:evaluator" }, ...(factor.stateHistory || [])],
         };
       }
       if (decay.status === "recover") {
@@ -1017,7 +1183,6 @@ export function evaluateFactorRegistry(registryInput = {}, context = {}) {
       }
       return { ...factor, evidence: { ...(factor.evidence || {}), latestDecay: decay } };
     }
-    trialEntry.reason = `state ${factor.state} observed only`;
     return factor;
   });
   const next = {

@@ -409,6 +409,31 @@ const duplicateCandidate = addFactorCandidate(registryWithSeeds, {
 });
 assert.equal(duplicateCandidate.factor.state, "rejected", "Originality gate should reject duplicate op-sequence factor candidates");
 assert.equal(duplicateCandidate.registry.trialLedger.count, registryWithSeeds.trialLedger.count + 1, "Rejected factor candidates should still be recorded in trial ledger");
+const idConflictRegistry = normalizeFactorRegistry({
+  factors: [
+    {
+      factorId: "liveShadowAlpha",
+      family: "momentum",
+      spec: { factorId: "liveShadowAlpha", pipeline: [{ op: "ref", input: "bars.close" }] },
+      expectedSign: 1,
+      prior: "literature",
+      state: "shadow",
+      stateHistory: [],
+      evidence: {},
+    },
+  ],
+});
+const idConflict = addFactorCandidate(idConflictRegistry, {
+  factorId: "liveShadowAlpha",
+  spec: { factorId: "liveShadowAlpha", pipeline: [{ op: "ref", input: "bars.volume" }] },
+});
+assert.equal(idConflict.factor.state, "rejected", "Candidate submission reusing a non-rejected factor id should be rejected");
+assert.match(idConflict.gate.reason, /liveShadowAlpha/, "ID conflict rejection should name the conflicting factor id");
+assert.equal(
+  idConflict.registry.factors.find((item) => item.factorId === "liveShadowAlpha").state,
+  "shadow",
+  "ID conflict rejection must not overwrite the existing shadow factor",
+);
 const corpusTickers = ["AAA", "BBB", "CCC", "DDD"];
 const corpusSlopes = { AAA: 0.6, BBB: 0.25, CCC: -0.15, DDD: -0.45 };
 const corpusBars = [];
@@ -586,6 +611,33 @@ assert.ok(
   evaluatedRegistry.registry.trialLedger.count > registryWithSeeds.trialLedger.count,
   "Factor evaluator should write trial-ledger entries before transitions",
 );
+let repeatedRegistry = evaluatedRegistry.registry;
+const repeatedTrialCount = repeatedRegistry.trialLedger.count;
+for (let index = 0; index < 3; index += 1) {
+  repeatedRegistry = evaluateFactorRegistry(repeatedRegistry, {}).registry;
+}
+assert.equal(
+  repeatedRegistry.trialLedger.count,
+  repeatedTrialCount,
+  "Routine evaluator runs over an unchanged registry should not inflate the trial ledger",
+);
+const correctedLedgerRegistry = normalizeFactorRegistry({
+  trialLedger: {
+    count: 3,
+    entries: [
+      { id: "factor-eval-old-1", reason: "state active observed only" },
+      { id: "factor-eval-old-2", reason: "state shadow observed only" },
+      { id: "factor-trial-old-1", factorId: "oldSubmission", reason: "candidate submitted" },
+    ],
+  },
+  factors: [],
+});
+assert.equal(correctedLedgerRegistry.trialLedger.count, 1, "Ledger normalization should correct inflated routine-evaluation counts");
+assert.equal(
+  correctedLedgerRegistry.trialLedger.entries[0].type,
+  "ledger-correction",
+  "Ledger correction should be append-only and explicit",
+);
 const decayFixture = normalizeFactorRegistry({
   factors: [
     {
@@ -600,12 +652,63 @@ const decayFixture = normalizeFactorRegistry({
     },
   ],
 });
-const decayed = evaluateFactorRegistry(decayFixture, {
-  factorStats: { activeDecayFixture: { samples: 80, rankIC: -0.02, avgExcessPct: -1.1 } },
+const negativeWindowOutcomes = Array.from({ length: 120 }, (_, index) => {
+  const highScore = index % 2 === 0;
+  const decisionAt = new Date(Date.UTC(2026, 1, 1 + index)).toISOString().slice(0, 10);
+  return {
+    ticker: highScore ? "AAA" : "BBB",
+    decisionAt,
+    excessPct: highScore ? -2 : 2,
+    outcomeQualityStatus: "ok",
+    factorSnapshot: {
+      factors: {
+        activeDecayFixture: {
+          score: highScore ? 80 : 20,
+        },
+      },
+    },
+  };
 });
-assert.equal(decayed.registry.factors.find((item) => item.factorId === "activeDecayFixture").state, "decayed", "Decay monitor should demote weak active factors");
+const oneBadWindow = evaluateFactorRegistry(decayFixture, {
+  outcomeSnapshots: negativeWindowOutcomes.slice(0, 60),
+});
+assert.equal(
+  oneBadWindow.registry.factors.find((item) => item.factorId === "activeDecayFixture").state,
+  "active",
+  "Decay monitor should not demote after only one bad 60-outcome window",
+);
+const decayed = evaluateFactorRegistry(decayFixture, {
+  outcomeSnapshots: negativeWindowOutcomes,
+});
+assert.equal(
+  decayed.registry.factors.find((item) => item.factorId === "activeDecayFixture").state,
+  "decayed",
+  "Decay monitor should demote after two consecutive bad 60-outcome windows",
+);
+assert.equal(
+  decayed.registry.factors.find((item) => item.factorId === "activeDecayFixture").evidence.latestDecay.twoBadWindows,
+  true,
+  "Decay evidence should record the two-window condition",
+);
+const positiveWindowOutcomes = Array.from({ length: 60 }, (_, index) => {
+  const highScore = index % 2 === 0;
+  const decisionAt = new Date(Date.UTC(2026, 5, 1 + index)).toISOString().slice(0, 10);
+  return {
+    ticker: highScore ? "AAA" : "BBB",
+    decisionAt,
+    excessPct: highScore ? 2 : -2,
+    outcomeQualityStatus: "ok",
+    factorSnapshot: {
+      factors: {
+        activeDecayFixture: {
+          score: highScore ? 80 : 20,
+        },
+      },
+    },
+  };
+});
 const recovered = evaluateFactorRegistry(decayed.registry, {
-  factorStats: { activeDecayFixture: { samples: 80, rankIC: 0.03, avgExcessPct: 0.6 } },
+  outcomeSnapshots: positiveWindowOutcomes,
 });
 assert.equal(recovered.registry.factors.find((item) => item.factorId === "activeDecayFixture").state, "shadow", "Decay monitor should recover decayed factors after positive IC");
 const researcherIngest = ingestFactorResearcherOutput(registryWithSeeds, {
