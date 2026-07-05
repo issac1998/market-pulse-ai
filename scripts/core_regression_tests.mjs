@@ -45,6 +45,8 @@ import { evaluateFactorSpec, parseFactorSpec } from "../lib/factor_spec.mjs";
 import {
   addFactorCandidate,
   appendFactorPostmortem,
+  evaluateFactorRegistryWithCorpus,
+  evaluateFactorSpecOverCorpus,
   evaluateFactorRegistry,
   ingestFactorResearcherOutput,
   normalizeFactorRegistry,
@@ -332,6 +334,58 @@ const pitFilteredFactor = evaluateFactorSpec(
 );
 assert.equal(pitFilteredFactor.status, "ok", "Factor DSL evaluator should produce values before asOf");
 assert.notEqual(pitFilteredFactor.latest.value, 9999 - 107, "Factor DSL evaluator must filter future rows before evaluation");
+const multiTickerDelta = evaluateFactorSpec(
+  {
+    factorId: "multiTickerDelta",
+    pipeline: [
+      { op: "ref", input: "bars.close" },
+      { op: "delta", window: 5 },
+    ],
+  },
+  {
+    bars: [
+      { ticker: "AAA", date: "2026-01-01", close: 10 },
+      { ticker: "BBB", date: "2026-01-01", close: 20 },
+      { ticker: "AAA", date: "2026-01-02", close: 12 },
+      { ticker: "BBB", date: "2026-01-02", close: 18 },
+      { ticker: "AAA", date: "2026-01-03", close: 15 },
+      { ticker: "BBB", date: "2026-01-03", close: 16 },
+      { ticker: "AAA", date: "2026-01-04", close: 16 },
+      { ticker: "BBB", date: "2026-01-04", close: 15 },
+      { ticker: "AAA", date: "2026-01-05", close: 18 },
+      { ticker: "BBB", date: "2026-01-05", close: 14 },
+      { ticker: "AAA", date: "2026-01-06", close: 21 },
+      { ticker: "BBB", date: "2026-01-06", close: 13 },
+    ],
+  },
+  { asOf: "2026-01-06" },
+);
+const multiTickerDeltaMap = new Map(multiTickerDelta.values.map((row) => [`${row.ticker}|${row.date}`, row.value]));
+assert.equal(multiTickerDeltaMap.get("AAA|2026-01-06"), 11, "Factor DSL delta should be computed within each ticker only");
+assert.equal(multiTickerDeltaMap.get("BBB|2026-01-06"), -7, "Factor DSL delta must not cross ticker boundaries");
+const multiTickerCsRank = evaluateFactorSpec(
+  {
+    factorId: "multiTickerCsRank",
+    pipeline: [
+      { op: "ref", input: "bars.close" },
+      { op: "cs_rank" },
+    ],
+  },
+  {
+    bars: [
+      { ticker: "AAA", date: "2026-01-01", close: 10 },
+      { ticker: "BBB", date: "2026-01-01", close: 20 },
+      { ticker: "AAA", date: "2026-01-02", close: 30 },
+      { ticker: "BBB", date: "2026-01-02", close: 18 },
+    ],
+  },
+  { asOf: "2026-01-02" },
+);
+const csRankMap = new Map(multiTickerCsRank.values.map((row) => [`${row.ticker}|${row.date}`, row.value]));
+assert.equal(csRankMap.get("AAA|2026-01-01"), 0, "cs_rank should rank across tickers on the same date");
+assert.equal(csRankMap.get("BBB|2026-01-01"), 1, "cs_rank should rank the higher same-date value above peers");
+assert.equal(csRankMap.get("AAA|2026-01-02"), 1, "cs_rank should recompute independently for each date");
+assert.equal(csRankMap.get("BBB|2026-01-02"), 0, "cs_rank should not use the whole time series as its peer set");
 const registryWithSeeds = normalizeFactorRegistry({});
 assert.ok(
   registryWithSeeds.factors.some((item) => item.factorId === "netShareIssuance" && item.evidence?.status === "insufficient-data"),
@@ -353,6 +407,80 @@ const duplicateCandidate = addFactorCandidate(registryWithSeeds, {
 });
 assert.equal(duplicateCandidate.factor.state, "rejected", "Originality gate should reject duplicate op-sequence factor candidates");
 assert.equal(duplicateCandidate.registry.trialLedger.count, registryWithSeeds.trialLedger.count + 1, "Rejected factor candidates should still be recorded in trial ledger");
+const corpusTickers = ["AAA", "BBB", "CCC", "DDD"];
+const corpusSlopes = { AAA: 0.6, BBB: 0.25, CCC: -0.15, DDD: -0.45 };
+const corpusBars = [];
+const corpusOutcomes = [];
+const corpusRegimes = [];
+const corpusDates = Array.from({ length: 280 }, (_, index) => {
+  const date = new Date(Date.UTC(2024, 0, 1 + index));
+  return date.toISOString().slice(0, 10);
+});
+for (const [ticker, slope] of Object.entries(corpusSlopes)) {
+  for (let index = 0; index < corpusDates.length; index += 1) {
+    const close = 100 + slope * index;
+    corpusBars.push({
+      ticker,
+      date: corpusDates[index],
+      open: close - slope / 2,
+      high: close + 1,
+      low: close - 1,
+      close,
+      volume: 1_000_000 + index,
+    });
+  }
+}
+const corpusDecisionDates = corpusDates.slice(252, 276).filter((_, index) => index % 5 === 0);
+for (const [regimeIndex, date] of corpusDecisionDates.entries()) {
+  corpusRegimes.push({ date, bucket: ["riskOn", "neutral", "riskOff"][regimeIndex % 3], risk_score: 30 + regimeIndex });
+  for (const [ticker, slope] of Object.entries(corpusSlopes)) {
+    for (const horizonDays of [20, 60]) {
+      corpusOutcomes.push({
+        ticker,
+        horizon_days: horizonDays,
+        decision_at: date,
+        excess_pct: slope * 10,
+        outcome_quality_status: "ok",
+      });
+    }
+  }
+}
+const week52CorpusEvidence = await evaluateFactorSpecOverCorpus(
+  registryWithSeeds.factors.find((item) => item.factorId === "week52HighProximity").spec,
+  {
+    db: {
+      bars: corpusBars,
+      historicalOutcomes: corpusOutcomes,
+      historicalRegimes: corpusRegimes,
+    },
+    universe: corpusTickers,
+    dateGrid: corpusDecisionDates,
+  },
+);
+assert.equal(week52CorpusEvidence.source, "historical-corpus", "Corpus factor evidence should be labeled as historical-corpus");
+assert.ok(week52CorpusEvidence.horizons["20"].n > 0, "Corpus factor evidence should include horizon cells with n");
+assert.ok(Number.isFinite(week52CorpusEvidence.horizons["20"].rankIC), "Corpus factor evidence should compute rankIC");
+assert.ok(week52CorpusEvidence.regimeSigns >= 2, "Corpus factor evidence should carry regime sign checks");
+const corpusAdmitted = await evaluateFactorRegistryWithCorpus(registryWithSeeds, {
+  db: {
+    bars: corpusBars,
+    historicalOutcomes: corpusOutcomes,
+    historicalRegimes: corpusRegimes,
+  },
+  universe: corpusTickers,
+  dateGrid: corpusDecisionDates,
+  maxCorpusFactors: 9,
+});
+assert.equal(
+  corpusAdmitted.registry.factors.find((item) => item.factorId === "week52HighProximity").state,
+  "shadow",
+  "Mechanical evaluator should admit a B3 seed using computed corpus evidence without manual overrides",
+);
+assert.equal(
+  corpusAdmitted.registry.factors.find((item) => item.factorId === "week52HighProximity").evidence.admission.source,
+  "historical-corpus",
+  "B3 seed admission should record the computed corpus evidence source",
+);
 const evaluatedRegistry = evaluateFactorRegistry(registryWithSeeds, {
   evidenceOverrides: {
     week52HighProximity: {

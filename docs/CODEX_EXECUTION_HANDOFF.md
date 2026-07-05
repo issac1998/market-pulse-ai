@@ -185,3 +185,119 @@ All five live in `server/historical_backtest.mjs` metrics/report assembly (engin
 
 - WP10 first (F9/F11 poison all gate math). WP11 → WP12 strictly ordered. WP13 can start in parallel with WP12 (touches different files). WP14 needs WP10+WP11+WP13. WP15 needs WP14. WP16 needs WP12+WP14.
 - Sequencing rationale (from the plan): measurement fixes before the LLM loop — gates built on tie-clumped, biased scores would admit and kill the wrong factors.
+
+---
+
+# Round 2 external review (Claude, 2026-07-05, commits 8adbed7..db6cd7e) — verdict + Round 3 queue
+
+## Per-WP verdicts
+
+| WP | Verdict | Notes |
+|----|---------|-------|
+| WP10 | ✅ pass | MaxDD −18.30% (was −100%), headline metrics non-null, 17 weight windows, icDecay 6 horizon cells, regimeSplit 3 buckets, SQLite persistence + pagination. Daily book = equal-weight mark-to-market from `historical_bars`, exact-MaxDD fixture present. Absolute return levels remain survivorship-inflated (known corpus caveat) — treat structure, not level, as the signal. |
+| WP11 | ✅ pass (high quality) | `applyCrossSectionalNormalization` (recommender_core) is correct: winsorize 1/99 → tie-averaged percentile rank → continuous float; `<30` static-baseline fallback; live + historical share the code path (parity holds). All four availability bonuses verified removed in the scorers; flow term is ADV-normalized and null when ADV missing; per-factor quality shrinkage + softened multiplier tiers in `recommendation-score-v2`; `schemaMix` tagging present. Fixtures verified green. |
+| WP12 | ✅ pass | Sub-signal decomposition matches the binding lists exactly (`buildFactorSubSignals`, server.mjs ≈20848); shared `buildFactorStatsFromOutcomes` produces per-sub-signal + per-horizon stats with `n` everywhere; live `factorCorrelationMatrix` + high-|ρ| pairs; news decay `2^(−age/36)` with 0.5 missing-timestamp default; IC weighting shipped disabled as specified. |
+| WP13 | ✅ pass | DSL parse gates solid (closed whitelist, window menu, ≤8 steps / ≤3 windowed); asOf filtering inside the evaluator verified by independent poisoned-future test (n=0). Registry + trial ledger + 4 routes + SQLite mirrors; empty accrual tables reported `insufficient-data` honestly; native-implementation contradictions recorded, not faked. |
+| WP14 | ⚠️ conditional | Gate *logic* is correct and fails closed; flags default off; llmGovernance stamps truthful; shadow factors excluded from weights by construction. BUT the two evidence engines are stubs — see R1/R2 below. The candidate→shadow verification walked on `manual-evidence-override`, not computed evidence. |
+| WP15 | ✅ pass | Agent file matches house format; tools read-only; ingest goes through parse+originality gates; only creates `candidate` entries with `createdBy:"llm:factor_researcher"`; post-mortems land in registry memory; mock-invoker E2E green; lifecycle UI board renders. One integrity bug (R3a). |
+| WP16 | ✅ pass with refinement | `effectiveN` = unique-decision dedupe across horizons, honestly labeled; IC-composite plan reads only mechanical stats and enters as `status:"candidate"` strategy version; B4/B5 seeded with `blocked-data-depth` recorded for 13F. Within-horizon time overlap not yet addressed (R4a). |
+
+Mechanical checks re-run externally: `node --check` all touched files ✓, `core_regression_tests` ✓, route inventory `--check` ✓ (81 routes), Python compiles ✓, independent DSL smoke test ✓.
+
+**Bottom line: the lifecycle skeleton, governance, and measurement layer are real and well-built. But the loop cannot yet validate a factor end-to-end on its own evidence: nothing evaluates candidate specs over the historical corpus, and live shadow factors are injected with a constant score of 50 (zero variance ⇒ IC can never accrue). Round 3 closes exactly that.**
+
+Unrelated working-tree note: uncommitted `public/app.js`/`public/styles.css` (uzi-analysis feature), `README.md`, and two doc edits predate this round — do **not** revert or absorb them into Round-3 commits.
+
+## Round 3 queue — execute in order (same ground rules 1–14; ticks/report protocol unchanged)
+
+## ☑ WP17 — Corpus evidence engine (closes the candidate→shadow loop on real evidence; CRITICAL)
+
+The missing piece found in review: `admissionEvidenceForFactor` (server/factor_registry.mjs) only reads `evidenceOverrides` / stored `factor.evidence` / live factorStats — nothing computes evidence from `historical_bars` + walk-forward outcomes. Build the engine:
+
+- **Multi-ticker DSL semantics first** (in `lib/factor_spec.mjs`): `refSeries`/`overnight_return`/rolling ops currently mix tickers into one date-sorted series — `delta`/`ts_*` would compute across ticker boundaries on multi-ticker datasets. Group all series ops by ticker. Make `cs_rank`/`cs_zscore` true per-date cross-sectional ops (rank across tickers at each date); currently they rank over the whole time series, which is a mislabeled `ts_rank`. Keep the operator whitelist closed. Fixture: a 2-ticker dataset where per-ticker delta and per-date cs_rank are hand-checkable.
+- **`evaluateFactorSpecOverCorpus(spec, {db, universe, dateGrid})`** (new, in `server/factor_registry.mjs` or a sibling module): per rebalance date (weekly grid is fine), evaluate the spec per ticker from SQLite (`historical_bars`, `pit_fundamentals`, accrual tables) strictly ≤ asOf, cross-sectionally rank the values, join to the WP10 `historical_outcomes` tables per horizon, and compute: rankIC + `effectiveN` + t-stat per horizon, per regime bucket (join `historical_regimes`), coverage (fraction of universe with computable values), and score-series correlation vs each active/shadow factor (aligned on ticker+date pairs — the current originality correlation aligns by array index, which is meaningless; fix it there too). Write the result into `factor.evidence` with `source:"historical-corpus"`, every cell carrying `n`/`effectiveN`.
+- Wire `evaluateFactorRegistry` to call this for `candidate` factors (batch, resumable; cap runtime per factor); `manual-evidence-override` stays allowed but must be labeled in `stateHistory.reason` and should no longer be the only path.
+- **Verify**: at least one B3 seed (e.g. `week52HighProximity` or `overnightGapBias21`) gets fully computed corpus evidence (IC × horizon × regime with n) and passes or fails the gates on that evidence alone — no overrides; a poisoned-future fixture at the corpus-engine level; the two-ticker DSL fixtures green.
+
+## ☐ WP18 — Real live shadow computation + shadow→active promotion emitter (CRITICAL)
+
+- `shadowFactorsForContext` (server.mjs ≈21257) currently injects `score: 50, quality: 0` constants — zero cross-sectional variance, so live IC can never accrue and the shadow phase is decorative. Replace: for each `shadow` registry factor, assemble a per-ticker dataset from run context + accrual tables (bars from the technical chart / Longbridge kline cache, `options_snapshots` for ivHistory, `analyst_revision_history`, `short_interest_history`, PIT facts) and evaluate the spec (DSL or native) per ticker. Real values flow into `applyCrossSectionalNormalization` alongside core factors (they already pass through it — constants were the only reason it was inert). Keep `quality` honest (coverage-based), keep `weightEligible:false` and exclusion from the weights map exactly as now. Tickers where the spec has insufficient data ⇒ `score:null`/missing, never a fabricated 50-with-quality.
+- Native evaluator functions for the 5 `implementation:"native"` seeds, registered in one dispatch map (same registry entry, no DSL whitelist changes): `ivRvSpread` (iv_atm − annualized ts_std of daily returns, 21d), `residualMomentum` (60d return residual vs SPY + sector-basket regression using `buildBenchmarkBasket`), `amihudIlliquidity21` (mean |daily return| / dollar volume), `insiderClusterBuy` (≥2 distinct Form 4 insiders buying within 30d — contradiction protocol if Form 4 rows lack insider identity), `institutionalBreadthDelta` (stays `blocked-data-depth` until 13F holdings-level sync exists — do not fake).
+- **Shadow→active promotion emitter** (missing entirely — grep found no path): when a shadow factor reaches ≥50 usable live outcomes AND live rankIC sign matches historical AND |ρ| < 0.6 holds, emit a **candidate strategy version** including the factor at weight 0.015 (normalization redistributes; step caps apply) with the evidence attached in the changelog. Human promote via the WP8 API remains the only activation. Also emit the **weight-floor candidate strategy version** on decay of any factor present in active weights (the current decay path changes registry state but never touches a strategy version).
+- **Verify**: a live run shows shadow factors with non-constant cross-sectional scores (fixture: two tickers, different spec inputs ⇒ different shadow scores); shadow outcomes accrue into factorStats with real rankIC after simulated outcomes; the promotion emitter produces a `status:"candidate"` version with weight 0.015 and never touches active weights; decay on an active-weighted factor emits a floor candidate version.
+
+## ☐ WP19 — Registry integrity + ledger semantics + decay windows (bugs found in review)
+
+- **R3a — id-clobber bug**: `addFactorCandidate` replaces any same-`factorId` entry wholesale (`factors.filter(item => item.factorId !== factorId)`), so an LLM proposal reusing an existing id can silently overwrite a shadow/active factor's state and history — a ground-rule-12 violation surface. Reject submissions whose `factorId` already exists in any non-`rejected` state (error names the conflict); rejected ids may be reused.
+- **R3b — trial-ledger inflation**: `evaluateFactorRegistry` writes a ledger entry per factor per evaluation run (~20/run including "state observed only"), so the escalation hurdle rises with routine monitoring instead of with distinct hypotheses. Count a trial ONLY on (a) new candidate submission (human or LLM) and (b) first admission evaluation of a distinct spec hash; routine re-evaluations and decay monitoring log to `stateHistory`/audit, not the ledger. Migrate the existing inflated count with an append-only correction entry (record old count, new count, rule).
+- **R3c — decay-window semantics**: current monitor uses full-sample pooled stats (`n ≥ 60 && rankIC ≤ 0 && avgExcessPct < 0`). Implement the spec: rolling window of the **trailing 60 usable outcomes**, demotion only after **2 consecutive** negative windows; add the redundancy check (|ρ| > 0.85 vs a higher-IC factor ⇒ retirement recommendation, needs the WP17 correlation machinery); auto-recovery stays.
+- **R3d — originality correlation alignment**: fixed as part of WP17 (align score series on ticker+date); confirm the gate uses it.
+- **Verify**: fixture — proposal reusing a shadow factor's id is rejected with the conflict named; ledger fixture — 3 evaluator runs over an unchanged registry add 0 trials; decay fixture — one bad window does not demote, two consecutive do; migration entry present and append-only.
+
+## ☐ WP20 — Statistical refinements (after WP17/WP18 are producing evidence)
+
+- **Within-horizon overlap**: `effectiveN` currently dedupes multi-horizon rows of one decision but not adjacent-day decisions whose T+20/T+60 windows share most of their path. Add calendar-based non-overlap subsampling per horizon (keep every ⌈horizon⌉-th decision date per ticker) as the t-stat basis, or Newey-West with lag = horizonDays as a labeled alternative; report both `effectiveN` variants with method labels.
+- **`revisionMomentum` spec semantics**: once `analyst_revision_history` accrues rows, sanity-check `ref revisions.upgrades → delta 21` against hand-computed 30d revision breadth for 3 tickers; adjust the spec (not the whitelist) if the field mapping is off.
+- **Hurdle formula re-check**: with R3b's honest trial counting, re-derive the escalation (base 3.0/3.5 + 0.1 per doubling beyond 8 trials) and document the current trial count in the report payload.
+- **Verify**: both effectiveN variants visible with method labels and `effectiveN ≤ n` always; a hand-checked revision-breadth comparison recorded in the execution doc.
+
+## Round-3 dependency notes
+
+- WP17 → WP18 → (WP19 ∥ WP20-after-evidence). WP19's R3a/R3b can land any time (independent bug fixes) — if WP17 stalls on corpus/data issues, do WP19 first and log the blocker.
+- Do not re-verify WP10–WP16 items; they are accepted. Round 3 must not change scoring semantics landed in WP11/WP12 (cross-sectional rank, shrinkage, sub-signal lists) — extend, don't rewrite.
+
+---
+
+# Round 4 — Runtime performance, security & operational reliability (WP21–WP24)
+
+> Written: 2026-07-05 (Claude — whole-codebase deep review: bugs, performance, and settings/workflows that discount outcomes or hurt UX). All numbers below were **measured live** on the current build — do not re-derive, fix. Same ground rules 1–14.
+
+**Measured facts driving this round** (evidence basis, 2026-07-05):
+`store.json` = 110.4 MB pretty-printed; the identical content is **58.9 MB compact (47% waste)**. A full `JSON.stringify(store, null, 2)` costs ~325 ms and `structuredClone` of the store a comparable amount — both **synchronous on the event loop, executed on every `saveStore`**, plus `archiveRuns` rewrites every full run file (~60 MB of pretty JSON) on every save, plus the debounced SQLite mirror re-parses the full store in Python (**2.9 s**) per save. `/api/state` = **25.9 MB, uncompressed** (no gzip anywhere in `http_responses.mjs`), ~1.05 s server time per load. Store composition: collection `runs` 63.9 MB (biggest run 12.4 MB: stockNarratives 3.78 + socialHotStocks 3.18 + technicals 2.27), `allStockAgent.runs` 39.8 MB (24 retained agent runs × 1.64 MB of full evaluations), articleCache 6.3 MB. `server.listen(PORT)` binds **0.0.0.0**. `readBody` has **no size cap**. Scheduler catch-up window = 75 min with no on-start/on-wake makeup → the June-30→July-5 five-day data gap happened silently. The 1,000-date walk-forward blocked the event loop ~137 s (compute is in-process).
+
+## ☐ WP21 — Security & transport (small, do first)
+
+- **S1 — bind localhost by default**: `server.listen(PORT, process.env.HOST || "127.0.0.1")`. Rationale: the API currently exposes `.env` editing (`/api/config/env`), order-draft creation, and strategy promote to the whole LAN with zero auth — a direct violation of the roadmap's "local-only by default" principle. `HOST=0.0.0.0` remains an explicit opt-out; when non-loopback, log a startup warning and show a banner in the config center.
+- **S2 — request body cap**: `readBody` (server/http_requests.mjs) must cap at 2 MB (configurable `MAX_REQUEST_BODY_BYTES`) and respond 413 beyond it; JSON parse failures return 400 with a structured error, never a crash.
+- **S3 — gzip responses**: `sendJson`/static serving negotiate `Accept-Encoding` and gzip payloads > 64 KB (Node `zlib`). `/api/state` is 25.9 MB raw and JSON compresses ~8–10×; this is the single cheapest UX win in the repo.
+- **Verify**: request from another interface refused by default; 3 MB POST → 413; `curl -H 'Accept-Encoding: gzip' /api/state` returns `Content-Encoding: gzip` with size < 4 MB; UI loads normally.
+
+## ☐ WP22 — Save-path & store performance (the event-loop stalls)
+
+Every store mutation currently costs: structuredClone(full store) + stringify-pretty(full store) + full-payload string compare + rewrite of all run archives + a 2.9 s Python full re-sync. With the watcher enabled (2-min ticks that call `saveStore` even when nothing fired) this repeats all day.
+
+- **P1 — compact JSON**: write `JSON.stringify(payload)` (no indent) in `saveStore` AND `archiveRuns`. Immediate ~47% disk cut (110 → 59 MB) at zero risk; keep a `STORE_PRETTY_JSON=true` escape hatch for debugging.
+- **P2 — stop retaining full payload strings**: replace `storeLastSavedPayload === payload` with a sha256 hash comparison (keep only the hash) — frees ~200 MB steady-state RSS.
+- **P3 — incremental archives**: `archiveRuns` keeps an in-memory `Map<runId, contentHash>` and writes only new/changed runs, not all 20 per save.
+- **P4 — dirty-aware watcher saves**: `runIntradayWatcherAndSave` skips `saveStore` when the tick produced no alerts, no consensus snapshots, and no state change.
+- **P5 — slim retained payloads** (append-only trimming; never touch frozen decisions/outcomes):
+  - collection runs: store at most 60 K-line bars per ticker inside a run's `technicals` (full series already lives in the caches); `stockNarratives` keep full text only in the latest 3 runs (older runs keep per-ticker one-line summaries); `socialHotStocks` deduped by post id within a run.
+  - agent runs: full `evaluations` retained only for the latest 3 agent runs; older agent runs keep decision/candidate lists + summary (target: `allStockAgent` ≤ 12 MB).
+- **P6 — incremental SQLite sync**: `sqlite_store_sync.py` accepts `--since <runId|timestamp>` and the debounced auto-sync passes the last-synced watermark, so a routine save re-syncs only the delta (full sync stays available via CLI/`/api/sqlite/sync`).
+- **P7 — walk-forward off the event loop**: `runHistoricalWalkForwardFromRows` executes in a `worker_threads` Worker (or child `node` process with JSON hand-off); the HTTP handler awaits without blocking other requests. Verify by hitting `/api/run/status` every 2 s during a 500-date run — all responses < 500 ms.
+- **Verify**: p95 `saveStore` wall time < 150 ms over 20 consecutive watcher-tick saves (log timing into `storePersistenceStatus`); store.json ≤ 60 MB after first compact save; archive mtimes show only changed runs rewritten; server responsive during a walk-forward.
+
+## ☐ WP23 — Scheduler reliability & staleness honesty (the silent 5-day gap)
+
+The system silently served June-30 data as "today's" content for five days. Freshness badges exist but nothing *acted* on staleness and nothing told the owner a run was missed.
+
+- **W1 — startup/wake catch-up**: on server start and once per hour, if today is a NYSE trading day and the expected session's run (pre after 07:45+grace, post after 16:30+grace NY time) is missing, trigger the collection run (same-trading-day only — never backfill prior days as if fresh) and record `trigger:"catch-up"`. The 75-min `SCHEDULE_CATCH_UP_MINUTES` window stays for the normal tick; this is the safety net above it.
+- **W2 — missed-run alerting**: when a scheduled session is detected as missed (not merely late), append an `alerts` entry + `audit_events` row, and if push (WP2) is configured, send one push. The Today desk shows a red "数据已过期 N 个交易日" banner when the newest run is older than 1 trading day (currently only a quiet freshness timestamp).
+- **W3 — stale-source hard gate for the agent**: if the agent's source collection run is older than `AGENT_MAX_SOURCE_AGE_HOURS` (default 36), every buy auto-downgrades to research with explicit gate id `stale_source_run` (instead of relying on incidental `missing_price_or_data`), and the run summary says so. Outcome tracking of those research decisions continues — they are honest, labeled samples.
+- **W4 — deadline-aware LLM budgets for scheduled runs**: pre-market runs must finish before the open. Scheduled (not manual) runs use a per-stage LLM ceiling (`SCHEDULE_LLM_STAGE_TIMEOUT_MS`, default 90 s; local fallback beyond) instead of the interactive `LLM_FULL_REPORT_TIMEOUT_MS=600 s` — a hung provider currently delays the morning report by 10+ minutes per stage.
+- **Verify**: restart the server across a missed scheduled time → catch-up run fires with `trigger:"catch-up"` + alert row; simulate a 3-day-old newest run → red Today banner and agent downgrades all buys with `stale_source_run`; scheduled-run LLM stages observed ≤ 90 s in audit timings.
+
+## ☐ WP24 — Sample-accrual guarantee (settings that starve the learning loop)
+
+Even after WP1, live evidence shows **0 tracked buy decisions on recent runs**: every top scorer is either a held position (`allowAddToExisting=false` excludes it from `buyEligible` entirely) or stale-data-vetoed. Quiet/stale days produce zero outcome samples — the single biggest discount on the final outcome, because the learning loop cannot earn authority without samples.
+
+- **A1 — always-track research fallback**: after normal buy selection, if tracked buy decisions < `MIN_TRACKED_DECISIONS_PER_RUN` (default 5), log the top-scoring remaining evaluations (by `actionScore`, requiring `dataQualityScore ≥ minDataQuality`, cooldown-respecting, positions included) as decisions with `actionable:false`, `status:"open"`, `trackingReason:"starvation-backfill"` — outcome-tracked, excluded from the paper book and Today's actionable list. Factor stats gain a `trackingReason` split so backfill samples are distinguishable (and excludable) in analysis.
+- **A2 — held-position signal tracking**: `hasPosition` names skip `buyEligible` (correct for trading) but their *signals* are exactly as informative — A1's pool must include them (decision records carry `hasPosition:true`).
+- **A3 — starvation telemetry**: run summary reports `trackedDecisions`, `starvationBackfill` count, and consecutive-zero days; ≥3 consecutive zero-tracked days raises an alert (through the W2 channel).
+- **Verify**: run the agent against the current (stale) store → ≥5 tracked decisions exist with `trackingReason:"starvation-backfill"`, none in the paper book or actionable list; factor-stats view shows the split with `n`; regression fixture for the backfill selection.
+
+## Round-4 dependency notes
+
+- Order: **WP21 (hours) → WP22 → WP23 ∥ WP24.** WP22's P1/P2 must land before the intraday watcher is enabled for real (otherwise every 2-min tick pays the full save cost).
+- WP22-P5 trimming must not touch `decisions`, `outcomeSnapshots`, `strategyVersions`, or anything frozen — display/derived payloads only. If a trim would lose data the UI still reads, keep the data and log the conflict.
+- Round 4 deliberately contains **no scoring-semantics changes**; it is safe to interleave with Round 3.

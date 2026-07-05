@@ -1288,3 +1288,58 @@ Regression fixtures added:
 Contradictions:
 
 - `institutionalBreadthDelta` remains blocked because the current 13F sync is filing-level-only and does not provide holdings-level point-in-time holder breadth by ticker. The factor is recorded as `implementation:"native"` with `evidence.status:"blocked-data-depth"`; no synthetic breadth data is fabricated.
+
+---
+
+## WP17 — Corpus Evidence Engine — 2026-07-05
+
+Implemented Round 3 WP17.
+
+Changes:
+
+- Fixed Factor DSL multi-ticker semantics in `lib/factor_spec.mjs`:
+  - rolling operators, `delta`, `ts_*`, `ts_corr`, and `overnight_return` now operate within each ticker.
+  - `cs_rank` and `cs_zscore` now operate cross-sectionally per date.
+  - binary alignment now uses `ticker|date` rather than date-only joins.
+- Added ticker/date-aligned score-series correlation for originality checks in `server/factor_registry.mjs`.
+- Added `evaluateFactorSpecOverCorpus()`:
+  - loads from SQLite or in-memory fixtures.
+  - evaluates DSL factor scores on a rebalance date grid.
+  - joins to `historical_outcomes` by ticker/date/horizon.
+  - computes horizon rankIC, raw `n`, `effectiveN`, t-stat, regime buckets, coverage, and active/shadow correlation.
+  - labels evidence as `source:"historical-corpus"` and keeps `n/effectiveN` on every stat cell.
+- Added `evaluateFactorRegistryWithCorpus()` and wired `/api/factors/evaluate` to use it with the SQLite mirror by default.
+- Regenerated route inventory after the server route implementation changed.
+
+Verification:
+
+```text
+$ node --check lib/factor_spec.mjs
+pass
+
+$ node --check server/factor_registry.mjs
+pass
+
+$ node --check server.mjs
+pass
+
+$ node --check public/app.js
+pass
+
+$ node scripts/core_regression_tests.mjs
+core_regression_tests: ok
+
+$ node scripts/generate_route_inventory.mjs
+{"status":"ok","routes":81,"uiFetches":43,"storeKeys":26}
+```
+
+Regression fixtures added:
+
+- Two-ticker DSL fixture proves `delta` does not cross ticker boundaries.
+- Two-ticker DSL fixture proves `cs_rank` is recomputed per date.
+- Historical corpus fixture computes `week52HighProximity` evidence with horizon and regime `n`.
+- Registry fixture admits the B3 `week52HighProximity` seed to `shadow` using computed `historical-corpus` evidence, without manual overrides.
+
+Contradictions:
+
+- None.

@@ -4,6 +4,7 @@ import {
   parseFactorSpec,
 } from "../lib/factor_spec.mjs";
 import { numberOrNull } from "../lib/market_core.mjs";
+import { execFile } from "node:child_process";
 
 const REGISTRY_SCHEMA = "factor-registry-v1";
 const STATES = new Set(["candidate", "shadow", "active", "decayed", "retired", "rejected"]);
@@ -16,8 +17,46 @@ function text(value = "") {
   return String(value || "").trim();
 }
 
+function safeTicker(value = "") {
+  return String(value || "").toUpperCase().replace(/[^A-Z0-9.-]/g, "").slice(0, 16);
+}
+
+function ymd(value = "") {
+  const raw = text(value);
+  if (!raw) return "";
+  const compact = raw.replace(/[^\d]/g, "");
+  if (/^\d{8}$/.test(compact)) return `${compact.slice(0, 4)}-${compact.slice(4, 6)}-${compact.slice(6, 8)}`;
+  const parsed = new Date(raw);
+  return Number.isFinite(parsed.getTime()) ? parsed.toISOString().slice(0, 10) : raw.slice(0, 10);
+}
+
 function compactId(prefix = "factor") {
   return `${prefix}-${Date.now()}-${Math.random().toString(16).slice(2, 8)}`;
+}
+
+function sqlText(value = "") {
+  return String(value || "").replace(/'/g, "''");
+}
+
+function sqliteJson(dbPath, sql, timeoutMs = 30000) {
+  return new Promise((resolve, reject) => {
+    execFile("sqlite3", ["-json", dbPath, sql], { timeout: timeoutMs, maxBuffer: 64 * 1024 * 1024 }, (error, stdout, stderr) => {
+      if (error) {
+        reject(new Error(`${error.message}${stderr ? `; ${stderr}` : ""}`));
+        return;
+      }
+      const raw = String(stdout || "").trim();
+      if (!raw) {
+        resolve([]);
+        return;
+      }
+      try {
+        resolve(JSON.parse(raw));
+      } catch (parseError) {
+        reject(new Error(`sqlite3 JSON parse failed: ${parseError.message}; output=${raw.slice(0, 300)}`));
+      }
+    });
+  });
 }
 
 function seedFactor(factorId, family, spec, extra = {}) {
@@ -314,6 +353,29 @@ function rankCorrelation(xs = [], ys = []) {
   return dx2 && dy2 ? numerator / Math.sqrt(dx2 * dy2) : null;
 }
 
+function alignedSeriesRankCorrelation(left = [], right = []) {
+  const rightMap = new Map(
+    (right || [])
+      .map((row) => [`${safeTicker(row.ticker)}|${ymd(row.date)}`, numberOrNull(row.score ?? row.value)])
+      .filter(([, value]) => Number.isFinite(value)),
+  );
+  const xs = [];
+  const ys = [];
+  for (const row of left || []) {
+    const key = `${safeTicker(row.ticker)}|${ymd(row.date)}`;
+    const rv = rightMap.get(key);
+    const lv = numberOrNull(row.score ?? row.value);
+    if (Number.isFinite(lv) && Number.isFinite(rv)) {
+      xs.push(lv);
+      ys.push(rv);
+    }
+  }
+  return {
+    rho: rankCorrelation(xs, ys),
+    n: xs.length,
+  };
+}
+
 export function factorOriginalityGate(registry = {}, candidateSpec = {}, dataset = null) {
   const parsed = parseFactorSpec(candidateSpec);
   const candidateOps = factorSpecOpSequence(parsed);
@@ -332,8 +394,9 @@ export function factorOriginalityGate(registry = {}, candidateSpec = {}, dataset
     for (const factor of registry.factors || []) {
       if (factor.implementation !== "dsl" || !factor.spec?.pipeline?.length) continue;
       const existingEval = evaluateFactorSpec(factor.spec, dataset, {});
-      const rho = rankCorrelation(candidateEval.values.map((row) => row.value), existingEval.values.map((row) => row.value));
-      checks.push({ factorId: factor.factorId, type: "score-series", rho, n: Math.min(candidateEval.n, existingEval.n) });
+      const aligned = alignedSeriesRankCorrelation(candidateEval.values, existingEval.values);
+      const rho = aligned.rho;
+      checks.push({ factorId: factor.factorId, type: "score-series", rho, n: aligned.n, alignment: "ticker-date" });
       if (Number.isFinite(rho) && Math.abs(rho) > 0.9) {
         return { ok: false, reason: `score-series correlation ${rho.toFixed(2)} vs ${factor.factorId}`, checks };
       }
@@ -473,10 +536,372 @@ export function advanceFactorState(registryInput = {}, factorId = "", nextState 
   return { registry: { ...registry, factors }, factor: factors.find((item) => item.factorId === factorId) };
 }
 
+function mean(values = []) {
+  const rows = values.filter(Number.isFinite);
+  return rows.length ? rows.reduce((sum, value) => sum + value, 0) / rows.length : null;
+}
+
+function rankScoreRows(rows = []) {
+  const sorted = rows
+    .map((row, index) => ({ ...row, index, rawValue: numberOrNull(row.rawValue ?? row.value) }))
+    .filter((row) => Number.isFinite(row.rawValue))
+    .sort((a, b) => a.rawValue - b.rawValue);
+  const out = [];
+  for (let index = 0; index < sorted.length; index += 1) {
+    let end = index;
+    while (end + 1 < sorted.length && sorted[end + 1].rawValue === sorted[index].rawValue) end += 1;
+    const score = sorted.length > 1 ? ((index + end) / 2 / (sorted.length - 1)) * 100 : 50;
+    for (let cursor = index; cursor <= end; cursor += 1) out.push({ ...sorted[cursor], score });
+    index = end;
+  }
+  return out.sort((a, b) => a.index - b.index).map(({ index, ...row }) => row);
+}
+
+function dateGridFromBars(bars = [], options = {}) {
+  const step = Math.max(1, Number(options.stepDays || 5));
+  const maxDates = Math.max(1, Number(options.maxDates || 120));
+  const dates = [...new Set((bars || []).map((row) => ymd(row.date)).filter(Boolean))].sort();
+  const selected = [];
+  for (let index = 0; index < dates.length; index += step) selected.push(dates[index]);
+  if (dates.length && selected.at(-1) !== dates.at(-1)) selected.push(dates.at(-1));
+  return selected.slice(-maxDates);
+}
+
+function latestRowsByDate(values = [], dateGrid = [], universe = []) {
+  const byTicker = new Map();
+  for (const row of values || []) {
+    const ticker = safeTicker(row.ticker);
+    const date = ymd(row.date);
+    const value = numberOrNull(row.value);
+    if (!ticker || !date || !Number.isFinite(value)) continue;
+    if (!byTicker.has(ticker)) byTicker.set(ticker, []);
+    byTicker.get(ticker).push({ ticker, date, rawValue: value });
+  }
+  for (const rows of byTicker.values()) rows.sort((a, b) => a.date.localeCompare(b.date));
+  const tickers = (universe || []).map(safeTicker).filter(Boolean);
+  const out = [];
+  for (const date of dateGrid || []) {
+    const crossSection = [];
+    for (const ticker of tickers) {
+      const rows = byTicker.get(ticker) || [];
+      let latest = null;
+      for (const row of rows) {
+        if (row.date <= date) latest = row;
+        else break;
+      }
+      if (latest) crossSection.push({ ticker, date, rawValue: latest.rawValue, valueDate: latest.date });
+    }
+    out.push(...rankScoreRows(crossSection));
+  }
+  return out;
+}
+
+function factorScoreRowsForDataset(specInput = {}, dataset = {}, options = {}) {
+  const spec = parseFactorSpec(specInput);
+  const bars = Array.isArray(dataset.bars) ? dataset.bars : [];
+  const universe = (options.universe?.length ? options.universe : [...new Set(bars.map((row) => safeTicker(row.ticker)).filter(Boolean))]).map(safeTicker).filter(Boolean);
+  const dateGrid = (options.dateGrid?.length ? options.dateGrid : dateGridFromBars(bars, options)).map(ymd).filter(Boolean);
+  const asOf = dateGrid.at(-1) || options.asOf || "";
+  const evaluation = evaluateFactorSpec(spec, dataset, { asOf });
+  const scoreRows = latestRowsByDate(evaluation.values, dateGrid, universe);
+  const byDate = new Map();
+  for (const row of scoreRows) {
+    if (!byDate.has(row.date)) byDate.set(row.date, 0);
+    byDate.set(row.date, byDate.get(row.date) + 1);
+  }
+  const coverageByDate = dateGrid.map((date) => ({
+    date,
+    n: byDate.get(date) || 0,
+    coverage: universe.length ? (byDate.get(date) || 0) / universe.length : 0,
+  }));
+  return {
+    spec,
+    evaluation,
+    scoreRows,
+    coverageByDate,
+    coverage: mean(coverageByDate.map((row) => row.coverage)) ?? 0,
+    universe,
+    dateGrid,
+  };
+}
+
+function summarizeHorizonPairs(pairs = [], expectedSign = 1) {
+  const xs = pairs.map((row) => row.score);
+  const ys = pairs.map((row) => row.excessPct);
+  const rankIC = rankCorrelation(xs, ys);
+  const uniqueDecisionKeys = new Set(pairs.map((row) => `${row.ticker}|${row.decisionAt}`)).size;
+  const effectiveN = Math.min(pairs.length, uniqueDecisionKeys);
+  const tStat = Number.isFinite(rankIC) && effectiveN > 2 ? rankIC * Math.sqrt(effectiveN) : null;
+  return {
+    rankIC: Number.isFinite(rankIC) ? rankIC : null,
+    n: pairs.length,
+    effectiveN,
+    effectiveNMethod: "unique-ticker-date",
+    tStat: Number.isFinite(tStat) ? tStat : null,
+    tStatMethod: "rankIC*sqrt(effectiveN)",
+    signOk: Number.isFinite(rankIC) ? rankIC * expectedSign > 0 : false,
+  };
+}
+
+function corpusDatasetFromObject(db = {}) {
+  return {
+    bars: Array.isArray(db.bars) ? db.bars : Array.isArray(db.historical_bars) ? db.historical_bars : [],
+    pit: Array.isArray(db.pit) ? db.pit : Array.isArray(db.pit_fundamentals) ? db.pit_fundamentals : [],
+    revisions: Array.isArray(db.revisions) ? db.revisions : Array.isArray(db.analyst_revision_history) ? db.analyst_revision_history : [],
+    shortInterest: Array.isArray(db.shortInterest) ? db.shortInterest : Array.isArray(db.short_interest_history) ? db.short_interest_history : [],
+    ivHistory: Array.isArray(db.ivHistory) ? db.ivHistory : Array.isArray(db.options_snapshots) ? db.options_snapshots : [],
+    consensus: Array.isArray(db.consensus) ? db.consensus : Array.isArray(db.consensus_snapshots) ? db.consensus_snapshots : [],
+    historicalOutcomes: Array.isArray(db.historicalOutcomes) ? db.historicalOutcomes : Array.isArray(db.historical_outcomes) ? db.historical_outcomes : [],
+    historicalRegimes: Array.isArray(db.historicalRegimes) ? db.historicalRegimes : Array.isArray(db.historical_regimes) ? db.historical_regimes : [],
+    diagnostics: [],
+  };
+}
+
+async function optionalSqliteJson(dbPath, sql, diagnostics, label, timeoutMs) {
+  try {
+    return await sqliteJson(dbPath, sql, timeoutMs);
+  } catch (error) {
+    diagnostics.push({ label, status: "unavailable", error: error.message });
+    return [];
+  }
+}
+
+async function corpusDatasetFromSqlite(dbPath = "", options = {}) {
+  const timeoutMs = Number(options.timeoutMs || 60000);
+  const diagnostics = [];
+  const universeInput = (options.universe || []).map(safeTicker).filter(Boolean);
+  let universe = universeInput;
+  if (!universe.length) {
+    const tickerRows = await sqliteJson(
+      dbPath,
+      `SELECT DISTINCT ticker FROM historical_bars ORDER BY ticker LIMIT ${Math.max(1, Number(options.maxTickers || 80))};`,
+      timeoutMs,
+    );
+    universe = tickerRows.map((row) => safeTicker(row.ticker)).filter(Boolean);
+  }
+  const tickerList = universe.map((ticker) => `'${sqlText(ticker)}'`).join(",");
+  if (!tickerList) return { ...corpusDatasetFromObject({}), diagnostics: [{ label: "universe", status: "empty" }] };
+  const bars = await sqliteJson(
+    dbPath,
+    `SELECT ticker,date,open,high,low,close,volume,source FROM historical_bars WHERE ticker IN (${tickerList}) ORDER BY ticker,date;`,
+    timeoutMs,
+  );
+  const historicalOutcomes = await optionalSqliteJson(
+    dbPath,
+    `SELECT ticker,horizon_days,decision_at,excess_pct,regime,outcome_quality_status,json FROM historical_outcomes WHERE ticker IN (${tickerList}) ORDER BY decision_at,ticker,horizon_days;`,
+    diagnostics,
+    "historical_outcomes",
+    timeoutMs,
+  );
+  const historicalRegimes = await optionalSqliteJson(
+    dbPath,
+    "SELECT date,bucket,risk_score,json FROM historical_regimes ORDER BY date;",
+    diagnostics,
+    "historical_regimes",
+    timeoutMs,
+  );
+  const pit = await optionalSqliteJson(
+    dbPath,
+    `SELECT ticker,filed_at AS date,period,field,value,form,json FROM pit_fundamentals WHERE ticker IN (${tickerList}) ORDER BY ticker,filed_at,period;`,
+    diagnostics,
+    "pit_fundamentals",
+    timeoutMs,
+  );
+  const revisions = await optionalSqliteJson(
+    dbPath,
+    `SELECT ticker,captured_at AS date,upgrades,downgrades,buy_ratio,consensus_eps,json FROM analyst_revision_history WHERE ticker IN (${tickerList}) ORDER BY ticker,captured_at;`,
+    diagnostics,
+    "analyst_revision_history",
+    timeoutMs,
+  );
+  const shortInterest = await optionalSqliteJson(
+    dbPath,
+    `SELECT ticker,captured_at AS date,short_interest,days_to_cover,json FROM short_interest_history WHERE ticker IN (${tickerList}) ORDER BY ticker,captured_at;`,
+    diagnostics,
+    "short_interest_history",
+    timeoutMs,
+  );
+  const ivHistory = await optionalSqliteJson(
+    dbPath,
+    `SELECT ticker,captured_at AS date,iv_atm,put_call_ratio,json FROM options_snapshots WHERE ticker IN (${tickerList}) ORDER BY ticker,captured_at;`,
+    diagnostics,
+    "options_snapshots",
+    timeoutMs,
+  );
+  const consensus = await optionalSqliteJson(
+    dbPath,
+    `SELECT ticker,captured_at AS date,eps,revenue,json FROM consensus_snapshots WHERE ticker IN (${tickerList}) ORDER BY ticker,captured_at;`,
+    diagnostics,
+    "consensus_snapshots",
+    timeoutMs,
+  );
+  return { bars, pit, revisions, shortInterest, ivHistory, consensus, historicalOutcomes, historicalRegimes, diagnostics };
+}
+
+async function loadCorpusDataset(db = null, options = {}) {
+  if (!db) return corpusDatasetFromObject({});
+  if (typeof db === "string") return corpusDatasetFromSqlite(db, options);
+  if (typeof db === "object" && db.sqlitePath) return corpusDatasetFromSqlite(db.sqlitePath, options);
+  return corpusDatasetFromObject(db);
+}
+
+function normalizeOutcomeRows(rows = []) {
+  return (rows || [])
+    .map((row) => ({
+      ticker: safeTicker(row.ticker),
+      horizonDays: Number(row.horizonDays ?? row.horizon_days),
+      decisionAt: ymd(row.decisionAt ?? row.decision_at ?? row.date),
+      excessPct: numberOrNull(row.excessPct ?? row.excess_pct),
+      regime: text(row.regime || row.bucket || ""),
+      outcomeQualityStatus: text(row.outcomeQualityStatus || row.outcome_quality_status || "ok"),
+    }))
+    .filter((row) => row.ticker && row.decisionAt && Number.isFinite(row.horizonDays) && Number.isFinite(row.excessPct) && row.outcomeQualityStatus !== "suspect_price");
+}
+
+function regimeForDate(regimes = [], date = "") {
+  const target = ymd(date);
+  return (regimes || [])
+    .map((row) => ({ date: ymd(row.date), bucket: text(row.bucket || row.regime || ""), riskScore: numberOrNull(row.risk_score ?? row.riskScore) }))
+    .filter((row) => row.date && row.date <= target)
+    .sort((a, b) => b.date.localeCompare(a.date))[0] || null;
+}
+
+function adjacentSignCount(horizonStats = {}, targetHorizons = [], expectedSign = 1) {
+  const targets = (targetHorizons || []).map(Number).filter(Number.isFinite);
+  if (!targets.length) return 0;
+  const available = Object.entries(horizonStats)
+    .map(([horizon, stat]) => ({ horizon: Number(horizon), signOk: stat.signOk, rankIC: stat.rankIC }))
+    .filter((row) => Number.isFinite(row.horizon) && Number.isFinite(row.rankIC));
+  let count = 0;
+  for (const target of targets) {
+    const neighbors = available
+      .filter((row) => row.horizon !== target)
+      .sort((a, b) => Math.abs(a.horizon - target) - Math.abs(b.horizon - target))
+      .slice(0, 2);
+    if (neighbors.some((row) => row.rankIC * expectedSign > 0)) count += 1;
+  }
+  return count;
+}
+
+function scoreRowsCorrelation(left = [], right = []) {
+  return alignedSeriesRankCorrelation(left, right);
+}
+
+export async function evaluateFactorSpecOverCorpus(specInput = {}, options = {}) {
+  const factor = options.factor || {};
+  if (factor.implementation && factor.implementation !== "dsl") {
+    return {
+      schemaVersion: "factor-corpus-evidence-v1",
+      factorId: text(factor.factorId || specInput.factorId),
+      status: factor.evidence?.status || "insufficient-data",
+      source: "historical-corpus",
+      reason: factor.evidence?.reason || "native evaluator required",
+      n: 0,
+      effectiveN: 0,
+    };
+  }
+  const dataset = await loadCorpusDataset(options.db, options);
+  const parsed = parseFactorSpec(specInput);
+  const universe = (options.universe?.length
+    ? options.universe
+    : [...new Set((dataset.bars || []).map((row) => safeTicker(row.ticker)).filter(Boolean))]
+  ).map(safeTicker).filter(Boolean);
+  const dateGrid = (options.dateGrid?.length ? options.dateGrid : dateGridFromBars(dataset.bars, options)).map(ymd).filter(Boolean);
+  const scored = factorScoreRowsForDataset(parsed, dataset, {
+    ...options,
+    universe,
+    dateGrid,
+  });
+  const scoreMap = new Map(scored.scoreRows.map((row) => [`${row.ticker}|${row.date}`, row]));
+  const horizons = (parsed.horizons || [20]).map(Number).filter(Number.isFinite);
+  const outcomeRows = normalizeOutcomeRows(dataset.historicalOutcomes)
+    .filter((row) => !horizons.length || horizons.includes(row.horizonDays));
+  const horizonPairs = {};
+  for (const outcome of outcomeRows) {
+    const score = scoreMap.get(`${outcome.ticker}|${outcome.decisionAt}`);
+    if (!score) continue;
+    const regime = outcome.regime || regimeForDate(dataset.historicalRegimes, outcome.decisionAt)?.bucket || "unknown";
+    const pair = {
+      ticker: outcome.ticker,
+      decisionAt: outcome.decisionAt,
+      horizonDays: outcome.horizonDays,
+      score: score.score,
+      rawValue: score.rawValue,
+      excessPct: outcome.excessPct,
+      regime,
+    };
+    if (!horizonPairs[outcome.horizonDays]) horizonPairs[outcome.horizonDays] = [];
+    horizonPairs[outcome.horizonDays].push(pair);
+  }
+  const horizonsSummary = {};
+  const regimeBuckets = {};
+  for (const [horizon, pairs] of Object.entries(horizonPairs)) {
+    horizonsSummary[horizon] = summarizeHorizonPairs(pairs, parsed.expectedSign);
+    for (const pair of pairs) {
+      const bucket = pair.regime || "unknown";
+      const key = `${horizon}|${bucket}`;
+      if (!regimeBuckets[key]) regimeBuckets[key] = [];
+      regimeBuckets[key].push(pair);
+    }
+  }
+  const regimes = {};
+  for (const [key, pairs] of Object.entries(regimeBuckets)) {
+    const [horizon, bucket] = key.split("|");
+    if (!regimes[horizon]) regimes[horizon] = {};
+    regimes[horizon][bucket] = summarizeHorizonPairs(pairs, parsed.expectedSign);
+  }
+  const primaryHorizon = horizons.find((horizon) => horizonsSummary[horizon]?.n) || Number(Object.keys(horizonsSummary)[0]);
+  const primary = horizonsSummary[primaryHorizon] || { rankIC: null, n: 0, effectiveN: 0, tStat: null };
+  const regimeSigns = Object.values(regimes[primaryHorizon] || {}).filter((row) => Number.isFinite(row.rankIC) && row.rankIC * parsed.expectedSign > 0).length;
+  const comparisonFactors = (options.comparisonFactors || []).filter((item) => item?.implementation === "dsl" && item.spec?.pipeline?.length);
+  const correlations = [];
+  for (const existing of comparisonFactors) {
+    try {
+      const existingRows = factorScoreRowsForDataset(existing.spec, dataset, { ...options, universe, dateGrid }).scoreRows;
+      const aligned = scoreRowsCorrelation(scored.scoreRows, existingRows);
+      correlations.push({ factorId: existing.factorId, rho: aligned.rho, n: aligned.n, alignment: "ticker-date" });
+    } catch (error) {
+      correlations.push({ factorId: existing.factorId, rho: null, n: 0, error: error.message, alignment: "ticker-date" });
+    }
+  }
+  const finiteCorrelations = correlations.map((row) => Math.abs(numberOrNull(row.rho))).filter(Number.isFinite);
+  const maxCorrelation = finiteCorrelations.length ? Math.max(...finiteCorrelations) : 0;
+  const totalN = Object.values(horizonsSummary).reduce((sum, row) => sum + Number(row.n || 0), 0);
+  const status = totalN ? "ok" : "insufficient-data";
+  return {
+    schemaVersion: "factor-corpus-evidence-v1",
+    factorId: parsed.factorId,
+    generatedAt: nowIso(),
+    source: "historical-corpus",
+    status,
+    n: primary.n || 0,
+    effectiveN: primary.effectiveN || 0,
+    rankIC: primary.rankIC,
+    tStat: primary.tStat,
+    tStatMethod: primary.tStatMethod || "rankIC*sqrt(effectiveN)",
+    primaryHorizon,
+    horizons: horizonsSummary,
+    regimes,
+    regimeSigns,
+    adjacentHorizonSigns: adjacentSignCount(horizonsSummary, horizons, parsed.expectedSign),
+    coverage: scored.coverage,
+    coverageByDate: scored.coverageByDate.slice(-20),
+    maxCorrelation,
+    correlations,
+    scoreSeries: scored.scoreRows.slice(0, Number(options.persistScoreSeriesLimit || 5000)),
+    diagnostics: dataset.diagnostics || [],
+    universeCount: universe.length,
+    dateCount: dateGrid.length,
+    outcomeCount: outcomeRows.length,
+    reason: status === "ok" ? "" : "No aligned historical_outcomes rows for factor score series.",
+  };
+}
+
 function admissionEvidenceForFactor(factor = {}, context = {}) {
   const override = context.evidenceOverrides?.[factor.factorId];
+  const corpus = context.corpusEvidence?.[factor.factorId];
   const liveStats = context.performanceReport?.factorStats?.[factor.factorId] || context.factorStats?.[factor.factorId] || {};
-  const evidence = override || factor.evidence || {};
+  const evidence = override || corpus || factor.evidence?.admission || factor.evidence?.latestAdmission || factor.evidence || {};
   const rankIC = numberOrNull(evidence.rankIC ?? liveStats.rankIC);
   const n = numberOrNull(evidence.n ?? evidence.samples ?? liveStats.n ?? liveStats.samples);
   const effectiveN = numberOrNull(evidence.effectiveN ?? liveStats.effectiveN) ?? n;
@@ -499,7 +924,7 @@ function admissionEvidenceForFactor(factor = {}, context = {}) {
     coverage >= 0.6;
   return {
     status: pass ? "passed" : "failed",
-    source: override ? "manual-evidence-override" : liveStats.samples || liveStats.n ? "live-factor-stats" : "stored-evidence",
+    source: override ? "manual-evidence-override" : corpus ? "historical-corpus" : liveStats.samples || liveStats.n ? "live-factor-stats" : "stored-evidence",
     rankIC: Number.isFinite(rankIC) ? rankIC : null,
     n: Number.isFinite(n) ? n : 0,
     effectiveN: Number.isFinite(effectiveN) ? effectiveN : Number.isFinite(n) ? n : 0,
@@ -619,6 +1044,68 @@ export function evaluateFactorRegistry(registryInput = {}, context = {}) {
       transitions,
       evaluated: factors.length,
       trialEntries: trialEntries.length,
+    },
+  };
+}
+
+export async function evaluateFactorRegistryWithCorpus(registryInput = {}, context = {}) {
+  const registry = normalizeFactorRegistry(registryInput);
+  const corpusEvidence = { ...(context.corpusEvidence || {}) };
+  const corpusDb = context.corpusDb || context.db || context.sqlitePath || null;
+  const comparisonFactors = registry.factors.filter((factor) => ["active", "shadow"].includes(factor.state));
+  const candidates = registry.factors.filter((factor) => factor.state === "candidate" && !corpusEvidence[factor.factorId]);
+  const corpusDiagnostics = [];
+  if (corpusDb) {
+    const maxFactors = Math.max(1, Number(context.maxCorpusFactors || candidates.length || 1));
+    for (const factor of candidates.slice(0, maxFactors)) {
+      try {
+        corpusEvidence[factor.factorId] = await evaluateFactorSpecOverCorpus(factor.spec, {
+          db: corpusDb,
+          factor,
+          comparisonFactors,
+          universe: context.universe,
+          dateGrid: context.dateGrid,
+          maxDates: context.maxDates || 120,
+          maxTickers: context.maxTickers || 80,
+          timeoutMs: context.corpusTimeoutMs || context.timeoutMs || 60000,
+        });
+      } catch (error) {
+        corpusEvidence[factor.factorId] = {
+          schemaVersion: "factor-corpus-evidence-v1",
+          factorId: factor.factorId,
+          source: "historical-corpus",
+          status: "error",
+          n: 0,
+          effectiveN: 0,
+          error: error.message,
+        };
+        corpusDiagnostics.push({ factorId: factor.factorId, status: "error", error: error.message });
+      }
+    }
+  } else {
+    corpusDiagnostics.push({ status: "skipped", reason: "missing-corpus-db" });
+  }
+  const result = evaluateFactorRegistry(registry, { ...context, corpusEvidence });
+  return {
+    ...result,
+    corpusEvidence,
+    corpusDiagnostics,
+    report: {
+      ...result.report,
+      corpusEvidence: Object.fromEntries(Object.entries(corpusEvidence).map(([factorId, evidence]) => [
+        factorId,
+        {
+          status: evidence.status,
+          source: evidence.source,
+          n: evidence.n || 0,
+          effectiveN: evidence.effectiveN || 0,
+          primaryHorizon: evidence.primaryHorizon || null,
+          rankIC: Number.isFinite(evidence.rankIC) ? evidence.rankIC : null,
+          tStat: Number.isFinite(evidence.tStat) ? evidence.tStat : null,
+          coverage: Number.isFinite(evidence.coverage) ? evidence.coverage : null,
+        },
+      ])),
+      corpusDiagnostics,
     },
   };
 }

@@ -60,6 +60,7 @@ import {
   advanceFactorState,
   buildFactorPerformanceReport,
   evaluateFactorRegistry,
+  evaluateFactorRegistryWithCorpus,
   ingestFactorResearcherOutput,
   normalizeFactorRegistry,
 } from "./server/factor_registry.mjs";
@@ -38054,11 +38055,18 @@ async function handleApi(req, res, url) {
     const state = normalizeAllStockAgentState(db.allStockAgent);
     const registry = normalizeFactorRegistry(db.factorRegistry);
     const performanceReport = buildFactorPerformanceReport(registry, { latestRun: state.runs[0] || null });
-    const result = evaluateFactorRegistry(registry, {
+    const result = await evaluateFactorRegistryWithCorpus(registry, {
       actor: "system:evaluator",
       performanceReport,
       factorStats: body.factorStatsOverride || state.runs[0]?.factorStats || {},
       evidenceOverrides: body.evidenceOverrides || {},
+      sqlitePath: body.sqlitePath || SQLITE_DB_FILE,
+      universe: Array.isArray(body.universe) ? body.universe : null,
+      dateGrid: Array.isArray(body.dateGrid) ? body.dateGrid : null,
+      maxCorpusFactors: body.maxCorpusFactors,
+      maxDates: body.maxDates,
+      maxTickers: body.maxTickers,
+      corpusTimeoutMs: body.corpusTimeoutMs,
     });
     db.factorRegistry = { ...result.registry, performanceReport };
     const postmortem = await appendFactorPostmortemsForTransitions(db, result.transitions, performanceReport, {
