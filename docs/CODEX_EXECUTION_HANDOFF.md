@@ -277,7 +277,7 @@ Every store mutation currently costs: structuredClone(full store) + stringify-pr
 - **P7 — walk-forward off the event loop**: `runHistoricalWalkForwardFromRows` executes in a `worker_threads` Worker (or child `node` process with JSON hand-off); the HTTP handler awaits without blocking other requests. Verify by hitting `/api/run/status` every 2 s during a 500-date run — all responses < 500 ms.
 - **Verify**: p95 `saveStore` wall time < 150 ms over 20 consecutive watcher-tick saves (log timing into `storePersistenceStatus`); store.json ≤ 60 MB after first compact save; archive mtimes show only changed runs rewritten; server responsive during a walk-forward.
 
-## ☐ WP23 — Scheduler reliability & staleness honesty (the silent 5-day gap)
+## ☑ WP23 — Scheduler reliability & staleness honesty (the silent 5-day gap)
 
 The system silently served June-30 data as "today's" content for five days. Freshness badges exist but nothing *acted* on staleness and nothing told the owner a run was missed.
 

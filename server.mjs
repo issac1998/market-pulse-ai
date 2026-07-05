@@ -1134,7 +1134,9 @@ const SCHEDULES = [
   { id: "agent", label: "候选池 Agent", hour: 17, minute: 5 },
 ];
 const SCHEDULE_CATCH_UP_MINUTES = Math.max(0, Number(process.env.SCHEDULE_CATCH_UP_MINUTES || 75));
+const SCHEDULE_LLM_STAGE_TIMEOUT_MS = Math.max(15000, Number(process.env.SCHEDULE_LLM_STAGE_TIMEOUT_MS || 90000));
 const ALL_STOCK_AGENT_ENABLED = parseBoolean(process.env.ALL_STOCK_AGENT_ENABLED, true);
+const AGENT_MAX_SOURCE_AGE_HOURS = Math.max(1, Number(process.env.AGENT_MAX_SOURCE_AGE_HOURS || 36));
 const ALL_STOCK_AGENT_BUY_LIMIT = Math.max(1, Number(process.env.ALL_STOCK_AGENT_BUY_LIMIT || 10));
 const ALL_STOCK_AGENT_UNIVERSE_LIMIT = Math.max(20, Number(process.env.ALL_STOCK_AGENT_UNIVERSE_LIMIT || 180));
 const ALL_STOCK_AGENT_DECISION_LIMIT = Math.max(100, Number(process.env.ALL_STOCK_AGENT_DECISION_LIMIT || 1200));
@@ -2945,6 +2947,8 @@ const ARTICLE_LANDING_HOSTS = new Set([
 
 function articleUrlParts(value) {
   try {
+    const scheduledRun = trigger === "schedule" || trigger === "catch-up";
+    const scheduledLlmStageTimeoutMs = scheduledRun ? SCHEDULE_LLM_STAGE_TIMEOUT_MS : null;
     const url = new URL(String(value || ""));
     return { url, host: url.hostname.toLowerCase(), path: url.pathname.replace(/\/+$/g, "") };
   } catch {
@@ -11070,6 +11074,56 @@ function dueScheduleCandidate(date = new Date(), scheduleLog = {}) {
     [0] || null;
 }
 
+function missedScheduleCandidate(date = new Date(), scheduleLog = {}) {
+  if (!isNyseTradingDate(date)) return null;
+  const p = getNewYorkParts(date);
+  const nowMinute = p.hour * 60 + p.minute;
+  return SCHEDULES.map((job) => ({
+    job,
+    key: `${p.ymd}:${job.id}`,
+    newYorkDate: p.ymd,
+    newYorkTime: `${String(job.hour).padStart(2, "0")}:${String(job.minute).padStart(2, "0")}`,
+    elapsedMinutes: nowMinute - scheduleMinuteOfDay(job),
+  }))
+    .filter((item) => item.elapsedMinutes > SCHEDULE_CATCH_UP_MINUTES)
+    .filter((item) => !scheduleLog[item.key])
+    .sort((a, b) => b.elapsedMinutes - a.elapsedMinutes)
+    [0] || null;
+}
+
+function appendMissedScheduleAlert(db = {}, due = {}) {
+  const alertKey = `schedule-missed:${due.key}`;
+  const exists = (db.alerts || []).some((alert) => alert.alertKey === alertKey || alert.storyFingerprint === alertKey);
+  if (!exists) {
+    db.alerts = [
+      {
+        id: compactId("schedule-alert"),
+        alertKey,
+        storyFingerprint: alertKey,
+        createdAt: nowIso(),
+        severity: "high",
+        ticker: "MKT",
+        title: "定时采集已错过",
+        detail: `${due.newYorkDate} ${due.job?.label || due.job?.id || "schedule"} 已超过补跑窗口 ${SCHEDULE_CATCH_UP_MINUTES} 分钟，本次按 catch-up 触发。`,
+        evidenceIds: ["schedule_missed", due.key],
+        status: "active",
+        catalystClass: "schedule",
+        novelty: "new",
+        score: 90,
+      },
+      ...(db.alerts || []),
+    ].slice(0, 300);
+  }
+  appendAuditEvent(db, "schedule.missed", {
+    key: due.key,
+    session: due.job?.id,
+    newYorkDate: due.newYorkDate,
+    newYorkTime: due.newYorkTime,
+    elapsedMinutes: due.elapsedMinutes,
+    catchUpMinutes: SCHEDULE_CATCH_UP_MINUTES,
+  }, "warn", "scheduler");
+}
+
 function nextScheduledRuns(limit = 2) {
   const found = [];
   const start = Math.ceil(Date.now() / 60_000) * 60_000;
@@ -11126,6 +11180,7 @@ function publicScheduleStatus(db) {
   const lastRunTime = lastRun?.completedAt ? new Date(lastRun.completedAt).getTime() : 0;
   const ageHours = lastRunTime ? (Date.now() - lastRunTime) / 3600000 : null;
   const freshnessStatus = ageHours === null ? "missing" : ageHours <= 24 ? "fresh" : ageHours <= 48 ? "aging" : "stale";
+  const staleTradingDays = ageHours === null ? null : Math.max(0, Math.floor(ageHours / 24));
   const nextRuns = nextScheduledRuns(4);
   return {
     timezone: "America/New_York",
@@ -11145,7 +11200,12 @@ function publicScheduleStatus(db) {
       lastRunId: lastRun?.id || "",
       lastRunAt: lastRun?.completedAt || "",
       ageHours: Number.isFinite(ageHours) ? Number(ageHours.toFixed(1)) : null,
+      staleTradingDays,
       freshnessStatus,
+      staleBanner:
+        freshnessStatus === "stale"
+          ? `数据已过期约 ${staleTradingDays} 个自然日；请先运行盘前/盘后采集或等待 catch-up。`
+          : "",
       nextRunAt: nextRuns[0]?.localTime || "",
       lastScheduledRunId: lastScheduled?.runId || "",
       lastScheduledAt: lastScheduled?.completedAt || "",
@@ -22114,6 +22174,12 @@ function allStockAgentDynamicBuyThreshold(skill = {}, state = {}, run = {}) {
   };
 }
 
+function allStockAgentSourceRunAgeHours(run = {}) {
+  const stamp = run?.completedAt || run?.generatedAt || run?.startedAt || "";
+  const time = new Date(stamp).getTime();
+  return Number.isFinite(time) && time > 0 ? (Date.now() - time) / 3600000 : null;
+}
+
 function allStockAgentActionability(evaluation = {}, state = {}, run = {}, skill = {}) {
   const minDq = numberOrNull(skill.settings?.minActionableDataQuality) ?? ALL_STOCK_AGENT_MIN_ACTIONABLE_DQ;
   const dynamic = allStockAgentDynamicBuyThreshold(skill, state, run);
@@ -22132,6 +22198,14 @@ function allStockAgentActionability(evaluation = {}, state = {}, run = {}, skill
       label: "组合暴露动态阈值",
       action: "downgrade_research",
       evidence: `买入分 ${formatReportNumber(evaluation.buyScore || 0, 0)}，动态阈值 ${formatReportNumber(dynamic.threshold, 0)}。`,
+    });
+  }
+  if (Number.isFinite(evaluation.sourceRunAgeHours) && evaluation.sourceRunAgeHours > AGENT_MAX_SOURCE_AGE_HOURS) {
+    gates.push({
+      id: "stale_source_run",
+      label: "源报告过期",
+      action: "downgrade_research",
+      evidence: `源报告距今 ${formatReportNumber(evaluation.sourceRunAgeHours, 1)} 小时，超过 ${formatReportNumber(AGENT_MAX_SOURCE_AGE_HOURS, 0)} 小时上限；只保留为研究追踪样本。`,
     });
   }
   const cooldown = allStockAgentCooldownGate(state, evaluation.ticker, run, skill);
@@ -22458,6 +22532,7 @@ function buildAllStockAgentEvaluation(run = {}, tickerPoolItem = {}, state = {},
   const adjustedBuy = applyAllStockAgentShadowGates(buy.score, shadowGates, buyThreshold);
   const buyEligible = adjustedBuy.score >= buyThreshold && !vetoBuy && (allowAddToExisting || !hasPosition);
   const sellEligible = hasPosition && sell.score >= sellThreshold;
+  const sourceRunAgeHours = allStockAgentSourceRunAgeHours(run);
   const evaluation = {
     schemaVersion: "all-stock-agent-evaluation-v1",
     ticker,
@@ -22515,6 +22590,8 @@ function buildAllStockAgentEvaluation(run = {}, tickerPoolItem = {}, state = {},
     ].slice(0, 7),
     invalidations: recommendationInvalidations({ gates }),
     technicalLine: actionSuggestionTechnicalLine(ctx.technical || {}, ctx.quote || {}),
+    sourceRunAgeHours: Number.isFinite(sourceRunAgeHours) ? Number(sourceRunAgeHours.toFixed(2)) : null,
+    sourceRunStale: Number.isFinite(sourceRunAgeHours) && sourceRunAgeHours > AGENT_MAX_SOURCE_AGE_HOURS,
     generatedAt: nowIso(),
   };
   evaluation.actionability = allStockAgentActionability(evaluation, state, run, skill);
@@ -23807,6 +23884,10 @@ async function runAllStockAgentForRun(db, sourceRun, trigger = "manual", options
       actionableBuyLimit,
       actionableBuy: buyDecisions.filter((item) => item.actionable !== false).length,
       researchDowngraded: buyDecisions.filter((item) => item.actionable === false || item.actionability?.status === "research").length,
+      staleSourceRun: evaluations.filter((item) => item.sourceRunStale).length,
+      staleSourceGate: buyDecisions.filter((item) =>
+        (item.actionability?.gates || []).some((gate) => gate.id === "stale_source_run"),
+      ).length,
     },
     roadmap: {
       schemaVersion: "investment-assistant-roadmap-status-v1",
@@ -36636,14 +36717,14 @@ async function analyzeWithLlmOrLocal(payload) {
   try {
     const result = await callConfiguredLlm(system, user, llmProvider, {
       task: "full-report",
-      timeoutMs: LLM_FULL_REPORT_TIMEOUT_MS,
+      timeoutMs: payload.llmTimeoutMs || LLM_FULL_REPORT_TIMEOUT_MS,
     });
     return { ...local, provider: result.provider, llmText: result.text };
   } catch (error) {
     try {
       const result = await callConfiguredLlm(system, fallbackUser, llmProvider, {
         task: "fallback-summary",
-        timeoutMs: LLM_FULL_REPORT_FALLBACK_TIMEOUT_MS,
+        timeoutMs: payload.llmFallbackTimeoutMs || LLM_FULL_REPORT_FALLBACK_TIMEOUT_MS,
         bypassCooldown: true,
       });
       return {
@@ -37015,6 +37096,8 @@ async function runCollection(session = "manual", trigger = "manual", options = {
         portfolioRisk,
         errors,
         llmProvider,
+        llmTimeoutMs: scheduledLlmStageTimeoutMs,
+        llmFallbackTimeoutMs: scheduledLlmStageTimeoutMs,
       });
       const analysis = localizeAnalysisEvidence(rawAnalysis, localizedForAnalysis);
       const backtest = buildMomentumBacktest(technicalResult.technicals || []);
@@ -37093,9 +37176,9 @@ async function runCollection(session = "manual", trigger = "manual", options = {
         options: (run.options || []).length,
         errors: (run.errors || []).length,
       });
-      if (trigger === "schedule") {
+      if (trigger === "schedule" || trigger === "catch-up") {
         const p = getNewYorkParts(new Date());
-        db.scheduleLog[`${p.ymd}:${session}`] = run.id;
+        db.scheduleLog[options.scheduleKey || `${p.ymd}:${session}`] = run.id;
       }
       await saveStore(db);
       if (trigger === "schedule" || options.emailReport) {
@@ -37147,13 +37230,22 @@ async function runCollection(session = "manual", trigger = "manual", options = {
 
 async function maybeRunSchedule() {
   const db = await ensureStore();
-  const due = dueScheduleCandidate(new Date(), db.scheduleLog);
+  let due = dueScheduleCandidate(new Date(), db.scheduleLog);
+  let trigger = "schedule";
+  if (!due) {
+    due = missedScheduleCandidate(new Date(), db.scheduleLog);
+    if (due) {
+      trigger = "catch-up";
+      appendMissedScheduleAlert(db, due);
+      await saveStore(db);
+    }
+  }
   if (!due) return;
   if (due.job.id === "agent") {
-    await runAllStockAgentForRun(db, latestRun(db), "schedule", { scheduleKey: due.key });
+    await runAllStockAgentForRun(db, latestRun(db), trigger, { scheduleKey: due.key });
     return;
   }
-  await runCollection(due.job.id, "schedule", { llmProvider: SCHEDULE_LLM_PROVIDER });
+  await runCollection(due.job.id, trigger, { llmProvider: SCHEDULE_LLM_PROVIDER, scheduleKey: due.key });
 }
 
 function runTimeValue(run = {}) {
@@ -38141,6 +38233,7 @@ function configForClient(db) {
       skillFile: path.relative(__dirname, ALL_STOCK_AGENT_SKILL_FILE),
       buyLimit: ALL_STOCK_AGENT_BUY_LIMIT,
       universeLimit: ALL_STOCK_AGENT_UNIVERSE_LIMIT,
+      maxSourceAgeHours: AGENT_MAX_SOURCE_AGE_HOURS,
       shadowDebateDaily: {
         enabled: AGENT_DEBATE_DAILY_ENABLED,
         newYorkTime: AGENT_DEBATE_DAILY_NEW_YORK_TIME,
@@ -38160,6 +38253,11 @@ function configForClient(db) {
             ? `top-${ALL_STOCK_AGENT_QUOTE_PREFETCH_LIMIT}`
             : "all-candidates",
       },
+    },
+    schedulerReliability: {
+      catchUpMinutes: SCHEDULE_CATCH_UP_MINUTES,
+      scheduleLlmStageTimeoutMs: SCHEDULE_LLM_STAGE_TIMEOUT_MS,
+      staleAgentSourceMaxHours: AGENT_MAX_SOURCE_AGE_HOURS,
     },
   };
 }

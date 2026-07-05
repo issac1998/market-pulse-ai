@@ -1419,6 +1419,56 @@ Contradictions:
 
 - The full 20 consecutive watcher-tick p95 save benchmark was not run in this session. The implementation records per-save `lastSaveMs`; the verified compact save reduced `store.json` from 131 MB to 57 MB, and the event-loop worker check stayed below 500 ms on concurrent status requests.
 
+---
+
+## WP23 — Scheduler Reliability & Staleness Honesty — 2026-07-05
+
+Implemented Round 4 WP23.
+
+Changes:
+
+- Added same-day missed-schedule detection:
+  - normal `schedule` still runs inside `SCHEDULE_CATCH_UP_MINUTES`.
+  - if the same NYSE trading day has already passed a session by more than the catch-up window and no run is logged, the scheduler emits a `catch-up` trigger.
+- Added missed-run alerting:
+  - appends a high-severity `schedule-missed:*` alert.
+  - appends a `schedule.missed` audit event with schedule key, session, NY date/time, elapsed minutes, and catch-up window.
+- `runCollection()` now records `scheduleLog` for both `schedule` and `catch-up`, preserving the exact schedule key passed by the scheduler.
+- Exposed staleness information in `config.schedule.health`:
+  - `staleTradingDays`
+  - `staleBanner`
+- Added `AGENT_MAX_SOURCE_AGE_HOURS` default 36.
+- Added `stale_source_run` actionability gate:
+  - source runs older than the limit downgrade buy calls to research/actionable false.
+  - those decisions can still be logged and tracked as labeled research samples.
+- Added stale source telemetry to all-stock-agent run summary:
+  - `staleSourceRun`
+  - `staleSourceGate`
+- Added scheduled-run LLM budget:
+  - `SCHEDULE_LLM_STAGE_TIMEOUT_MS` default 90,000 ms.
+  - scheduled/catch-up collection passes that deadline to the full-report LLM and fallback LLM stages.
+- Exposed scheduler reliability config through `config.schedulerReliability`.
+- Regenerated route inventory; route count remains 81.
+
+Verification:
+
+```text
+$ node --check server.mjs
+pass
+
+$ node scripts/core_regression_tests.mjs
+core_regression_tests: ok
+
+$ node scripts/generate_route_inventory.mjs && node scripts/generate_route_inventory.mjs --check
+{"status":"ok","routes":81,"uiFetches":43,"storeKeys":26}
+{"status":"ok","routes":81,"uiFetches":43,"storeKeys":26}
+```
+
+Contradictions:
+
+- The real-time missed-run trigger was not waited on in this session. The implementation is same-day only and writes explicit `catch-up`/`schedule.missed` records when the wall-clock condition is met.
+- The Today red banner UI was not edited because `public/app.js` already has unrelated uncommitted user changes. The backend now exposes `config.schedule.health.staleBanner`, so the frontend can render the banner without another data-model change.
+
 ## WP18 — Live Shadow Factors + Promotion Emitters — 2026-07-05
 
 Implemented Round 3 WP18.
