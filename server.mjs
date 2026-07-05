@@ -89,7 +89,7 @@ import {
 import { runJsonCli as runJsonCliProcess, runTextCli as runTextCliProcess } from "./server/cli_process.mjs";
 import { addressOnly, probeSmtpEmail, sendResendEmail, sendSmtpEmail } from "./server/email_delivery.mjs";
 import { loadEnvFile, parseBoolean, splitList } from "./server/env_utils.mjs";
-import { readBody } from "./server/http_requests.mjs";
+import { maxRequestBodyBytes, readBody, requestContentLengthExceedsLimit } from "./server/http_requests.mjs";
 import { sendDownload, sendJson } from "./server/http_responses.mjs";
 import { appFetch, fetchJson, fetchText, proxySummary, requestJson } from "./server/network_fetch.mjs";
 import { installProcessErrorHandlers } from "./server/process_errors.mjs";
@@ -141,6 +141,8 @@ const ALL_STOCK_AGENT_SKILL_FILE = path.join(
   process.env.ALL_STOCK_AGENT_SKILL_FILE || "strategies/all_stock_agent_skill.md",
 );
 const PORT = Number(process.env.PORT || 5173);
+const HOST = process.env.HOST || "127.0.0.1";
+const MAX_REQUEST_BODY_BYTES = maxRequestBodyBytes();
 const RUN_HISTORY_LIMIT = Math.max(1, Number(process.env.RUN_HISTORY_LIMIT || 20));
 const RUN_ARCHIVE_ENABLED = parseBoolean(process.env.RUN_ARCHIVE_ENABLED, true);
 const RUN_ARCHIVE_DIR = path.join(DATA_DIR, process.env.RUN_ARCHIVE_DIR || "runs");
@@ -1191,6 +1193,25 @@ let longBridgeActiveCount = 0;
 const longBridgeWaitQueue = [];
 let apeWisdomDetailsNextRequestAt = 0;
 let gdeltNextRequestAt = 0;
+
+function isLoopbackHost(host = "") {
+  const value = String(host || "").trim().toLowerCase();
+  return value === "localhost" || value === "127.0.0.1" || value === "::1";
+}
+
+function transportConfigForClient() {
+  const localOnly = isLoopbackHost(HOST);
+  return {
+    host: HOST,
+    port: PORT,
+    localOnly,
+    maxRequestBodyBytes: MAX_REQUEST_BODY_BYTES,
+    gzipMinBytes: 64 * 1024,
+    exposureWarning: localOnly
+      ? ""
+      : "当前服务绑定在非本地地址，局域网设备可能访问 API。只有在可信网络中才建议设置 HOST=0.0.0.0。",
+  };
+}
 
 function nowIso() {
   return new Date().toISOString();
@@ -37774,6 +37795,7 @@ function configForClient(db) {
         lastResult: sqliteMirrorLastResult,
       },
     },
+    transport: transportConfigForClient(),
     secFilings: {
       skipTickers: [...SEC_FILING_SKIP_TICKERS].sort(),
     },
@@ -38504,7 +38526,7 @@ async function handleApi(req, res, url) {
   }
 
   if ((req.method === "GET" || req.method === "POST") && url.pathname === "/api/agent-debate/run") {
-    const body = req.method === "POST" ? await readBody(req).catch(() => ({})) : {};
+    const body = req.method === "POST" ? await readBody(req) : {};
     const ticker = safeTicker(body.ticker || url.searchParams.get("ticker"));
     if (!ticker) return sendJson(res, { error: "请输入 ticker。" }, 400);
     try {
@@ -38561,7 +38583,7 @@ async function handleApi(req, res, url) {
 
   if ((req.method === "GET" || req.method === "POST") && url.pathname === "/api/all-stock-agent/backtest") {
     const db = await ensureStore();
-    const body = req.method === "POST" ? await readBody(req).catch(() => ({})) : {};
+    const body = req.method === "POST" ? await readBody(req) : {};
     const horizonsRaw = body.horizons || url.searchParams.get("horizons") || "";
     const horizons = Array.isArray(horizonsRaw)
       ? horizonsRaw
@@ -38579,7 +38601,7 @@ async function handleApi(req, res, url) {
 
   if ((req.method === "GET" || req.method === "POST") && url.pathname === "/api/recommender/backtest") {
     const db = await ensureStore();
-    const body = req.method === "POST" ? await readBody(req).catch(() => ({})) : {};
+    const body = req.method === "POST" ? await readBody(req) : {};
     const horizonsRaw = body.horizons || url.searchParams.get("horizons") || "";
     const horizons = Array.isArray(horizonsRaw)
       ? horizonsRaw
@@ -38601,7 +38623,7 @@ async function handleApi(req, res, url) {
   }
 
   if (req.method === "POST" && url.pathname === "/api/recommender/historical-backtest") {
-    const body = await readBody(req).catch(() => ({}));
+    const body = await readBody(req);
     try {
       const result = await runHistoricalWalkForwardFromSqlite({
         sqlitePath: SQLITE_DB_FILE,
@@ -38766,7 +38788,7 @@ async function handleApi(req, res, url) {
   }
 
   if ((req.method === "GET" || req.method === "POST") && url.pathname === "/api/uzi/analyze") {
-    const body = req.method === "POST" ? await readBody(req).catch(() => ({})) : {};
+    const body = req.method === "POST" ? await readBody(req) : {};
     const ticker = safeTicker(body.ticker || url.searchParams.get("ticker"));
     if (!ticker) return sendJson(res, { error: "请输入 ticker。", provider: "UZI-Skill" }, 400);
     try {
@@ -38803,7 +38825,7 @@ async function handleApi(req, res, url) {
   }
 
   if ((req.method === "GET" || req.method === "POST") && url.pathname === "/api/stocks/deep-dive") {
-    const body = req.method === "POST" ? await readBody(req).catch(() => ({})) : {};
+    const body = req.method === "POST" ? await readBody(req) : {};
     const ticker = safeTicker(body.ticker || url.searchParams.get("ticker"));
     if (!ticker) return sendJson(res, { error: "请输入 ticker。" }, 400);
     const db = await ensureStore();
@@ -38811,7 +38833,7 @@ async function handleApi(req, res, url) {
   }
 
   if ((req.method === "GET" || req.method === "POST") && url.pathname === "/api/intraday/explain") {
-    const body = req.method === "POST" ? await readBody(req).catch(() => ({})) : {};
+    const body = req.method === "POST" ? await readBody(req) : {};
     const ticker = safeTicker(body.ticker || url.searchParams.get("ticker"));
     if (!ticker) return sendJson(res, { error: "请输入 ticker。" }, 400);
     const db = await ensureStore();
@@ -38873,7 +38895,7 @@ async function handleApi(req, res, url) {
   if ((req.method === "GET" || req.method === "POST") && url.pathname === "/api/strategy-versions/validate") {
     const db = await ensureStore();
     if (req.method === "GET") return sendJson(res, { validation: buildStrategyValidationPayload(db) });
-    const body = await readBody(req).catch((error) => ({ __readError: error.message }));
+    const body = await readBody(req);
     if (body.__readError) return sendJson(res, { error: body.__readError }, 400);
     const state = normalizeAllStockAgentState(db.allStockAgent);
     const candidateId = normalizeDisplayText(body.id || body.candidateId || "");
@@ -38898,7 +38920,7 @@ async function handleApi(req, res, url) {
   }
 
   if (req.method === "POST" && url.pathname === "/api/strategy-versions/promote") {
-    const body = await readBody(req).catch((error) => ({ __readError: error.message }));
+    const body = await readBody(req);
     if (body.__readError) return sendJson(res, { error: body.__readError }, 400);
     const candidateId = normalizeDisplayText(body.id || body.candidateId || "");
     const db = await ensureStore();
@@ -40771,6 +40793,9 @@ const server = http.createServer(async (req, res) => {
   });
   try {
     const url = new URL(req.url, `http://${req.headers.host}`);
+    if (url.pathname.slice(0, 5) === "/api/" && requestContentLengthExceedsLimit(req, MAX_REQUEST_BODY_BYTES)) {
+      return sendJson(res, { error: `请求体超过上限 ${MAX_REQUEST_BODY_BYTES} 字节。` }, 413);
+    }
     if (url.pathname.startsWith("/api/")) {
       await handleApi(req, res, url);
     } else {
@@ -40778,14 +40803,20 @@ const server = http.createServer(async (req, res) => {
     }
   } catch (error) {
     if (!isConnectionClosedError(error)) {
-      sendJson(res, { error: error.message }, 500);
+      sendJson(res, { error: error.message }, error.statusCode || 500);
     }
   }
 });
 
 await ensureStore();
-server.listen(PORT, () => {
-  console.log(`Market Pulse AI running at http://localhost:${PORT}`);
+server.listen(PORT, HOST, () => {
+  const url = `http://${HOST === "0.0.0.0" ? "localhost" : HOST}:${PORT}`;
+  console.log(`Market Pulse AI running at ${url}`);
+  if (!isLoopbackHost(HOST)) {
+    console.warn(
+      `WARNING: Market Pulse AI is listening on ${HOST}:${PORT}. APIs include local configuration endpoints; use HOST=0.0.0.0 only on trusted networks.`,
+    );
+  }
 });
 
 if (INTRADAY_WATCHER_CONFIG.enabled) {

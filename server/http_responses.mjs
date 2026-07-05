@@ -1,3 +1,7 @@
+import { gzipSync } from "node:zlib";
+
+const GZIP_MIN_BYTES = 64 * 1024;
+
 export function sanitizeJsonResponseText(value = "") {
   return String(value || "")
     .replace(
@@ -28,22 +32,46 @@ export function jsonResponseReplacer(_key, value) {
   return typeof value === "string" ? sanitizeJsonResponseText(value) : value;
 }
 
+function requestAcceptsGzip(req) {
+  return /\bgzip\b/i.test(String(req?.headers?.["accept-encoding"] || ""));
+}
+
+function maybeGzipBody(res, body, headers = {}) {
+  const buffer = Buffer.isBuffer(body) ? body : Buffer.from(String(body));
+  if (buffer.length <= GZIP_MIN_BYTES || !requestAcceptsGzip(res.req)) {
+    return { body: buffer, headers };
+  }
+  return {
+    body: gzipSync(buffer),
+    headers: { ...headers, "Content-Encoding": "gzip", Vary: "Accept-Encoding" },
+  };
+}
+
 export function sendJson(res, data, status = 200) {
   if (res.destroyed || res.writableEnded) return;
-  res.writeHead(status, {
+  const payload = JSON.stringify(data, jsonResponseReplacer);
+  const encoded = maybeGzipBody(res, payload, {
     "Content-Type": "application/json; charset=utf-8",
     "Cache-Control": "no-store",
   });
-  res.end(JSON.stringify(data, jsonResponseReplacer));
+  res.writeHead(status, {
+    ...encoded.headers,
+    "Content-Length": encoded.body.length,
+  });
+  res.end(encoded.body);
 }
 
 export function sendDownload(res, body, filename, type) {
   if (res.destroyed || res.writableEnded) return;
   const safeName = String(filename || "market-pulse-export.txt").replace(/[^A-Za-z0-9._-]/g, "_");
-  res.writeHead(200, {
+  const encoded = maybeGzipBody(res, body, {
     "Content-Type": type || "application/octet-stream",
     "Content-Disposition": `attachment; filename="${safeName}"`,
     "Cache-Control": "no-store",
   });
-  res.end(body);
+  res.writeHead(200, {
+    ...encoded.headers,
+    "Content-Length": encoded.body.length,
+  });
+  res.end(encoded.body);
 }

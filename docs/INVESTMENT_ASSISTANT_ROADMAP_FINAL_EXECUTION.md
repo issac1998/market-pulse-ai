@@ -1514,3 +1514,67 @@ Regression fixtures added or updated:
 Contradictions:
 
 - No live `analyst_revision_history` sample was required for this code-level verification. The fixture validates the intended field mapping; production rows will continue to report insufficient data until the accrual table has enough history.
+
+---
+
+## WP21 — Security & Transport — 2026-07-05
+
+Implemented Round 4 WP21.
+
+Changes:
+
+- Bound the HTTP server to `HOST || "127.0.0.1"` instead of the implicit all-interface listener.
+- Added non-loopback startup warning text and exposed `config.transport` to the UI.
+- Added a configuration-center warning banner when `HOST` is non-loopback.
+- Added `MAX_REQUEST_BODY_BYTES` with a 2 MB default.
+- Added Content-Length preflight rejection for API requests and byte-count enforcement inside `readBody()`.
+- Converted JSON parse errors into structured 400 responses and request-size errors into 413 responses.
+- Added gzip negotiation for JSON/download responses and static files larger than 64 KB.
+- Regenerated route inventory; route count remains 81.
+
+Verification:
+
+```text
+$ node --check server.mjs
+pass
+
+$ node --check server/http_requests.mjs
+pass
+
+$ node --check server/http_responses.mjs
+pass
+
+$ node --check server/static_files.mjs
+pass
+
+$ node --check public/configuration.js
+pass
+
+$ PORT=5187 HOST=127.0.0.1 INTRADAY_WATCHER_ENABLED=false AGENT_DEBATE_DAILY_ENABLED=false FACTOR_RESEARCHER_ENABLED=false node server.mjs
+Market Pulse AI running at http://127.0.0.1:5187
+
+$ curl ... 3MB POST ... http://127.0.0.1:5187/api/source-smoke/finnhub
+413
+{"error":"请求体超过上限 2097152 字节。"}
+
+$ curl -H 'Accept-Encoding: gzip' http://127.0.0.1:5187/api/state
+HTTP/1.1 200 OK
+Content-Encoding: gzip
+Content-Length: 3311886
+3311886 /tmp/market-pulse-state.gz
+
+$ curl http://192.168.1.3:5187/api/state
+curl: (52) Empty reply from server
+000 52
+
+$ node scripts/core_regression_tests.mjs
+core_regression_tests: ok
+
+$ node scripts/generate_route_inventory.mjs && node scripts/generate_route_inventory.mjs --check
+{"status":"ok","routes":81,"uiFetches":43,"storeKeys":26}
+{"status":"ok","routes":81,"uiFetches":43,"storeKeys":26}
+```
+
+Contradictions:
+
+- None.

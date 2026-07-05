@@ -1,6 +1,9 @@
 import { createReadStream } from "node:fs";
 import { stat } from "node:fs/promises";
 import path from "node:path";
+import { createGzip } from "node:zlib";
+
+const GZIP_MIN_BYTES = 64 * 1024;
 
 export function contentType(file) {
   if (file.endsWith(".html")) return "text/html; charset=utf-8";
@@ -21,12 +24,19 @@ export async function serveStatic(req, res, url, { publicDir }) {
     return;
   }
   try {
-    await stat(filePath);
+    const stats = await stat(filePath);
+    const gzip = stats.size > GZIP_MIN_BYTES && /\bgzip\b/i.test(String(req.headers["accept-encoding"] || ""));
     res.writeHead(200, {
       "Content-Type": contentType(filePath),
       "Cache-Control": "no-store",
+      ...(gzip ? { "Content-Encoding": "gzip", Vary: "Accept-Encoding" } : { "Content-Length": stats.size }),
     });
-    createReadStream(filePath).pipe(res);
+    const stream = createReadStream(filePath);
+    if (gzip) {
+      stream.pipe(createGzip()).pipe(res);
+    } else {
+      stream.pipe(res);
+    }
   } catch {
     res.writeHead(404, { "Content-Type": "text/plain; charset=utf-8" });
     res.end("Not found");

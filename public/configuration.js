@@ -12,6 +12,8 @@ const els = {
   envConfigMessage: document.getElementById("envConfigMessage"),
   saveEnvConfig: document.getElementById("saveEnvConfig"),
   integrationTaskList: document.getElementById("integrationTaskList"),
+  transportWarning: document.getElementById("transportWarning"),
+  transportWarningText: document.getElementById("transportWarningText"),
 };
 
 const guideSections = [
@@ -397,6 +399,18 @@ function renderSummary() {
   els.diagnosticTime.textContent = diagnostics?.generatedAt ? fmtTime(diagnostics.generatedAt) : "未诊断";
 }
 
+function renderTransportWarning() {
+  if (!els.transportWarning) return;
+  const transport = appState?.config?.transport || {};
+  const warning = transport.exposureWarning || "";
+  els.transportWarning.hidden = !warning;
+  if (els.transportWarningText) {
+    els.transportWarningText.textContent = warning
+      ? `${warning} 当前绑定：${transport.host || "-"}:${transport.port || "-"}。`
+      : "";
+  }
+}
+
 function renderIntegrationTasks() {
   if (!els.integrationTaskList) return;
   const readiness = appState?.config?.integrationReadiness || {};
@@ -524,6 +538,7 @@ function renderGuide() {
 }
 
 function renderAll() {
+  renderTransportWarning();
   renderSummary();
   renderIntegrationTasks();
   renderEnvConfig();
