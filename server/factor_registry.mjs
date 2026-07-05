@@ -704,17 +704,57 @@ function summarizeHorizonPairs(pairs = [], expectedSign = 1) {
   const ys = pairs.map((row) => row.excessPct);
   const rankIC = rankCorrelation(xs, ys);
   const uniqueDecisionKeys = new Set(pairs.map((row) => `${row.ticker}|${row.decisionAt}`)).size;
-  const effectiveN = Math.min(pairs.length, uniqueDecisionKeys);
+  const horizonDays = Number(pairs.find((row) => Number.isFinite(Number(row.horizonDays)))?.horizonDays || 1);
+  const calendarEffectiveN = calendarNonOverlapEffectiveN(pairs.map((row) => ({ ticker: row.ticker, date: row.decisionAt })), horizonDays);
+  const effectiveN = Math.min(pairs.length, calendarEffectiveN || uniqueDecisionKeys);
   const tStat = Number.isFinite(rankIC) && effectiveN > 2 ? rankIC * Math.sqrt(effectiveN) : null;
   return {
     rankIC: Number.isFinite(rankIC) ? rankIC : null,
     n: pairs.length,
     effectiveN,
-    effectiveNMethod: "unique-ticker-date",
+    effectiveNMethod: `calendar-non-overlap-${Math.max(1, Math.ceil(horizonDays || 1))}d`,
+    effectiveNVariants: {
+      uniqueDecision: {
+        value: Math.min(pairs.length, uniqueDecisionKeys),
+        method: "unique-ticker-date",
+        n: pairs.length,
+      },
+      calendarNonOverlap: {
+        value: Math.min(pairs.length, calendarEffectiveN || uniqueDecisionKeys),
+        method: `calendar-non-overlap-${Math.max(1, Math.ceil(horizonDays || 1))}d`,
+        n: pairs.length,
+      },
+    },
     tStat: Number.isFinite(tStat) ? tStat : null,
     tStatMethod: "rankIC*sqrt(effectiveN)",
     signOk: Number.isFinite(rankIC) ? rankIC * expectedSign > 0 : false,
   };
+}
+
+function calendarNonOverlapEffectiveN(samples = [], horizonDays = 1) {
+  const horizon = Math.max(1, Math.ceil(Number(horizonDays) || 1));
+  const byTicker = new Map();
+  for (const sample of samples || []) {
+    const ticker = safeTicker(sample.ticker);
+    const date = ymd(sample.date);
+    if (!date) continue;
+    const key = ticker || "__all__";
+    if (!byTicker.has(key)) byTicker.set(key, []);
+    byTicker.get(key).push(date);
+  }
+  let count = 0;
+  for (const dates of byTicker.values()) {
+    let lastMs = null;
+    for (const date of [...new Set(dates)].sort()) {
+      const ms = new Date(`${date}T00:00:00Z`).getTime();
+      if (!Number.isFinite(ms)) continue;
+      if (lastMs === null || (ms - lastMs) / (24 * 60 * 60 * 1000) >= horizon) {
+        count += 1;
+        lastMs = ms;
+      }
+    }
+  }
+  return count;
 }
 
 function corpusDatasetFromObject(db = {}) {
@@ -1338,6 +1378,13 @@ export function buildFactorPerformanceReport(registryInput = {}, context = {}) {
         return acc;
       }, {}),
       trialCount: registry.trialLedger.count,
+      admissionHurdle: {
+        schemaVersion: "factor-admission-hurdle-v1",
+        trialCount: registry.trialLedger.count,
+        formula: "base 3.0 for literature or 3.5 for generated, plus 0.1 per doubling of honest trialCount beyond 8",
+        literature: 3.0 + (registry.trialLedger.count > 8 ? Math.floor(Math.log2(registry.trialLedger.count / 8)) * 0.1 : 0),
+        generated: 3.5 + (registry.trialLedger.count > 8 ? Math.floor(Math.log2(registry.trialLedger.count / 8)) * 0.1 : 0),
+      },
     },
     factors: registry.factors.map((factor) => ({
       factorId: factor.factorId,

@@ -388,6 +388,28 @@ assert.equal(csRankMap.get("AAA|2026-01-01"), 0, "cs_rank should rank across tic
 assert.equal(csRankMap.get("BBB|2026-01-01"), 1, "cs_rank should rank the higher same-date value above peers");
 assert.equal(csRankMap.get("AAA|2026-01-02"), 1, "cs_rank should recompute independently for each date");
 assert.equal(csRankMap.get("BBB|2026-01-02"), 0, "cs_rank should not use the whole time series as its peer set");
+const revisionMomentumMapping = evaluateFactorSpec(
+  {
+    factorId: "revisionMomentum",
+    pipeline: [
+      { op: "ref", input: "revisions.upgrades" },
+      { op: "delta", window: 21 },
+    ],
+  },
+  {
+    revisions: Array.from({ length: 22 }, (_, index) => ({
+      ticker: "AAA",
+      date: new Date(Date.UTC(2026, 0, 1 + index)).toISOString().slice(0, 10),
+      upgrades: index === 0 ? 2 : index === 21 ? 5 : 2 + index / 21,
+    })),
+  },
+  { asOf: "2026-01-22" },
+);
+assert.equal(
+  revisionMomentumMapping.latest.value,
+  3,
+  "revisionMomentum field mapping should compute 21-row upgrade breadth delta from revisions.upgrades",
+);
 const registryWithSeeds = normalizeFactorRegistry({});
 assert.ok(
   registryWithSeeds.factors.some((item) => item.factorId === "netShareIssuance" && item.evidence?.status === "insufficient-data"),
@@ -439,7 +461,7 @@ const corpusSlopes = { AAA: 0.6, BBB: 0.25, CCC: -0.15, DDD: -0.45 };
 const corpusBars = [];
 const corpusOutcomes = [];
 const corpusRegimes = [];
-const corpusDates = Array.from({ length: 280 }, (_, index) => {
+const corpusDates = Array.from({ length: 540 }, (_, index) => {
   const date = new Date(Date.UTC(2024, 0, 1 + index));
   return date.toISOString().slice(0, 10);
 });
@@ -457,7 +479,7 @@ for (const [ticker, slope] of Object.entries(corpusSlopes)) {
     });
   }
 }
-const corpusDecisionDates = corpusDates.slice(252, 276).filter((_, index) => index % 5 === 0);
+const corpusDecisionDates = corpusDates.slice(252, 520).filter((_, index) => index % 20 === 0);
 for (const [regimeIndex, date] of corpusDecisionDates.entries()) {
   corpusRegimes.push({ date, bucket: ["riskOn", "neutral", "riskOff"][regimeIndex % 3], risk_score: 30 + regimeIndex });
   for (const [ticker, slope] of Object.entries(corpusSlopes)) {
@@ -779,6 +801,22 @@ const overlappingFactorStats = buildFactorStatsFromOutcomes([
 assert.equal(overlappingFactorStats.momentum.n, 3, "Factor stats should retain raw pooled n");
 assert.equal(overlappingFactorStats.momentum.effectiveN, 2, "Factor stats should report non-overlapping effectiveN by frozen decision");
 assert.ok(overlappingFactorStats.momentum.effectiveN < overlappingFactorStats.momentum.n, "effectiveN should be below raw n when horizons overlap");
+const adjacentHorizonStats = buildFactorStatsFromOutcomes(
+  Array.from({ length: 5 }, (_, index) => ({
+    decisionId: `adjacent-${index}`,
+    ticker: "AAA",
+    decisionAt: new Date(Date.UTC(2026, 0, 1 + index)).toISOString().slice(0, 10),
+    horizonDays: 20,
+    excessPct: index - 2,
+    factorSnapshot: { factors: { momentum: { label: "Momentum", score: 40 + index * 5 } } },
+  })),
+);
+const adjacentH20 = adjacentHorizonStats.momentum.horizons["20"];
+assert.equal(adjacentH20.n, 5, "Adjacent horizon fixture should retain raw n");
+assert.equal(adjacentH20.effectiveNUniqueDecision, 5, "Unique-decision effectiveN should count each frozen decision");
+assert.equal(adjacentH20.effectiveNCalendarNonOverlap, 1, "Calendar non-overlap effectiveN should subsample overlapping T+20 decisions");
+assert.equal(adjacentH20.effectiveN, adjacentH20.effectiveNCalendarNonOverlap, "T-stat effectiveN should use calendar non-overlap");
+assert.ok(adjacentH20.effectiveNVariants.calendarNonOverlap.method.includes("20d"), "effectiveN variants should label the horizon window");
 
 const recommendationScore = scoreRecommendationFromFactorSnapshot(
   {

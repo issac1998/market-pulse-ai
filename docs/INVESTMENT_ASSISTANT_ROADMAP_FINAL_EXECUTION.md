@@ -1344,8 +1344,6 @@ Contradictions:
 
 - None.
 
----
-
 ## WP18 — Live Shadow Factors + Promotion Emitters — 2026-07-05
 
 Implemented Round 3 WP18.
@@ -1461,3 +1459,58 @@ Regression fixtures added:
 Contradictions:
 
 - None.
+
+---
+
+## WP20 — Statistical Refinements — 2026-07-05
+
+Implemented Round 3 WP20.
+
+Changes:
+
+- Added calendar non-overlap effective-N to shared factor stats in `lib/recommender_core.mjs`:
+  - `effectiveNUniqueDecision`
+  - `effectiveNCalendarNonOverlap`
+  - `effectiveNVariants.uniqueDecision`
+  - `effectiveNVariants.calendarNonOverlap`
+  - `effectiveN` and t-stat now use the calendar non-overlap variant.
+- Added the same effective-N variants to corpus evidence horizon cells in `server/factor_registry.mjs`.
+- Added admission hurdle metadata to the factor performance report:
+  - current honest `trialCount`
+  - formula text
+  - current literature/generated hurdle values
+- Kept WP11/WP12 scoring semantics unchanged.
+- Regenerated route inventory.
+
+Verification:
+
+```text
+$ node --check lib/recommender_core.mjs
+pass
+
+$ node --check server/factor_registry.mjs
+pass
+
+$ node --check server.mjs
+pass
+
+$ node --check public/app.js
+pass
+
+$ node scripts/core_regression_tests.mjs
+core_regression_tests: ok
+
+$ node scripts/generate_route_inventory.mjs
+{"status":"ok","routes":81,"uiFetches":43,"storeKeys":26}
+```
+
+Regression fixtures added or updated:
+
+- Adjacent T+20 decisions retain raw `n=5`, unique-decision effectiveN `5`, and calendar non-overlap effectiveN `1`.
+- Factor stats expose both effectiveN variant method labels, with `effectiveN <= n`.
+- Corpus evidence fixture was widened to 20-calendar-day-spaced decisions so the stricter non-overlap t-stat can still admit `week52HighProximity` on computed evidence.
+- `revisionMomentum` field mapping sanity check: fixture rows use `revisions.upgrades` with first value `2` and 21-row-later value `5`; DSL `delta 21` returns `3`, matching the hand-computed revision breadth delta.
+
+Contradictions:
+
+- No live `analyst_revision_history` sample was required for this code-level verification. The fixture validates the intended field mapping; production rows will continue to report insufficient data until the accrual table has enough history.

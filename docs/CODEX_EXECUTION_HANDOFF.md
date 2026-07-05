@@ -234,7 +234,7 @@ The missing piece found in review: `admissionEvidenceForFactor` (server/factor_r
 - **R3d — originality correlation alignment**: fixed as part of WP17 (align score series on ticker+date); confirm the gate uses it.
 - **Verify**: fixture — proposal reusing a shadow factor's id is rejected with the conflict named; ledger fixture — 3 evaluator runs over an unchanged registry add 0 trials; decay fixture — one bad window does not demote, two consecutive do; migration entry present and append-only.
 
-## ☐ WP20 — Statistical refinements (after WP17/WP18 are producing evidence)
+## ☑ WP20 — Statistical refinements (after WP17/WP18 are producing evidence)
 
 - **Within-horizon overlap**: `effectiveN` currently dedupes multi-horizon rows of one decision but not adjacent-day decisions whose T+20/T+60 windows share most of their path. Add calendar-based non-overlap subsampling per horizon (keep every ⌈horizon⌉-th decision date per ticker) as the t-stat basis, or Newey-West with lag = horizonDays as a labeled alternative; report both `effectiveN` variants with method labels.
 - **`revisionMomentum` spec semantics**: once `analyst_revision_history` accrues rows, sanity-check `ref revisions.upgrades → delta 21` against hand-computed 30d revision breadth for 3 tickers; adjust the spec (not the whitelist) if the field mapping is off.
