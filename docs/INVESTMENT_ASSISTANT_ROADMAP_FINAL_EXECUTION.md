@@ -2018,3 +2018,58 @@ Contradictions / deferred live checks:
 
 - I did not run a full production collection under `--max-old-space-size=2048` in this heartbeat because it would mutate the live store, call external providers, and may run for many minutes. The save-path clone removal is verified by source grep and regression tests; the full live collection remains a follow-up validation item.
 - I did not perform a destructive `kill -9` restart drill on the production process in this heartbeat. The lock-file path and clean-signal cleanup are implemented; the dirty-restart UI/audit proof remains a follow-up validation item.
+
+---
+
+## WP27 — Walk-forward benchmark integrity — 2026-07-08
+
+What changed:
+
+- Added an explicit `BENCHMARK_TICKERS` set (`SPY`, `QQQ`, sector SPDRs, `SMH`) in `server/historical_backtest.mjs`.
+- Historical walk-forward now excludes every benchmark ticker from the trading universe and cross-sectional scoring, not just `SPY`.
+- SQLite walk-forward loads benchmark bars in a dedicated query that is not affected by `maxTickers`; capped runs can still compute SPY/sector benchmark returns.
+- Missing benchmark returns no longer degrade to `raw - 0`: outcome rows get `benchmarkStatus:"missing_benchmark"`, `excessPct:null`, and `outcomeUsable:false`.
+- Daily equity-book rows also stop computing excess when the SPY daily benchmark is unavailable.
+- Metrics now expose `missingBenchmark {count,n,source}` so benchmark gaps are visible and sample-counted.
+- Sector basket partials are labeled `partial_benchmark` when optional sector components are missing; if required SPY is missing, the benchmark is unusable.
+
+Files/functions:
+
+- `server/historical_backtest.mjs`: benchmark ticker set, SQLite benchmark-bar loading, outcome benchmark status, daily benchmark status, missingBenchmark metric.
+- `scripts/core_regression_tests.mjs`: benchmark ticker exclusion and missing-benchmark fixtures.
+
+Verification:
+
+```text
+$ node --check server/historical_backtest.mjs && node --check server.mjs && node --check public/app.js
+pass
+
+$ node scripts/core_regression_tests.mjs
+core_regression_tests: ok
+
+$ node scripts/generate_route_inventory.mjs --check && git diff --check
+{"status":"ok","routes":81,"uiFetches":43,"storeKeys":27}
+
+$ python3 -m py_compile scripts/*.py harness/invoker/*.py harness/tools/*.py harness/tests/*.py
+pass
+```
+
+SQLite capped smoke:
+
+```text
+$ node --input-type=module <temporary-sqlite fixture>
+{
+  "status": "ok",
+  "decisions": 9,
+  "outcomes": 9,
+  "benchmarkTickers": ["SMH", "SPY", "XLK"],
+  "hasBenchmarkDecision": false,
+  "missingBenchmark": {"count": 0, "n": 9, "source": "historical-backtest"},
+  "benchmarkStatuses": ["ok"],
+  "nonNullBenchmarkOutcomes": 9
+}
+```
+
+Contradictions / deferred live checks:
+
+- I did not run the full production corpus walk-forward in this heartbeat because it can be long-running and writes historical backtest rows to the live SQLite store. The temporary SQLite capped smoke covers the WP27 integrity bug directly; the full-corpus evidence rerun remains a follow-up validation item before trusting updated headline performance.

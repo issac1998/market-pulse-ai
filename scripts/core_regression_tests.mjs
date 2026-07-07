@@ -1362,6 +1362,10 @@ assert.ok(
   "Historical walk-forward should use security_master_ext sector ETF baskets when sector bars exist",
 );
 assert.ok(
+  historicalWalkForward.run.decisions.every((item) => !["SPY", "QQQ", "XLK", "XLE", "XLF", "XLV", "XLY", "XLP", "XLI", "XLB", "XLU", "XLRE", "XLC", "SMH"].includes(item.ticker)),
+  "Historical walk-forward should exclude benchmark tickers from pseudo-decisions",
+);
+assert.ok(
   historicalWalkForward.run.outcomes.some((item) => Number.isFinite(item.sectorBenchmarkReturnPct)),
   "Historical outcomes should expose sectorBenchmarkReturnPct when benchmark basket components are available",
 );
@@ -1373,6 +1377,33 @@ assert.ok(historicalWalkForward.run.outcomes.length > 0, "Historical walk-forwar
 assert.ok(
   historicalWalkForward.run.daily.some((row) => Number.isFinite(row.portfolioReturnPct)),
   "Historical daily book should expose equal-weight open-position portfolio returns",
+);
+const missingBenchmarkWalkForward = runHistoricalWalkForwardFromRows({
+  bars: historicalBacktestBars.filter((row) => !["SPY", "XLK"].includes(row.ticker)),
+  regimes: [{ date: "2026-01-01", bucket: "宏观顺风", risk_score: 38 }],
+  config: {
+    minLookback: 20,
+    maxDates: 2,
+    topN: 1,
+    horizons: [1],
+    primaryHorizon: 1,
+    securityMasterExt: [
+      { ticker: "AAPL", sector: "Information Technology", industry_group: "Technology Hardware & Equipment", industry: "Technology Hardware" },
+      { ticker: "MSFT", sector: "Information Technology", industry_group: "Software & Services", industry: "Software" },
+    ],
+  },
+});
+assert.ok(
+  missingBenchmarkWalkForward.run.outcomes.length > 0,
+  "Missing-benchmark fixture should still create raw outcomes for audit visibility",
+);
+assert.ok(
+  missingBenchmarkWalkForward.run.outcomes.every((item) => item.benchmarkStatus === "missing_benchmark" && item.excessPct === null && item.outcomeUsable === false),
+  "Missing benchmark rows must be unusable and must not treat raw return as excess",
+);
+assert.ok(
+  Number(missingBenchmarkWalkForward.run.metrics.missingBenchmark?.count || 0) > 0 && Number(missingBenchmarkWalkForward.run.metrics.missingBenchmark?.n || 0) > 0,
+  "Historical metrics should report missing benchmark counts with sample size",
 );
 assert.ok(
   historicalWalkForward.run.metrics.maxDrawdown.value > -100,

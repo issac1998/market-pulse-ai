@@ -19,6 +19,23 @@ import { numberOrNull } from "../lib/market_core.mjs";
 
 const DEFAULT_HORIZONS = [1, 3, 5, 10, 20, 60];
 const DEFAULT_WEIGHTS = normalizeRecommendationFactorWeights();
+export const BENCHMARK_TICKERS = Object.freeze([
+  "SPY",
+  "QQQ",
+  "XLK",
+  "XLE",
+  "XLF",
+  "XLV",
+  "XLY",
+  "XLP",
+  "XLI",
+  "XLB",
+  "XLU",
+  "XLRE",
+  "XLC",
+  "SMH",
+]);
+const BENCHMARK_TICKER_SET = new Set(BENCHMARK_TICKERS);
 const BRIDGE_VENV_PYTHON = fileURLToPath(new URL("../.venv-bridges/bin/python", import.meta.url));
 const PYTHON = process.env.BRIDGE_PYTHON
   || process.env.HISTORICAL_BRIDGE_PYTHON
@@ -30,6 +47,10 @@ const ALPHALENS_BRIDGE = fileURLToPath(new URL("../scripts/alphalens_bridge.py",
 
 function safeTicker(value = "") {
   return String(value || "").toUpperCase().replace(/[^A-Z0-9.-]/g, "").slice(0, 16);
+}
+
+function isBenchmarkTicker(value = "") {
+  return BENCHMARK_TICKER_SET.has(safeTicker(value));
 }
 
 function ymd(value = "") {
@@ -271,14 +292,17 @@ function benchmarkBasketForTicker(ticker = "", securityMaster = new Map(), byTic
 
 function benchmarkReturnForBasket(byTicker = new Map(), basket = [], signalDate = "", exitDate = "", roundTripCostBps = 0) {
   const components = [];
+  const requiredTickers = (basket || []).map((item) => safeTicker(item.ticker)).filter(Boolean);
+  const missingTickers = [];
   for (const item of basket || []) {
-    const rows = byTicker.get(safeTicker(item.ticker)) || [];
+    const ticker = safeTicker(item.ticker);
+    const rows = byTicker.get(ticker) || [];
     const entry = barAfter(rows, signalDate);
     const exit = entry ? rows.find((row) => row.date >= exitDate) || null : null;
     const value = entry && exit ? returnPct(entry.open, exit.close, roundTripCostBps) : null;
     if (Number.isFinite(value)) {
       components.push({
-        ticker: safeTicker(item.ticker),
+        ticker,
         weight: pct(item.weight) ?? 0,
         entryDate: entry.date,
         exitDate: exit.date,
@@ -286,16 +310,23 @@ function benchmarkReturnForBasket(byTicker = new Map(), basket = [], signalDate 
         exitPrice: exit.close,
         returnPct: value,
       });
+    } else if (ticker) {
+      missingTickers.push(ticker);
     }
   }
+  const missingSpy = requiredTickers.includes("SPY") && !components.some((item) => item.ticker === "SPY");
   const totalWeight = components.reduce((sum, item) => sum + item.weight, 0);
-  const value = totalWeight > 0
+  const value = !missingSpy && totalWeight > 0
     ? components.reduce((sum, item) => sum + item.returnPct * (item.weight / totalWeight), 0)
     : null;
   return {
     label: components.map((item) => item.ticker).join("+") || "",
     returnPct: value,
     components,
+    status: Number.isFinite(value)
+      ? (missingTickers.length ? "partial_benchmark" : "ok")
+      : "missing_benchmark",
+    missingTickers,
   };
 }
 
@@ -362,6 +393,8 @@ function equityAndDrawdownCurve(dailyRows = []) {
 
 function aggregateOutcomes(outcomes = [], primaryHorizon = 20, dailyRows = []) {
   const rows = outcomes.filter((row) => row.horizonDays === primaryHorizon && row.outcomeUsable !== false);
+  const primaryRowsAll = outcomes.filter((row) => row.horizonDays === primaryHorizon);
+  const missingBenchmark = primaryRowsAll.filter((row) => row.benchmarkStatus === "missing_benchmark" || row.outcomeUsable === false && row.excessPct === null).length;
   const excess = rows.map((row) => pct(row.excessPct)).filter(Number.isFinite);
   const raw = rows.map((row) => pct(row.rawReturnPct)).filter(Number.isFinite);
   const benchmark = rows.map((row) => pct(row.benchmarkReturnPct)).filter(Number.isFinite);
@@ -389,6 +422,7 @@ function aggregateOutcomes(outcomes = [], primaryHorizon = 20, dailyRows = []) {
   return {
     primaryHorizon,
     sampleCount: rows.length,
+    missingBenchmark: { count: missingBenchmark, n: primaryRowsAll.length, source: "historical-backtest" },
     avgExcessPct: metric(avgExcess, rows.length),
     totalReturnPct: metric(totalRawReturnPct, dailyRaw.length),
     excessReturnPct: metric(totalExcessReturnPct, dailyExcess.length),
@@ -527,13 +561,15 @@ function portfolioDailyBook(decisions = [], byTicker = new Map(), spyRows = [], 
     .map((row) => {
       const portfolioReturnPct = mean(row._positionReturns);
       const benchmarkReturnPct = spyDailyReturnForDate(spyRows, row.date);
-      const excess = Number.isFinite(portfolioReturnPct)
-        ? portfolioReturnPct - (Number.isFinite(benchmarkReturnPct) ? benchmarkReturnPct : 0)
+      const benchmarkAvailable = Number.isFinite(benchmarkReturnPct);
+      const excess = Number.isFinite(portfolioReturnPct) && benchmarkAvailable
+        ? portfolioReturnPct - benchmarkReturnPct
         : null;
       row.decisions = row.openPositions;
       row.tickers = [...new Set(row.tickers)].sort();
       row.portfolioReturnPct = portfolioReturnPct;
       row.benchmarkReturnPct = benchmarkReturnPct;
+      row.benchmarkStatus = benchmarkAvailable ? "ok" : "missing_benchmark";
       row.avgRawReturnPct = portfolioReturnPct;
       row.avgBenchmarkReturnPct = benchmarkReturnPct;
       row.avgExcessPct = excess;
@@ -1132,7 +1168,7 @@ export function runHistoricalWalkForwardFromRows({ bars = [], regimes = [], conf
   for (const signalDate of dates) {
     const scored = [];
     for (const [ticker, rows] of byTicker.entries()) {
-      if (ticker === "SPY") continue;
+      if (isBenchmarkTicker(ticker)) continue;
       const eligibleBars = rows.filter((row) => row.date <= signalDate);
       if (eligibleBars.length < runConfig.minLookback) continue;
       const { factorSnapshot, recommendationScore } = buildFactorSnapshotAsOf({
@@ -1193,7 +1229,8 @@ export function runHistoricalWalkForwardFromRows({ bars = [], regimes = [], conf
         const benchmark = benchmarkReturnForBasket(byTicker, decision.benchmarkBasket, signalDate, exit.date, roundTripCostBps);
         const spyBenchmark = benchmarkReturn(spyRows, signalDate, exit.date, roundTripCostBps);
         const benchmarkPct = pct(benchmark.returnPct);
-        const excess = Number.isFinite(raw) ? raw - (Number.isFinite(benchmarkPct) ? benchmarkPct : 0) : null;
+        const benchmarkStatus = Number.isFinite(benchmarkPct) ? benchmark.status || "ok" : "missing_benchmark";
+        const excess = Number.isFinite(raw) && Number.isFinite(benchmarkPct) ? raw - benchmarkPct : null;
         const outcome = outcomeFromExcess(excess, 0.5);
         const quality = classifyOutcomeQuality({
           entryPrice: entry.open,
@@ -1219,6 +1256,8 @@ export function runHistoricalWalkForwardFromRows({ bars = [], regimes = [], conf
           rawReturnPct: raw,
           benchmarkTicker: benchmark.label || "SPY",
           benchmarkReturnPct: benchmarkPct,
+          benchmarkStatus,
+          missingBenchmarkTickers: benchmark.missingTickers || [],
           spyBenchmarkReturnPct: pct(spyBenchmark.returnPct),
           sectorBenchmarkReturnPct: benchmarkPct,
           benchmarkComponents: benchmark.components,
@@ -1227,7 +1266,7 @@ export function runHistoricalWalkForwardFromRows({ bars = [], regimes = [], conf
           outcome,
           outcomeQualityStatus: quality.status,
           outcomeQualityReasons: quality.reasons,
-          outcomeUsable: quality.usable,
+          outcomeUsable: quality.usable && benchmarkStatus !== "missing_benchmark",
           regimeBucket,
           scoreSchema: decision.factorSnapshot.schemaVersion || decision.factorSnapshot.scoreSchema || "",
           factorSnapshot: decision.factorSnapshot,
@@ -1262,7 +1301,8 @@ export function runHistoricalWalkForwardFromRows({ bars = [], regimes = [], conf
     status: dates.length ? "ok" : "empty",
     decisionSource: "historical-backtest",
     scope: {
-      tickers: byTicker.size,
+      tickers: [...byTicker.keys()].filter((ticker) => !isBenchmarkTicker(ticker)).length,
+      benchmarkTickers: [...byTicker.keys()].filter(isBenchmarkTicker).sort(),
       dates: dates.length,
       barRows: normalizeHistoricalBars(bars).length,
       regimeRows: regimes.length,
@@ -1312,12 +1352,14 @@ export function runHistoricalWalkForwardFromRows({ bars = [], regimes = [], conf
         securityMasterExtError: runConfig.securityMasterExtError,
         securityMasterExtRows: securityMaster.size,
         sectorBasketStatusCounts,
+        missingBenchmark: metrics.missingBenchmark,
       },
     },
     caveats: [
       "Walk-forward uses only dates present in historical_bars and never reads rows after the signal date.",
       "Backtest outputs are labeled historical-backtest and must not blend with live recommendation rows.",
-      "Sector baskets use security_master_ext when present; if a mapped sector ETF has no historical bars, the basket falls back to available components and records sector_mapping_missing_bars.",
+      "Benchmark tickers are loaded independently and excluded from the trading universe/cross-section; missing benchmark rows make outcomes unusable instead of treating raw return as excess.",
+      "Sector baskets use security_master_ext when present; if a mapped sector ETF has no historical bars, the basket uses available benchmark components only with partial_benchmark disclosure.",
       roundTripCostBps > 0 ? "Costs/slippage are included in raw and benchmark returns." : "Zero-cost run is labeled frictionless-reference.",
     ],
   };
@@ -1333,9 +1375,10 @@ export async function runHistoricalWalkForwardFromSqlite({ sqlitePath, config = 
     end ? `date <= '${sqlText(end)}'` : "",
   ].filter(Boolean);
   const limitTickers = Math.max(0, Number(config.maxTickers || 0));
+  const benchmarkSqlList = BENCHMARK_TICKERS.map((ticker) => `'${sqlText(ticker)}'`).join(",");
   const tickerRows = await sqliteJson(
     sqlitePath,
-    `SELECT DISTINCT ticker FROM historical_bars ${where.length ? `WHERE ${where.join(" AND ")}` : ""} ORDER BY ticker${limitTickers ? ` LIMIT ${limitTickers}` : ""};`,
+    `SELECT DISTINCT ticker FROM historical_bars ${where.length ? `WHERE ${where.join(" AND ")} AND` : "WHERE"} ticker NOT IN (${benchmarkSqlList}) ORDER BY ticker${limitTickers ? ` LIMIT ${limitTickers}` : ""};`,
     config.sqliteTimeoutMs || 30000,
   );
   const tickers = tickerRows.map((row) => safeTicker(row.ticker)).filter(Boolean);
@@ -1355,10 +1398,18 @@ export async function runHistoricalWalkForwardFromSqlite({ sqlitePath, config = 
     }
     return result;
   }
+  const benchmarkRows = await sqliteJson(
+    sqlitePath,
+    `SELECT DISTINCT ticker FROM historical_bars WHERE ticker IN (${benchmarkSqlList})${where.length ? ` AND ${where.join(" AND ")}` : ""} ORDER BY ticker;`,
+    config.sqliteTimeoutMs || 30000,
+  );
+  const benchmarkTickers = benchmarkRows.map((row) => safeTicker(row.ticker)).filter(Boolean);
+  const allBarTickers = [...new Set([...tickers, ...benchmarkTickers])];
   const tickerList = tickers.map((ticker) => `'${sqlText(ticker)}'`).join(",");
+  const barTickerList = allBarTickers.map((ticker) => `'${sqlText(ticker)}'`).join(",");
   const bars = await sqliteJson(
     sqlitePath,
-    `SELECT ticker,date,open,high,low,close,volume,source FROM historical_bars WHERE ticker IN (${tickerList})${where.length ? ` AND ${where.join(" AND ")}` : ""} ORDER BY ticker,date;`,
+    `SELECT ticker,date,open,high,low,close,volume,source FROM historical_bars WHERE ticker IN (${barTickerList})${where.length ? ` AND ${where.join(" AND ")}` : ""} ORDER BY ticker,date;`,
     config.sqliteTimeoutMs || 30000,
   );
   const regimes = await sqliteJson(
