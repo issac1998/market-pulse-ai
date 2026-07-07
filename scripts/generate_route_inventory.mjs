@@ -112,7 +112,33 @@ function parseUiFetches(text) {
 }
 
 function parseStoreKeys(text) {
-  const block = text.match(/const normalized = \{([\s\S]*?)\n\s+\};\n\s+storeCache/s)?.[1] || "";
+  const start = text.indexOf("const normalized = {");
+  if (start < 0) return [];
+  const braceStart = text.indexOf("{", start);
+  let depth = 0;
+  let quote = "";
+  let end = -1;
+  for (let i = braceStart; i < text.length; i += 1) {
+    const ch = text[i];
+    const prev = text[i - 1];
+    if (quote) {
+      if (ch === quote && prev !== "\\") quote = "";
+      continue;
+    }
+    if (ch === "\"" || ch === "'" || ch === "`") {
+      quote = ch;
+      continue;
+    }
+    if (ch === "{") depth += 1;
+    if (ch === "}") {
+      depth -= 1;
+      if (depth === 0) {
+        end = i;
+        break;
+      }
+    }
+  }
+  const block = end > braceStart ? text.slice(braceStart + 1, end) : "";
   const keys = [...block.matchAll(/^\s{6}([A-Za-z0-9_]+):/gm)].map((item) => item[1]);
   return [...new Set(keys)].sort();
 }

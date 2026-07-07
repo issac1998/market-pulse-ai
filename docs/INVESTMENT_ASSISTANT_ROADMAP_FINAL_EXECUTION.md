@@ -2073,3 +2073,44 @@ $ node --input-type=module <temporary-sqlite fixture>
 Contradictions / deferred live checks:
 
 - I did not run the full production corpus walk-forward in this heartbeat because it can be long-running and writes historical backtest rows to the live SQLite store. The temporary SQLite capped smoke covers the WP27 integrity bug directly; the full-corpus evidence rerun remains a follow-up validation item before trusting updated headline performance.
+
+---
+
+## WP28 — Strategy-version single-active invariant — 2026-07-08
+
+What changed:
+
+- Added `repairStrategyVersionActiveInvariant()` in `server/strategy_versions.mjs`; it preserves the newest active version per `strategyType`, supersedes older active rows, and appends `stateHistory`.
+- `normalizeStrategyVersions()` now enforces the invariant by default, so active selection, display, upsert, promote, rollback normalization, and candidate insertion share one rule.
+- `upsertStrategyVersion()` active inserts now demote older active rows through the same repair path.
+- `promoteStrategyVersion()` now supersedes the previous active version with `stateHistory` instead of leaving ambiguous active rows.
+- Startup `ensureStore()` detects raw dual-active rows, writes a `strategy_version.migrated` audit event, and persists the repaired rows.
+- `scripts/generate_route_inventory.mjs` now parses primary store keys by brace matching instead of relying on `storeCache` appearing immediately after the normalized object; this preserves route inventory after the startup migration block.
+
+Files/functions:
+
+- `server/strategy_versions.mjs`: single-active repair, state history append, promote supersession.
+- `server.mjs`: startup migration + audit event.
+- `scripts/core_regression_tests.mjs`: active insert and dual-active repair fixtures.
+- `scripts/generate_route_inventory.mjs`: robust normalized-store parser.
+- `docs/CODEBASE_ROUTE_INVENTORY.md`: regenerated with current line numbers and 27 store keys.
+
+Verification:
+
+```text
+$ node --check server/strategy_versions.mjs && node --check server.mjs && node --check public/app.js && node --check scripts/generate_route_inventory.mjs
+pass
+
+$ node scripts/core_regression_tests.mjs
+core_regression_tests: ok
+
+$ node scripts/generate_route_inventory.mjs --check && git diff --check
+{"status":"ok","routes":81,"uiFetches":43,"storeKeys":27}
+
+$ python3 -m py_compile scripts/*.py harness/invoker/*.py harness/tools/*.py harness/tests/*.py
+pass
+```
+
+Contradictions / deferred live checks:
+
+- I did not start the production server solely to force the startup migration against the live store in this heartbeat. The migration logic is covered by the dual-active fixture; live proof will occur on the next normal server restart if the current store still contains dual-active rows.

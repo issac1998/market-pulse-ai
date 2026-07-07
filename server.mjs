@@ -85,6 +85,7 @@ import {
   candidateStrategyVersionFromSubSignalComposites,
   normalizeStrategyVersions as normalizeStrategyVersionRows,
   promoteStrategyVersion,
+  repairStrategyVersionActiveInvariant,
   rollbackStrategyVersions,
   upsertStrategyVersion as upsertStrategyVersionCore,
 } from "./server/strategy_versions.mjs";
@@ -3947,6 +3948,23 @@ async function ensureStore() {
       allStockAgent: normalizeAllStockAgentState(db.allStockAgent),
       factorRegistry: normalizeFactorRegistry(db.factorRegistry),
     };
+    const strategyRepair = repairStrategyVersionActiveInvariant(db.allStockAgent?.strategyVersions, {
+      migratedAt: nowIso(),
+      reason: "startup-single-active-migration",
+      actor: "server-startup",
+    });
+    if (strategyRepair.migrations.length) {
+      normalized.allStockAgent = {
+        ...normalized.allStockAgent,
+        strategyVersions: strategyRepair.rows,
+      };
+      appendAuditEvent(normalized, "strategy_version.migrated", {
+        reason: "startup-single-active-migration",
+        migrations: strategyRepair.migrations,
+      }, "warn", "server-startup");
+      await saveStore(normalized);
+      return storeCache || normalized;
+    }
     storeCache = normalized;
     storeCacheMtimeMs = fileStat.mtimeMs;
     storeLastSavedHash = sha256Text(raw);

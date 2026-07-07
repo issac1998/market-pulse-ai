@@ -39,12 +39,33 @@ function metricSampleCount(metric) {
 function statusRank(status = "") {
   if (status === "active") return 0;
   if (status === "candidate") return 1;
+  if (status === "superseded") return 2;
   if (status === "retired") return 2;
   return 3;
 }
 
-export function normalizeStrategyVersions(rows = []) {
-  return (Array.isArray(rows) ? rows : [])
+function appendStateHistory(row = {}, entry = {}) {
+  return [
+    {
+      at: entry.at || nowIso(),
+      status: entry.status || row.status || "",
+      previousStatus: entry.previousStatus || "",
+      reason: entry.reason || "",
+      actor: entry.actor || "system",
+      relatedVersionId: entry.relatedVersionId || "",
+    },
+    ...(Array.isArray(row.stateHistory) ? row.stateHistory : []),
+  ].slice(0, 100);
+}
+
+function sortStrategyVersions(rows = []) {
+  return rows
+    .sort((a, b) => statusRank(a.status) - statusRank(b.status) || String(b.createdAt || b.activeFrom).localeCompare(String(a.createdAt || a.activeFrom)))
+    .slice(0, 200);
+}
+
+function normalizeStrategyVersionsBase(rows = []) {
+  return sortStrategyVersions((Array.isArray(rows) ? rows : [])
     .filter((row) => row && typeof row === "object" && row.id)
     .map((row) => {
       const weights = row.weights || row.json?.weights || row.json?.factorWeights || row.json?.settings?.factorWeights || null;
@@ -66,11 +87,67 @@ export function normalizeStrategyVersions(rows = []) {
         active: row.active !== undefined ? Boolean(row.active) : (row.status || "active") === "active",
         weights: weights ? normalizeRecommendationFactorWeights(weights) : null,
         validationRecords: Array.isArray(row.validationRecords) ? row.validationRecords.slice(0, 50) : [],
+        stateHistory: Array.isArray(row.stateHistory) ? row.stateHistory.slice(0, 100) : [],
         json: row.json && typeof row.json === "object" ? row.json : null,
       };
-    })
-    .sort((a, b) => statusRank(a.status) - statusRank(b.status) || String(b.createdAt || b.activeFrom).localeCompare(String(a.createdAt || a.activeFrom)))
-    .slice(0, 200);
+    }));
+}
+
+export function repairStrategyVersionActiveInvariant(rows = [], options = {}) {
+  const normalized = normalizeStrategyVersionsBase(rows);
+  const repaired = normalized.map((row) => ({ ...row }));
+  const migrations = [];
+  const byType = new Map();
+  for (const row of repaired) {
+    const type = row.strategyType || "all-stock-agent";
+    if (!byType.has(type)) byType.set(type, []);
+    if (row.status === "active" || row.active) byType.get(type).push(row);
+  }
+  const migratedAt = options.migratedAt || nowIso();
+  for (const [strategyType, activeRows] of byType.entries()) {
+    if (activeRows.length <= 1) {
+      for (const row of activeRows) {
+        row.status = "active";
+        row.active = true;
+      }
+      continue;
+    }
+    const sorted = activeRows
+      .slice()
+      .sort((a, b) => String(b.activeFrom || b.createdAt).localeCompare(String(a.activeFrom || a.createdAt)));
+    const keeper = sorted[0];
+    keeper.status = "active";
+    keeper.active = true;
+    for (const row of sorted.slice(1)) {
+      const previousStatus = row.status || (row.active ? "active" : "");
+      row.status = options.supersededStatus || "superseded";
+      row.active = false;
+      row.activeTo = row.activeTo || migratedAt;
+      row.supersededByVersionId = keeper.id;
+      row.stateHistory = appendStateHistory(row, {
+        at: migratedAt,
+        status: row.status,
+        previousStatus,
+        reason: options.reason || "single-active-invariant",
+        actor: options.actor || "system",
+        relatedVersionId: keeper.id,
+      });
+      migrations.push({
+        strategyType,
+        supersededId: row.id,
+        activeId: keeper.id,
+        previousStatus,
+        status: row.status,
+        migratedAt,
+      });
+    }
+  }
+  return { rows: sortStrategyVersions(repaired), migrations };
+}
+
+export function normalizeStrategyVersions(rows = [], options = {}) {
+  if (options.enforceSingleActive === false) return normalizeStrategyVersionsBase(rows);
+  return repairStrategyVersionActiveInvariant(rows, options).rows;
 }
 
 export function activeStrategyVersion(rows = []) {
@@ -450,10 +527,19 @@ export function promoteStrategyVersion(rows = [], candidateId = "", options = {}
     if (row.status === "active" || row.active) {
       return {
         ...row,
-        status: "retired",
+        status: "superseded",
         active: false,
         activeTo: row.activeTo || promotedAt,
         retiredByPromotionId: candidate.id,
+        supersededByVersionId: candidate.id,
+        stateHistory: appendStateHistory(row, {
+          at: promotedAt,
+          status: "superseded",
+          previousStatus: row.status || "active",
+          reason: "strategy-version-promoted",
+          actor: options.promotedBy || "human",
+          relatedVersionId: candidate.id,
+        }),
       };
     }
     return row;

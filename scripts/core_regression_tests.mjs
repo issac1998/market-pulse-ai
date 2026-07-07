@@ -68,6 +68,7 @@ import {
   candidateStrategyVersionForShadowPromotion,
   candidateStrategyVersionFromSubSignalComposites,
   promoteStrategyVersion,
+  repairStrategyVersionActiveInvariant,
   rollbackStrategyVersions,
   upsertStrategyVersion,
 } from "../server/strategy_versions.mjs";
@@ -1010,6 +1011,39 @@ assert.equal(subSignalCandidate.json.settings.subSignalCompositeMode, "ic-weight
 assert.ok(subSignalCandidate.changelog?.[0]?.summary.includes("IC 加权子信号"), "Sub-signal candidate should record a changelog entry");
 let strategyRows = upsertStrategyVersion([activeStrategy], candidateStrategy);
 assert.equal(activeStrategyVersion(strategyRows).id, "active-v1", "Candidate insertion must not change active strategy version");
+const secondActive = {
+  id: "active-v2",
+  status: "active",
+  active: true,
+  activeFrom: "2026-07-02T00:00:00.000Z",
+  createdAt: "2026-07-02T00:00:00.000Z",
+  weights: { momentum: 0.25, qualityGrowth: 0.15, valuationExpectation: 0.2, earningsRevision: 0.2, newsCatalyst: 0.2 },
+  configHash: "active-hash-v2",
+};
+const singleActiveRows = upsertStrategyVersion([
+  { ...activeStrategy, active: true, activeFrom: "2026-07-01T00:00:00.000Z", createdAt: "2026-07-01T00:00:00.000Z" },
+], secondActive);
+assert.equal(
+  singleActiveRows.filter((row) => row.strategyType === "all-stock-agent" && row.status === "active" && row.active).length,
+  1,
+  "Upserting an active strategy should leave exactly one active version",
+);
+assert.equal(activeStrategyVersion(singleActiveRows).id, "active-v2", "Newest active strategy should remain active after invariant repair");
+assert.equal(
+  singleActiveRows.find((row) => row.id === "active-v1")?.status,
+  "superseded",
+  "Older active strategy should be superseded during active insert",
+);
+const repairedDualActive = repairStrategyVersionActiveInvariant([
+  { ...activeStrategy, active: true, activeFrom: "2026-07-01T00:00:00.000Z", createdAt: "2026-07-01T00:00:00.000Z" },
+  secondActive,
+], { migratedAt: "2026-07-03T00:00:00.000Z", reason: "fixture-migration" });
+assert.equal(repairedDualActive.migrations.length, 1, "Dual-active repair should report one append-only migration");
+assert.equal(
+  repairedDualActive.rows.find((row) => row.id === "active-v1")?.stateHistory?.[0]?.reason,
+  "fixture-migration",
+  "Dual-active repair should append state history to the superseded row",
+);
 assert.notEqual(
   activeStrategyWeights(strategyRows).momentum,
   candidateStrategy.weights.momentum,

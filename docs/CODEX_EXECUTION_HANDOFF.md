@@ -350,7 +350,7 @@ Facts (F13): universe = `SELECT DISTINCT ticker … ORDER BY ticker LIMIT maxTic
 - **27c — evidence re-run.** Re-run the full-corpus walk-forward after 27a/27b; the report must show `sectorBasketStatus` predominantly `sector_mapping_ok`, zero ETF tickers among decisions, and the missing-benchmark disclosure.
 - **Verify**: capped run (`maxTickers:8`) has non-null SPY benchmark on every outcome; fixture proving missing-ETF-bars → `missing_benchmark`, not raw-as-excess; uncapped run decision list contains no `BENCHMARK_TICKERS` member.
 
-## WP28 — Strategy-version single-active invariant (P1)
+## ☑ WP28 — Strategy-version single-active invariant (P1)
 
 Facts (F14): two versions are simultaneously `status:"active", active:true` because `upsertStrategyVersion` inserts new active baselines (new skill hash) without demoting the old.
 
