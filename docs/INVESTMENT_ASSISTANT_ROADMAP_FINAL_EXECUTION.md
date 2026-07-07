@@ -1920,3 +1920,101 @@ Contradictions:
 - FinanceDatabase equities do not classify benchmark/ETF tickers such as SPY/QQQ/SPCX. The importer reports raw coverage and equity-only coverage separately; equity coverage is 97.6% on the current corpus, while raw coverage is 91.1%.
 - The current historical corpus has SPY bars but no sector ETF bars such as XLK/XLF/XLV, so live SQLite backtest marks `sector_mapping_missing_bars`. Code support is complete; fully sectorized benchmark returns require adding sector ETF bars to `historical_bars`.
 - Production `pit_fundamentals` currently lacks enough AAPL/JPM/TSLA rows to verify exact Piotroski/Altman from real filings for all three names. Formula correctness is covered by hand-computed fixtures, and EDGAR extraction aliases were extended so future PIT sync can populate the required fields.
+
+---
+
+## External Review (Claude) — Rounds 3–5 (WP17–WP25) — 2026-07-07
+
+Reviewed commits `cc9f905..30085b6` against the Round 3–5 specs, then live-verified on localhost:5173 (fresh server start, current production store). Review actions taken by the reviewer are marked ⚙.
+
+### Verdict table
+
+| WP | Verdict | Key evidence |
+|---|---|---|
+| WP17 corpus evidence engine | **PASS** | Per-ticker DSL semantics confirmed in `lib/factor_spec.mjs` (`groupByTicker` on rolling/`delta`/`ts_*`; `cs_*` per date); corpus evidence carries `n`/`effectiveN` and `source:"historical-corpus"` |
+| WP18 live shadow factors | **PASS** | `shadowFactorsForContext` evaluates from run context; `weightEligible:false` intact; missing shadows stay `score:null` (`recommender_core.mjs:985`) — no fabricated 50s |
+| WP19 registry lifecycle | **PASS** | id-clobber rejection, append-only `ledger-correction`, two-consecutive-window decay + recovery all present with fixtures |
+| WP20 statistical refinements | **PASS** | `calendarNonOverlapEffectiveN` is per-ticker, capped at raw n; `effectiveN`/t-stat use the stricter variant |
+| WP21 security & transport | **PASS (live)** | Default bind 127.0.0.1 — LAN `curl http://192.168.1.3:5173` → connection refused (an earlier 502 was the Clash proxy answering, not the server); 3 MB POST → 413 with structured error; `/api/state` gzip 25.9 MB → 3.4 MB; `config.transport` exposed with `localOnly:true` |
+| WP22 save path & store perf | **PASS with gap (F12/F15)** | Compact JSON: store 110 MB → 61 MB; sha256 skip-clean works (`skipped-clean` observed); walk-forward via child process kept `/api/run/status` at 0.6–4 ms *during* a running backtest; **but** a real save is 835 ms (target <150 ms) and the deeper memory problem surfaced as F12 |
+| WP23 scheduler reliability | **PASS (live)** | On startup the server detected today's missed pre-session, appended high-severity `schedule-missed:2026-07-07:pre` + audit event, and launched collection with `trigger:"catch-up"` — observed live; `schedule.health.staleBanner` honestly reported 2 stale days |
+| WP24 sample accrual | **PASS** | Backfill decisions are double-locked out of execution paths (`actionable:false` AND `actionability.status:"research"`; `allStockAgentDecisionOpensPaperPosition` requires both); cooldowns respected; `trackingReasonSplit` in factor stats |
+| WP25 external integrations | **PASS with follow-up (F13)** | `security_master_ext` 9,432 rows (AAPL→Information Technology, JPM→Banks, XOM→Energy spot-checks correct); NYSE calendar JSON 2,513 trading days incl. 20 half-days; exact Piotroski/Altman with hand-computed fixtures; 4 personas all `veto_power:false`; zero FMP references |
+
+### New findings
+
+- **F12 (CRITICAL) — server OOM-crashed during the catch-up collection.** 589 s after start, at the 2 GB default heap: `FATAL ERROR: Ineffective mark-compacts near heap limit`. Native stack points at `node::worker::StructuredClone` → `ValueDeserializer`: `saveStore()` runs `storeCache = cloneStoreValue(db)` (`server.mjs:3804` → `structuredClone`) on **every save**, duplicating the entire ~61 MB-JSON store object graph mid-collection. **This is also the best root-cause hypothesis yet for the silent scheduler gap**: if scheduled collections have been OOM-killing the server, runs vanish without any log the UI can see. ⚙ Mitigation applied in review: server restarted with `NODE_OPTIONS=--max-old-space-size=6144`; catch-up re-fired and proceeded. Real fix = Round 6 WP26.
+- **F13 (HIGH) — walk-forward benchmark integrity holes.** (1) The trading universe query is `SELECT DISTINCT ticker … ORDER BY ticker LIMIT maxTickers` and bars load only for that list — so on capped runs SPY/sector-ETF bars never load; (2) at `server/historical_backtest.mjs:1196`, a missing benchmark silently degrades to `excess = raw − 0` with **no quality flag** — capped runs report raw returns labeled as excess; (3) only literal `"SPY"` is excluded from the trading loop, so the sector-ETF bars now in `historical_bars` would be *traded* on uncapped runs. ⚙ Reviewer loaded 12 sector ETFs (XLK/XLE/XLF/XLV/XLY/XLP/XLI/XLB/XLU/XLRE/XLC/SMH ×1,000 daily bars; corpus now 52,172 bars / 57 tickers) which closes Codex's `sector_mapping_missing_bars` contradiction **but makes uncapped walk-forward runs unsafe for evidence until WP27 lands**. Fix = Round 6 WP27.
+- **F14 (MEDIUM) — single-active invariant violated.** The store holds two strategy versions with `status:"active", active:true` (`all-stock-e07073aab308`, `all-stock-bcb68ff291cc`). `upsertStrategyVersion` inserts a new active baseline (new skill hash) without demoting the previous one; `activeStrategyVersion()` deterministically picks the newest, so behavior is stable, but the audit trail cannot state which version governed a given decision. Fix = Round 6 WP28.
+- **F15 (LOW) — save latency target not met.** `lastSaveMs: 835` on a real 61 MB save vs the <150 ms Round-4 target. Hash skip-clean and dirty-aware saves reduce frequency, so this is tolerable *if* F12 is fixed; noted so the target isn't silently forgotten.
+- **F16 (note) — backtest candidates behave per governance.** Historical-backtest candidate versions sit at `validationStatus:"missing"` (no live-active comparison metrics supplied) — correctly *not* promotable from backtest evidence alone. The WP8 promote gate stays deferred until the WP30 drill.
+
+### Deferred gates status (unchanged)
+
+WP5 quantstats 1e-3 tolerance (needs proxy pip install), WP6 restated-quarter proof, WP8 real promote (now addressed by WP30a drill), WP1 live ">3 tracked" (WP24 backfill makes this structural — verified at 5).
+
+### Addendum (same session, later): F17 — WP23 scope bug took down ALL collections; review-side hotfix applied
+
+- **F17 (CRITICAL, fixed in review)**: WP23's `scheduledLlmStageTimeoutMs` declaration was committed into the wrong function — inside the `articleUrlParts()` URL utility (`server.mjs:~2953`) instead of `runCollection()`, whose analysis stage references it (`server.mjs:37247`). Consequences observed live: (1) **every collection — manual or scheduled — since WP23 landed (2026-07-05) died at the analysis stage** with `ReferenceError: scheduledLlmStageTimeoutMs is not defined` (no collection has succeeded since the July-4 manual run); (2) the failed catch-up left no `scheduleLog` entry, so the missed-run detector re-fired every 30 s → a **retry storm** (54 failed collection attempts in ~44 min, hammering providers); (3) `articleUrlParts()` itself threw internally on the out-of-scope `trigger` reference — swallowed by its try/catch, so **all article-URL parsing silently returned null** (landing-page detection/dedup degraded). Why Codex's verification missed it: `node --check` passes (the code is syntactically valid), core regression tests never execute `runCollection`, and Codex's own contradiction note said the catch-up trigger "was not waited on in this session" — the first real execution of this path happened in this review.
+- **⚙ Review-side hotfix applied** (2-line move, no semantic change): declaration moved to the top of `runCollection()`; `articleUrlParts()` restored. `node --check` + `core_regression_tests` pass; server restarted; the catch-up re-fired and is running past its previous failure point. Codex must absorb this diff and add the WP26e/WP27 verify items below.
+- **F12 follow-up evidence (same session)**: with the 6 GB heap the fixed-code catch-up run proceeds but the HTTP server freezes for tens of seconds at a time; `sample` of the live process shows the main thread inside `node::worker::StructuredClone` → `Message::Deserialize` — the `cloneStoreValue(db)` full-store clone in `saveStore()`, live. WP26a is confirmed as the correct fix target (the clone both risks OOM at default heap and blocks the event loop for the clone duration on every save).
+- **Round-6 consequence (added as WP26e)**: a regression test that actually executes the scheduled-collection path (LLM mocked) so scope bugs in `runCollection` fail CI, plus a catch-up retry guard: at most 2 catch-up attempts per schedule key per day, then a high-severity alert and stop — a failing catch-up must never become a 30-second retry storm.
+
+---
+
+## WP26 — Memory architecture & crash resilience — 2026-07-08
+
+What changed:
+
+- Removed full-store `structuredClone` from the hot store paths: `ensureStore()` now returns the shared in-memory store object, and `saveStore()` no longer clones the whole store into `storeCache`.
+- Added heap telemetry (`heapUsedBytes`, `rssBytes`, `heapLimitBytes`, `heapUsedRatio`) to `storePersistenceStatus`; heap usage above 70% appends a high-severity alert plus `server.heap_pressure` audit event.
+- Reworked run archive writes so existing unchanged run archives are skipped by dirty-id/reference tracking instead of stringifying every full run on every save. New collection runs and report-email updates explicitly mark their run archive dirty.
+- Added `data/server.lock` crash honesty: clean SIGINT/SIGTERM removes the lock; dirty restarts append `server.crash_detected` audit plus a high-severity alert.
+- Absorbed the F17 hotfix by keeping `scheduledLlmStageTimeoutMs` scoped inside `runCollection()` and `articleUrlParts()` free of schedule variables.
+- Added `server/scheduler_guard.mjs` and wired catch-up retry protection: each schedule key allows at most `SCHEDULE_CATCH_UP_MAX_ATTEMPTS` catch-up attempts per day, then records one high-severity blocked alert and stops automatic retrying.
+- Documented crash lock, LaunchAgent restart path, and the now-optional 6GB heap override in README.
+
+Files/functions:
+
+- `server.mjs`: store cache/save path, run archive dirty tracking, heap telemetry, server lock setup, catch-up retry guard, scheduled runtime helper usage.
+- `server/scheduler_guard.mjs`: pure catch-up attempt accounting and scheduled-runtime helper.
+- `scripts/core_regression_tests.mjs`: catch-up attempt cap and scheduled-runtime regression fixtures.
+- `README.md`: reliable-run operations note.
+
+Verification:
+
+```text
+$ node --check server.mjs
+pass
+
+$ node --check public/app.js
+pass
+
+$ node --check server/scheduler_guard.mjs
+pass
+
+$ python3 -m py_compile scripts/*.py harness/invoker/*.py harness/tools/*.py harness/tests/*.py
+pass
+
+$ node scripts/core_regression_tests.mjs
+core_regression_tests: ok
+
+$ node scripts/generate_route_inventory.mjs
+{"status":"ok","routes":81,"uiFetches":43,"storeKeys":27}
+
+$ node scripts/generate_route_inventory.mjs --check && git diff --check
+{"status":"ok","routes":81,"uiFetches":43,"storeKeys":27}
+
+$ rg -n "storeCache\\s*=\\s*cloneStoreValue|return cloneStoreValue\\(storeCache\\)|return cloneStoreValue\\(db\\)|structuredClone\\(db\\)|structuredClone\\(storeCache\\)|scheduledLlmStageTimeoutMs" server.mjs server/scheduler_guard.mjs scripts/core_regression_tests.mjs
+server/scheduler_guard.mjs:83:    scheduledLlmStageTimeoutMs: scheduledRun ? scheduleLlmStageTimeoutMs : null,
+scripts/core_regression_tests.mjs:106:  { scheduledRun: true, scheduledLlmStageTimeoutMs: 90000 },
+scripts/core_regression_tests.mjs:111:  { scheduledRun: false, scheduledLlmStageTimeoutMs: null },
+server.mjs:37083:  const { scheduledRun, scheduledLlmStageTimeoutMs } = scheduledCollectionRuntime(
+server.mjs:37435:        llmTimeoutMs: scheduledLlmStageTimeoutMs,
+server.mjs:37436:        llmFallbackTimeoutMs: scheduledLlmStageTimeoutMs,
+```
+
+Contradictions / deferred live checks:
+
+- I did not run a full production collection under `--max-old-space-size=2048` in this heartbeat because it would mutate the live store, call external providers, and may run for many minutes. The save-path clone removal is verified by source grep and regression tests; the full live collection remains a follow-up validation item.
+- I did not perform a destructive `kill -9` restart drill on the production process in this heartbeat. The lock-file path and clean-signal cleanup are implemented; the dirty-restart UI/audit proof remains a follow-up validation item.

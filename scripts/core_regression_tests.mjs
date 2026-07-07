@@ -71,6 +71,11 @@ import {
   rollbackStrategyVersions,
   upsertStrategyVersion,
 } from "../server/strategy_versions.mjs";
+import {
+  normalizeCatchUpAttempts,
+  registerCatchUpAttempt,
+  scheduledCollectionRuntime,
+} from "../server/scheduler_guard.mjs";
 
 function assertApprox(actual, expected, tolerance, message) {
   assert.ok(Math.abs(actual - expected) <= tolerance, `${message}: expected ${expected}, got ${actual}`);
@@ -95,6 +100,30 @@ assert.equal(isNyseTradingDay("2026-07-03"), false, "Independence Day observed s
 assert.equal(isNyseTradingDay("2026-07-06"), true, "Monday after observed Independence Day should trade");
 assert.equal(nyseSessionForYmd("2026-11-27").isHalfDay, true, "Day after Thanksgiving should be half-day");
 assert.equal(addNyseTradingDays("2026-06-18T12:00:00Z", 1).toISOString().slice(0, 10), "2026-06-22", "Juneteenth + weekend should be skipped");
+
+assert.deepEqual(
+  scheduledCollectionRuntime("catch-up", 90000),
+  { scheduledRun: true, scheduledLlmStageTimeoutMs: 90000 },
+  "Catch-up collection should use scheduled LLM stage timeout without relying on outer scope variables",
+);
+assert.deepEqual(
+  scheduledCollectionRuntime("manual", 90000),
+  { scheduledRun: false, scheduledLlmStageTimeoutMs: null },
+  "Manual collection should not inherit scheduled LLM timeout",
+);
+const catchUpDue = { key: "2026-07-07:pre", newYorkDate: "2026-07-07", job: { id: "pre" } };
+const firstCatchUp = registerCatchUpAttempt({}, catchUpDue, { maxAttempts: 2, now: "2026-07-07T13:00:00.000Z" });
+assert.equal(firstCatchUp.allowed, true, "First catch-up attempt should be allowed");
+const secondCatchUp = registerCatchUpAttempt(firstCatchUp.attempts, catchUpDue, { maxAttempts: 2, now: "2026-07-07T13:01:00.000Z" });
+assert.equal(secondCatchUp.allowed, true, "Second catch-up attempt should be allowed");
+const blockedCatchUp = registerCatchUpAttempt(secondCatchUp.attempts, catchUpDue, { maxAttempts: 2, now: "2026-07-07T13:02:00.000Z" });
+assert.equal(blockedCatchUp.allowed, false, "Third catch-up attempt should be blocked");
+assert.equal(blockedCatchUp.reason, "max_attempts_exceeded", "Blocked catch-up should expose the max-attempt reason");
+assert.equal(
+  normalizeCatchUpAttempts(blockedCatchUp.attempts).catchUp[catchUpDue.key].count,
+  2,
+  "Catch-up attempt count should remain capped after blocking",
+);
 
 const macro = scoreFredMacroRegime({
   DGS10: [{ date: "2026-06-01", value: "5.10" }],

@@ -318,3 +318,94 @@ Even after WP1, live evidence shows **0 tracked buy decisions on recent runs**: 
 - **D16 (decision, executes with Phase 3.2, not now): portfolio-risk engine = Riskfolio-Lib** (BSD-3, v7.3.0 2026-06; 13 risk measures, HRP/HERC) via bridge; PyPortfolioOpt (MIT, active) as the simpler fallback. Recorded so Phase 3.2 starts with the engine question closed.
 
 Order within WP25: 25a → 25b ∥ 25c → 25d. 25a unblocks a WP4 metric gap and should land first. Round 5 is independent of Rounds 3–4 and may interleave.
+
+---
+
+# Round 6 — Crash resilience, evidence integrity, trust closure (WP26–WP30)
+
+> Written 2026-07-07 (Claude) after reviewing Rounds 3–5 (verdicts + findings F12–F16 in the execution log) and live-verifying on localhost:5173. Two inputs: defects found in review, and the strategic blind spots recorded in CAPABILITY_GAPS §12 (survivorship-biased corpus, never-exercised promotion path, unmeasured LLM channel, owner-side switches). Same ground rules as Rounds 1–5. Priority: **WP26 → WP27 → WP28 ∥ WP29 → WP30**; WP26/WP27 are P0 and block trusting any new evidence.
+
+## ☑ WP26 — Memory architecture & crash resilience (P0 — the server died during review)
+
+Facts (F12): with the default 2 GB Node heap, the server OOM-crashed 589 s into a catch-up collection. Stack: `saveStore()` → `cloneStoreValue(db)` → `structuredClone` of the entire store object graph on **every save**. This is also the leading root-cause hypothesis for the silent scheduler gap (OOM-killed scheduled runs leave no visible trace). Reviewer mitigation already in place: start with `NODE_OPTIONS=--max-old-space-size=6144`.
+
+- **26a — remove the full-store clone from the save path.** `storeCache` must not be built by `structuredClone(db)` per save. Acceptable shapes: cache the already-produced compact payload string and lazily `JSON.parse` on the rare cache-read path; or drop `storeCache` and reload from disk on cache miss. Save semantics (sha256 skip-clean, atomic tmp+rename) unchanged.
+- **26b — heap telemetry.** Record `process.memoryUsage().heapUsed/rss` and `v8.getHeapStatistics().heap_size_limit` in `storePersistenceStatus` on every save; append a high-severity alert when heapUsed > 70% of the limit.
+- **26c — crash honesty.** Write `data/server.lock` (pid + startedAt) on boot, remove on clean shutdown (SIGINT/SIGTERM handlers). Lock present at startup ⇒ previous process died dirty ⇒ high-severity alert + `server.crash_detected` audit event. Document a launchd (macOS) auto-restart recipe in the README ops section.
+- **26d — interim heap floor.** Start scripts/README document `NODE_OPTIONS=--max-old-space-size=6144` until 26a lands; remove the recommendation after verification.
+- **26a′ — allocation forensics from the live review (2026-07-07/08, REQUIRED READING).** The machine has **8 GB RAM**; the store is ~50 MB compact JSON. Observed: OOM at the 2 GB default heap AND at a 6 GB heap (41 min into a collection, GC mark-compact pauses up to 151 s, mutator utilization 0.035). The three allocators to eliminate, all confirmed in code/live sample:
+  1. `ensureStore()` returns `cloneStoreValue(...)` — a **full structuredClone of the store on every call** (server.mjs:3830/3886), including the 30-second scheduler tick and most request handlers.
+  2. `saveStore()` clones the whole store again into `storeCache` per save (server.mjs:3932; caught live via `sample` inside `StructuredClone`).
+  3. `archiveRuns()` (WP22-P3) compacts + stringifies **every** non-summary run on **every save** — the content-hash check happens *after* the stringify (server.mjs:3558-3559), so 20 runs × dozens of saves per collection ≈ multi-GB string churn. This is the June→July regression: June collections completed with the same store; WP22 added this per-save cost.
+  Fix direction: single shared in-memory store object (no clone-on-read; callers already mutate-then-save), payload-string cache instead of graph clone, and archive only runs whose id/updated marker changed (track dirty run ids; never stringify to discover cleanliness). Interim env mitigations applied by the reviewer (remove after fix): `RUN_HISTORY_LIMIT=6 RUN_INLINE_FULL_LIMIT=3 RUN_ARCHIVE_ENABLED=false NODE_OPTIONS=--max-old-space-size=6144`; runs 7+ remain archived in `data/runs/` (24 files, 127 MB).
+- **26e — absorb the F17 hotfix + kill the retry storm (added after live review).** WP23 shipped a scope bug: `scheduledLlmStageTimeoutMs` was declared inside `articleUrlParts()` instead of `runCollection()` — every collection since 2026-07-05 died at the analysis stage with a ReferenceError, the missed-run detector re-fired every 30 s (54 failed attempts in ~44 min), and `articleUrlParts()` silently returned null for all article URLs. The reviewer applied the 2-line hotfix (declaration moved to `runCollection()` top; utility restored) — absorb that working-tree diff. Then add: (1) a regression test that executes the scheduled-collection path with the LLM mocked, so scope errors in `runCollection` fail CI; (2) a catch-up retry guard — max 2 catch-up attempts per schedule key per day, then high-severity alert and stop.
+- **Verify**: a full collection run completes with `--max-old-space-size=2048`; `storePersistenceStatus` shows heap fields; `kill -9` + restart produces the crash alert; no `structuredClone` of the whole store anywhere on the save path (grep).
+
+## WP27 — Walk-forward benchmark integrity (P0 — "excess" can silently be raw return)
+
+Facts (F13): universe = `SELECT DISTINCT ticker … ORDER BY ticker LIMIT maxTickers`; bars load only for that list, so capped runs never load SPY (alphabetical order). At `server/historical_backtest.mjs:1196` a missing benchmark degrades to `excess = raw − 0` unlabeled. Only literal `"SPY"` is excluded from the trading loop. The reviewer has loaded 12 sector-ETF bar sets (XLK/XLE/XLF/XLV/XLY/XLP/XLI/XLB/XLU/XLRE/XLC/SMH; corpus now 52,172 bars / 57 tickers) — sector baskets can now resolve, but **until this WP lands, uncapped runs would trade the ETFs and their metrics must not be used as evidence**.
+
+- **27a — benchmark set isolation.** Define `BENCHMARK_TICKERS` (SPY, QQQ, the 11 SPDR XL* funds, SMH). Always load their bars in a dedicated query unaffected by `maxTickers`/ticker filters; exclude the whole set from the trading-universe loop *and* from cross-sectional normalization input.
+- **27b — no silent benchmark fallback.** When basket/SPY benchmark return is null for an outcome: `benchmarkStatus:"missing_benchmark"`, `excessPct:null`, `outcomeUsable:false`. Metrics exclude such rows and report a `missingBenchmark` count. Never `excess = raw`.
+- **27c — evidence re-run.** Re-run the full-corpus walk-forward after 27a/27b; the report must show `sectorBasketStatus` predominantly `sector_mapping_ok`, zero ETF tickers among decisions, and the missing-benchmark disclosure.
+- **Verify**: capped run (`maxTickers:8`) has non-null SPY benchmark on every outcome; fixture proving missing-ETF-bars → `missing_benchmark`, not raw-as-excess; uncapped run decision list contains no `BENCHMARK_TICKERS` member.
+
+## WP28 — Strategy-version single-active invariant (P1)
+
+Facts (F14): two versions are simultaneously `status:"active", active:true` because `upsertStrategyVersion` inserts new active baselines (new skill hash) without demoting the old.
+
+- Enforce exactly one active per `strategyType`: inserting an active sets the previous active's `activeTo`, `status:"superseded"`, and appends `stateHistory`. Startup migration repairs existing dual-active rows (newest stays active; older → superseded + `strategy_version.migrated` audit event). Regression fixture: upserting two actives leaves exactly one.
+- **Verify**: after migration, `/api/strategy-versions` shows one active; agent decisions stamp that version id; fixture green.
+
+## WP29 — Point-in-time universe corpus (P0 for evidence trust — kills survivorship bias)
+
+The single biggest discount on every backtest number so far: the 45-ticker corpus is *today's watchlist* — stocks that already won. All excess metrics are upper bounds; the rankIC conclusions (including the momentum-reversal rationale behind the two-sleeve design) inherit the bias.
+
+- **29a — membership table.** `universe_membership(ticker, added_at, removed_at, source, json)` from historical S&P 500 constituent-change data (e.g. the fja05680/sp500 GitHub dataset — verify its license file before vendoring; fallback: one-shot scrape of Wikipedia's S&P 500 change table). Import via `scripts/build_universe_membership.py`, provenance JSON alongside.
+- **29b — bars backfill for historical members** 2019→present via Longbridge CLI (reuse the reviewer's pattern: values arrive as strings → coerce; `INSERT OR REPLACE`). Delisted/unfetchable tickers are recorded with `universe_coverage_status:"bars_unavailable"` — never silently dropped. Reports state "N of M point-in-time members have bars (x%)".
+- **29c — `universeMode` in the walk-forward.** `"pit"` (candidates on signalDate = members on that date ∩ bars available) vs `"watchlist"` (current). Mode goes into run provenance. **Anti-fooling rule: PIT and watchlist metrics never appear in the same table without a mode column.**
+- **29d — re-judge the evidence.** Re-run factor rankIC + horizon metrics under PIT mode; record the outcome as Decision **D17** in CAPABILITY_GAPS §9, explicitly re-evaluating the two-sleeve (short-horizon reversal) rationale. If momentum rankIC flips sign, flag the two-sleeve plan for revision — evidence and judgement only, no scoring-semantics change in this WP.
+- **Verify**: membership spans 2019–2026 and matches the source's change events ≥95%; PIT report shows coverage + mode; D17 recorded with numbers.
+
+## WP30 — Trust the loop: promotion drill, LLM scorecard, go-live status (P1)
+
+- **30a — promotion fire-drill (sandboxed).** Copy the store; run a second server instance on a test port against the copy; take a real candidate version, attach a drill validation record (`source:"drill"`, clearly non-production), promote, verify active weights actually change agent scoring output, rollback, verify byte-identical restoration. Log everything in the execution doc. Production store untouched; drill artifacts never merged back. Closes the "promotion path has never actually run" gap (F16 / deferred WP8 gate).
+- **30b — LLM knowledge-channel scorecard.** Every LLM-sourced veto/cap/knowledge application records a counterfactual snapshot (the mechanical decision absent the LLM input). As outcomes mature, a report cell aggregates: n, avg excess with vs. without, hit-rate delta; below n=20 it prints "insufficient evidence" (honestly). Measurement only — no behavior change. This decides whether the LLM channel earns its latency and cost.
+- **30c — go-live/learning-loop status card.** Configuration page card listing learning-critical switches currently OFF (`INTRADAY_WATCHER_ENABLED`, `PUSH_PROVIDER`/`PUSH_TARGET`, `AGENT_DEBATE_DAILY_ENABLED`, `FACTOR_RESEARCHER_ENABLED`), plus per-channel samples accrued and estimated days-to-`minSamples` at the current accrual rate. Purpose: make the calendar bottleneck visible to the owner every day.
+- **Verify**: drill log with before/after weight hashes and rollback proof; scorecard renders the insufficient-evidence state; status card reflects real env state.
+
+## Round-6 dependency notes
+
+- WP26/WP27 first — they protect process survival and evidence integrity; everything downstream is untrustworthy until they land.
+- WP29b may run long (many tickers); it is data-only and can proceed in parallel with WP28/WP30 once WP27 is merged (do not run evidence backtests in the window where ETF bars exist but WP27 has not landed).
+- No scoring-semantics changes anywhere in Round 6.
+
+---
+
+# Round 7 — Trader Mirror agent（操作画像）(WP31)
+
+> Written 2026-07-07 (Claude) on owner request. Design rationale: CAPABILITY_GAPS §13. Independent of Round 6 and may interleave, but land WP26 (save path) first if both are in flight. Same ground rules; the constitution applies to the owner's profile exactly as to stock scoring: **deterministic numbers and tags, LLM narrative only.**
+
+## WP31 — Trader Mirror: read the owner's operations, classify style, coach
+
+**Order: 31a → 31b → 31c ∥ 31e → 31d.** Reuse the existing trade stack (`sanitizeTrade`/`mergeTrades`, `calculateTradeJournal` closed lots, `/api/trade-recommendation-reconciliation`, IBKR Flex sync). Do not re-implement FIFO matching or journal performance splits.
+
+- **31a — Longbridge fills ingestion.** New bridge using the verified CLI shape `longbridge order executions --history --start <watermark> --format json` (values may be strings — coerce, same as kline). Map fills → trade schema (`ticker` from `SYM.US`, `side`, `quantity`, `price`, `executedAt`, `broker:"longbridge"`, `externalId` = execution id, `orderId`), merge via `mergeTrades` (dedup on `externalId`). Watermark `db.tradeSync.longbridge.lastSyncAt` (start default 2019-01-01 on first run). Daily auto-sync after the post-session collection + `POST /api/trades/sync-longbridge` manual trigger + button in the trades UI. Fills for non-US markets are kept but flagged `market` so US-only analytics can filter. **Verify**: run against the owner's real account; imported count reported; re-running imports 0 duplicates; a hand-checked fill matches broker records exactly.
+- **31b — behavioral metrics engine (deterministic).** `lib/trader_profile.mjs` exporting `buildTraderProfile({ closedLots, openLots, trades, bars, securityMaster, spyBars })` → `trader-profile-v1` JSON. Metric families (each cell `{value, n, status}`; `status:"insufficient_data"` when n < minSamples — overall round trips < 20, per-cohort < 8):
+  - **Results** (reuse journal where present): win rate, profit factor, expectancy, avg win/loss, holding-day distribution, realized equity curve + max DD.
+  - **Entry behavior**: chase rate (% of buys with entry ≥ 98% of trailing 20d high, from `historical_bars`); cohort outcomes chase vs pullback (entry ≤ 50th percentile of 20d range); average entry-day extension vs SMA20.
+  - **Exit behavior**: disposition ratio (median holding days of losers ÷ winners); MFE capture (exit price ÷ max close between entry and exit); worst-decile loss share (stop discipline); revenge re-entry rate (re-buy same ticker ≤ 5 trading days after a closed loss).
+  - **Sizing**: notional size CV; correlation of size vs subsequent lot return; max single-name share of total notional.
+  - **Concentration/reactivity**: sector HHI via `security_master_ext`; trades-per-week; share of buys on days when SPY moved ≤ −1.5% or ≥ +1.5% (panic/FOMO reactivity).
+  - **Counterfactuals**: per closed lot, alternative return if held +20 more trading days, and SPY over the same window; aggregates "sold-too-early %", "underperformed-SPY-while-held %".
+  - **Style classifier (rule-based, versioned `styleSchema:"trader-style-v1"`)**: horizon (day <2d / swing 2–10d / position 10–60d / long >60d by median holding days), entry style (chaser if chase rate >40% / pullback if <20% / mixed), risk discipline (tight if worst-decile loss share <35% and MFE-capture >60% / loose otherwise / undisciplined if revenge rate >15%), diversification (concentrated if HHI top-quartile), turnover (high if >5 trades/week). Tags carry the metric ids + values they were derived from. **The LLM never assigns tags.**
+  - **Verify**: fixture with a synthetic 30-lot ledger where every metric is hand-computed; insufficient-data fixture (5 lots → all styles `insufficient_data`); metrics carry `n` everywhere.
+- **31c — system-overlap analysis.** Extend the reconciliation: follow-rate (owner trade matches an actionable recommendation same ticker/direction within ±2 trading days), outcome comparison followed vs owner-instinct cohorts, ignored-winner count (actionable recs not traded whose frozen outcome was a win). Output into the profile as `systemOverlap`. **Verify**: fixture with known matches; cohorts carry `n`.
+- **31d — LLM narrator (opt-in).** `harness/agents/trader_mirror.md` (tier reasoning, `veto_power:false`, `output_schema: trader-mirror-report-v1`): inputs are the computed profile JSON **only**; outputs `{styleNarrative, habits[], resultsSummary, coachingInstructions[], disclaimers}` where every habit/instruction cites metric ids and instructions are if-then behavioral rules bound to cohort deltas (e.g. "chase entries (chaseRate n=14, avg −3.2%) lose vs your pullback entries (+1.8%, n=9) → require limit orders ≥2% below the 20d high"). No metric → no claim. Gated by `TRADER_MIRROR_LLM_ENABLED` (default false; trade data leaves the machine only with this consent); without it the deterministic profile still renders fully. `llmGovernance` stamp on the stored report. **Verify**: mock-invoker run produces schema-valid output with metric-id citations; disabled flag → profile renders with `narrative:null`.
+- **31e — API/UI/persistence.** `GET /api/trader-profile` (cached compute), `POST /api/trader-profile/refresh` (sync fills → recompute → optional LLM). Store key `traderProfile` `{ current, snapshots[≤24], tradeSync }` (+ sqlite mirror table `trader_profile_snapshots`). UI 交易画像 card: style tags with evidence popovers, metric table with `n` badges, coaching list, overlap panel, explicit insufficient-data rendering, sync status/button. Weekly auto-refresh (Sunday) + on-demand. **Verify**: with the ledger empty the page shows the ingestion call-to-action, not fake zeros; after 31a sync, profile renders on real data; route inventory regenerated.
+
+## Round-7 dependency notes
+
+- 31b/31c consume `historical_bars` + `security_master_ext` — both already populated (52,172 bars / 57 tickers; 9,432 securities). Bars missing for a traded ticker ⇒ that lot's context metrics are `insufficient_data`, never fabricated.
+- Counterfactual and entry-context metrics must use bars ≤ the relevant dates only (same PIT discipline as the walk-forward).
+- No scoring-semantics changes; the profile must never feed factor weights or gates — it is a mirror for the human, not an input to the machine.

@@ -1,9 +1,10 @@
 import http from "node:http";
 import net from "node:net";
 import crypto from "node:crypto";
+import v8 from "node:v8";
 import { spawn } from "node:child_process";
 import { mkdir, readFile, rename, stat, unlink, writeFile } from "node:fs/promises";
-import { existsSync, mkdirSync, readFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, unlinkSync, writeFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -95,6 +96,11 @@ import { sendDownload, sendJson } from "./server/http_responses.mjs";
 import { appFetch, fetchJson, fetchText, proxySummary, requestJson } from "./server/network_fetch.mjs";
 import { installProcessErrorHandlers } from "./server/process_errors.mjs";
 import {
+  normalizeCatchUpAttempts,
+  registerCatchUpAttempt,
+  scheduledCollectionRuntime,
+} from "./server/scheduler_guard.mjs";
+import {
   execFileText,
   isCliCommandAvailable,
   longBridgeDefaultCommand,
@@ -117,6 +123,7 @@ loadEnvFile(ENV_FILE);
 const DATA_DIR = path.join(__dirname, "data");
 const PUBLIC_DIR = path.join(__dirname, "public");
 const DB_FILE = path.join(DATA_DIR, "store.json");
+const SERVER_LOCK_FILE = path.join(DATA_DIR, "server.lock");
 const UZI_DEFAULT_REPO_DIR = "/Users/a/.codex/vendor/UZI-Skill";
 const UZI_ENABLED = parseBoolean(process.env.UZI_ENABLED, true);
 const UZI_REPO_DIR = process.env.UZI_REPO_DIR || UZI_DEFAULT_REPO_DIR;
@@ -1137,6 +1144,7 @@ const SCHEDULES = [
 ];
 const SCHEDULE_CATCH_UP_MINUTES = Math.max(0, Number(process.env.SCHEDULE_CATCH_UP_MINUTES || 75));
 const SCHEDULE_LLM_STAGE_TIMEOUT_MS = Math.max(15000, Number(process.env.SCHEDULE_LLM_STAGE_TIMEOUT_MS || 90000));
+const SCHEDULE_CATCH_UP_MAX_ATTEMPTS = Math.max(1, Number(process.env.SCHEDULE_CATCH_UP_MAX_ATTEMPTS || 2));
 const ALL_STOCK_AGENT_ENABLED = parseBoolean(process.env.ALL_STOCK_AGENT_ENABLED, true);
 const AGENT_MAX_SOURCE_AGE_HOURS = Math.max(1, Number(process.env.AGENT_MAX_SOURCE_AGE_HOURS || 36));
 const ALL_STOCK_AGENT_BUY_LIMIT = Math.max(1, Number(process.env.ALL_STOCK_AGENT_BUY_LIMIT || 10));
@@ -1189,6 +1197,8 @@ let storeCacheMtimeMs = 0;
 let storeLastSavedHash = "";
 let sqliteMirrorLastWatermark = "";
 const runArchiveContentHashes = new Map();
+const runArchiveObjectRefs = new Map();
+const runArchiveDirtyIds = new Set();
 let storePersistenceStatus = {
   status: "unknown",
   payloadBytes: 0,
@@ -2950,8 +2960,6 @@ const ARTICLE_LANDING_HOSTS = new Set([
 
 function articleUrlParts(value) {
   try {
-    const scheduledRun = trigger === "schedule" || trigger === "catch-up";
-    const scheduledLlmStageTimeoutMs = scheduledRun ? SCHEDULE_LLM_STAGE_TIMEOUT_MS : null;
     const url = new URL(String(value || ""));
     return { url, host: url.hostname.toLowerCase(), path: url.pathname.replace(/\/+$/g, "") };
   } catch {
@@ -3498,6 +3506,11 @@ function runArchivePath(runId = "") {
   return safeId ? path.join(RUN_ARCHIVE_DIR, `${safeId}.json`) : "";
 }
 
+function markRunArchiveDirty(runId = "") {
+  const id = String(runId || "").trim();
+  if (id) runArchiveDirtyIds.add(id);
+}
+
 function compactRunSummaryForStore(run = {}) {
   return {
     id: run.id,
@@ -3555,6 +3568,12 @@ async function archiveRuns(runs = []) {
     fullRuns.map(async (run) => {
       const file = runArchivePath(run.id);
       if (!file) return;
+      const dirty = runArchiveDirtyIds.has(run.id);
+      if (!dirty && runArchiveObjectRefs.get(run.id) === run && existsSync(file)) return;
+      if (!dirty && existsSync(file)) {
+        runArchiveObjectRefs.set(run.id, run);
+        return;
+      }
       const payload = stringifyPersistedJson(compactRunForStore(run, { keepNarrativeFullText: true }));
       const hash = sha256Text(payload);
       let existingHash = runArchiveContentHashes.get(run.id);
@@ -3566,9 +3585,15 @@ async function archiveRuns(runs = []) {
           existingHash = "";
         }
       }
-      if (existingHash === hash) return;
+      if (existingHash === hash) {
+        runArchiveObjectRefs.set(run.id, run);
+        runArchiveDirtyIds.delete(run.id);
+        return;
+      }
       await writeFile(file, payload, "utf8");
       runArchiveContentHashes.set(run.id, hash);
+      runArchiveObjectRefs.set(run.id, run);
+      runArchiveDirtyIds.delete(run.id);
     }),
   );
 }
@@ -3812,13 +3837,58 @@ function storePayloadWarning(payloadBytes) {
   return `store.json 当前约 ${(payloadBytes / 1024 / 1024).toFixed(1)}MB，超过告警阈值 ${(STORE_SIZE_WARN_BYTES / 1024 / 1024).toFixed(0)}MB；旧 run 已归档，建议继续观察 SQLite mirror。`;
 }
 
+function storeHeapTelemetry() {
+  const memory = process.memoryUsage();
+  const heap = v8.getHeapStatistics();
+  const heapLimitBytes = Number(heap.heap_size_limit || 0);
+  const heapUsedBytes = Number(memory.heapUsed || 0);
+  return {
+    heapUsedBytes,
+    rssBytes: Number(memory.rss || 0),
+    heapLimitBytes,
+    heapUsedRatio: heapLimitBytes > 0 ? Number((heapUsedBytes / heapLimitBytes).toFixed(4)) : null,
+  };
+}
+
+function appendHeapPressureAlert(db = {}, heap = storeHeapTelemetry()) {
+  if (!Number.isFinite(heap.heapUsedRatio) || heap.heapUsedRatio <= 0.7) return null;
+  const alertKey = `server-heap-high:${nowIso().slice(0, 10)}`;
+  const exists = (db.alerts || []).some((alert) => alert.alertKey === alertKey || alert.storyFingerprint === alertKey);
+  if (!exists) {
+    db.alerts = [
+      {
+        id: compactId("server-alert"),
+        alertKey,
+        storyFingerprint: alertKey,
+        createdAt: nowIso(),
+        severity: "high",
+        ticker: "SYS",
+        title: "服务端堆内存压力过高",
+        detail: `Node heap 使用率 ${(heap.heapUsedRatio * 100).toFixed(1)}%，已超过 70% 告警线；请观察采集任务和 store 体积。`,
+        evidenceIds: ["server_heap_pressure"],
+        status: "active",
+        catalystClass: "ops",
+        novelty: "new",
+        score: 92,
+      },
+      ...(db.alerts || []),
+    ].slice(0, 300);
+  }
+  return appendAuditEvent(db, "server.heap_pressure", heap, "warn", "server");
+}
+
 function updateStorePersistenceStatus(patch = {}) {
   const payloadBytes = Number.isFinite(patch.payloadBytes)
     ? patch.payloadBytes
     : storePersistenceStatus.payloadBytes;
+  const heap = patch.heap || storeHeapTelemetry();
   storePersistenceStatus = {
     ...storePersistenceStatus,
     ...patch,
+    heapUsedBytes: heap.heapUsedBytes,
+    rssBytes: heap.rssBytes,
+    heapLimitBytes: heap.heapLimitBytes,
+    heapUsedRatio: heap.heapUsedRatio,
     payloadBytes,
     warning: patch.warning !== undefined ? patch.warning : storePayloadWarning(payloadBytes),
   };
@@ -3829,7 +3899,7 @@ async function ensureStore() {
   await mkdir(DATA_DIR, { recursive: true });
   try {
     const fileStat = await stat(DB_FILE);
-    if (storeCache && storeCacheMtimeMs === fileStat.mtimeMs) return cloneStoreValue(storeCache);
+    if (storeCache && storeCacheMtimeMs === fileStat.mtimeMs) return storeCache;
     const raw = await readFile(DB_FILE, "utf8");
     const db = JSON.parse(raw);
     const runs = Array.isArray(db.runs) ? db.runs : [];
@@ -3867,6 +3937,7 @@ async function ensureStore() {
       intradayExplain: db.intradayExplain && typeof db.intradayExplain === "object" ? db.intradayExplain : {},
       auditEvents: normalizeAuditEvents(db.auditEvents),
       scheduleLog: db.scheduleLog || {},
+      scheduleAttempts: normalizeCatchUpAttempts(db.scheduleAttempts),
       sourceControls: normalizeSourceControls(db.sourceControls),
       sourceDiagnostics: normalizeSourceDiagnostics(db.sourceDiagnostics),
       customSocialFeeds: normalizeCustomSocialFeeds(db.customSocialFeeds),
@@ -3876,7 +3947,7 @@ async function ensureStore() {
       allStockAgent: normalizeAllStockAgentState(db.allStockAgent),
       factorRegistry: normalizeFactorRegistry(db.factorRegistry),
     };
-    storeCache = cloneStoreValue(normalized);
+    storeCache = normalized;
     storeCacheMtimeMs = fileStat.mtimeMs;
     storeLastSavedHash = sha256Text(raw);
     updateStorePersistenceStatus({
@@ -3885,7 +3956,7 @@ async function ensureStore() {
       mtimeMs: fileStat.mtimeMs,
       loadedAt: nowIso(),
     });
-    return cloneStoreValue(storeCache);
+    return storeCache;
   } catch {
     const db = {
       watchlist: DEFAULT_WATCHLIST,
@@ -3909,6 +3980,7 @@ async function ensureStore() {
       intradayExplain: {},
       auditEvents: [],
       scheduleLog: {},
+      scheduleAttempts: { catchUp: {} },
       sourceControls: { disabled: [], updatedAt: "" },
       sourceDiagnostics: null,
       customSocialFeeds: [],
@@ -3919,23 +3991,26 @@ async function ensureStore() {
       factorRegistry: normalizeFactorRegistry(),
     };
     await saveStore(db);
-    return cloneStoreValue(db);
+    return db;
   }
 }
 
 async function saveStore(db) {
   await archiveRuns(db.runs || []);
   const started = Date.now();
+  const heap = storeHeapTelemetry();
+  appendHeapPressureAlert(db, heap);
   const payload = stringifyPersistedJson(compactStoreForSave(db));
   const payloadBytes = Buffer.byteLength(payload, "utf8");
   const payloadHash = sha256Text(payload);
   const writeTask = saveQueue.then(async () => {
     await mkdir(DATA_DIR, { recursive: true });
-    storeCache = cloneStoreValue(db);
+    storeCache = db;
     updateStorePersistenceStatus({
       status: "pending",
       payloadBytes,
       payloadHash,
+      heap,
     });
     if (storeLastSavedHash === payloadHash) {
       updateStorePersistenceStatus({
@@ -3944,6 +4019,7 @@ async function saveStore(db) {
         payloadHash,
         lastSkippedAt: nowIso(),
         lastSaveMs: Date.now() - started,
+        heap: storeHeapTelemetry(),
       });
       return;
     }
@@ -3960,11 +4036,87 @@ async function saveStore(db) {
       lastSavedAt: nowIso(),
       mtimeMs: fileStat.mtimeMs,
       lastSaveMs: Date.now() - started,
+      heap: storeHeapTelemetry(),
     });
     scheduleSqliteMirrorSync();
   });
   saveQueue = writeTask.catch(() => {});
   return writeTask;
+}
+
+function readServerLockFile() {
+  if (!existsSync(SERVER_LOCK_FILE)) return null;
+  try {
+    return JSON.parse(readFileSync(SERVER_LOCK_FILE, "utf8"));
+  } catch {
+    return { raw: readFileSync(SERVER_LOCK_FILE, "utf8") };
+  }
+}
+
+function removeServerLockSync() {
+  try {
+    const current = readServerLockFile();
+    if (!current || Number(current.pid) === process.pid) unlinkSync(SERVER_LOCK_FILE);
+  } catch (error) {
+    console.warn(`Failed to remove server lock: ${error.message}`);
+  }
+}
+
+function installServerLockCleanup() {
+  for (const signal of ["SIGINT", "SIGTERM"]) {
+    process.once(signal, () => {
+      removeServerLockSync();
+      process.exit(signal === "SIGINT" ? 130 : 143);
+    });
+  }
+}
+
+function appendCrashDetectedAlert(db = {}, previousLock = {}) {
+  const startedAt = previousLock?.startedAt || "未知时间";
+  const pid = previousLock?.pid || "unknown";
+  const alertKey = `server-crash-detected:${startedAt}:${pid}`;
+  const exists = (db.alerts || []).some((alert) => alert.alertKey === alertKey || alert.storyFingerprint === alertKey);
+  if (!exists) {
+    db.alerts = [
+      {
+        id: compactId("server-alert"),
+        alertKey,
+        storyFingerprint: alertKey,
+        createdAt: nowIso(),
+        severity: "high",
+        ticker: "SYS",
+        title: "检测到上一次服务非正常退出",
+        detail: `启动时发现残留 server.lock；上次进程 pid=${pid}，startedAt=${startedAt}。请检查采集任务、内存压力和系统日志。`,
+        evidenceIds: ["server_lock", String(pid)],
+        status: "active",
+        catalystClass: "ops",
+        novelty: "new",
+        score: 95,
+      },
+      ...(db.alerts || []),
+    ].slice(0, 300);
+  }
+  appendAuditEvent(db, "server.crash_detected", {
+    previousLock,
+    currentPid: process.pid,
+    detectedAt: nowIso(),
+  }, "warn", "server");
+}
+
+async function setupServerLock(db = null) {
+  await mkdir(DATA_DIR, { recursive: true });
+  const previousLock = readServerLockFile();
+  if (previousLock) {
+    const state = db || (await ensureStore());
+    appendCrashDetectedAlert(state, previousLock);
+    await saveStore(state);
+  }
+  writeFileSync(
+    SERVER_LOCK_FILE,
+    JSON.stringify({ pid: process.pid, startedAt: nowIso(), port: PORT, host: HOST }),
+    "utf8",
+  );
+  installServerLockCleanup();
 }
 
 function scheduleSqliteMirrorSync() {
@@ -11124,6 +11276,38 @@ function appendMissedScheduleAlert(db = {}, due = {}) {
     newYorkTime: due.newYorkTime,
     elapsedMinutes: due.elapsedMinutes,
     catchUpMinutes: SCHEDULE_CATCH_UP_MINUTES,
+  }, "warn", "scheduler");
+}
+
+function appendCatchUpRetryBlockedAlert(db = {}, due = {}, attempt = {}) {
+  const alertKey = `schedule-catch-up-blocked:${due.key}`;
+  const exists = (db.alerts || []).some((alert) => alert.alertKey === alertKey || alert.storyFingerprint === alertKey);
+  if (exists) return null;
+  db.alerts = [
+    {
+      id: compactId("schedule-alert"),
+      alertKey,
+      storyFingerprint: alertKey,
+      createdAt: nowIso(),
+      severity: "high",
+      ticker: "MKT",
+      title: "Catch-up 采集已停止重试",
+      detail: `${due.newYorkDate} ${due.job?.label || due.job?.id || "schedule"} catch-up 已达到 ${attempt.maxAttempts || SCHEDULE_CATCH_UP_MAX_ATTEMPTS} 次上限；为避免重试风暴，系统已停止自动触发，请手动检查数据源或运行采集。`,
+      evidenceIds: ["schedule_catch_up_blocked", due.key],
+      status: "active",
+      catalystClass: "schedule",
+      novelty: "new",
+      score: 94,
+    },
+    ...(db.alerts || []),
+  ].slice(0, 300);
+  appendAuditEvent(db, "schedule.catch_up_blocked", {
+    key: due.key,
+    session: due.job?.id,
+    newYorkDate: due.newYorkDate,
+    attempts: attempt.count || 0,
+    maxAttempts: attempt.maxAttempts || SCHEDULE_CATCH_UP_MAX_ATTEMPTS,
+    blockedAt: attempt.blockedAt || nowIso(),
   }, "warn", "scheduler");
 }
 
@@ -36896,6 +37080,10 @@ async function analyzeWithLlmOrLocal(payload) {
 
 async function runCollection(session = "manual", trigger = "manual", options = {}) {
   if (runInProgress) return runInProgress;
+  const { scheduledRun, scheduledLlmStageTimeoutMs } = scheduledCollectionRuntime(
+    trigger,
+    SCHEDULE_LLM_STAGE_TIMEOUT_MS,
+  );
   runStatus = {
     state: "running",
     session,
@@ -37315,6 +37503,7 @@ async function runCollection(session = "manual", trigger = "manual", options = {
       ].slice(0, STOCK_HISTORY_LIMIT);
       db.alerts = [...run.alerts, ...(db.alerts || [])].slice(0, 200);
       db.runs = [run, ...db.runs].slice(0, 30);
+      markRunArchiveDirty(run.id);
       appendAuditEvent(db, "collection.run", {
         runId: run.id,
         session,
@@ -37337,6 +37526,7 @@ async function runCollection(session = "manual", trigger = "manual", options = {
         run.reportEmail = reportEmail;
         db.emailLog = [reportEmail, ...(db.emailLog || [])].slice(0, 100);
         db.runs = db.runs.map((item) => (item.id === run.id ? run : item));
+        markRunArchiveDirty(run.id);
         await saveStore(db);
       }
       runStatus = {
@@ -37384,6 +37574,16 @@ async function maybeRunSchedule() {
     due = missedScheduleCandidate(new Date(), db.scheduleLog);
     if (due) {
       trigger = "catch-up";
+      const attempt = registerCatchUpAttempt(db.scheduleAttempts, due, {
+        maxAttempts: SCHEDULE_CATCH_UP_MAX_ATTEMPTS,
+        now: nowIso(),
+      });
+      db.scheduleAttempts = attempt.attempts;
+      if (!attempt.allowed) {
+        appendCatchUpRetryBlockedAlert(db, due, attempt.record || {});
+        await saveStore(db);
+        return;
+      }
       appendMissedScheduleAlert(db, due);
       await saveStore(db);
     }
@@ -41190,7 +41390,8 @@ const server = http.createServer(async (req, res) => {
   }
 });
 
-await ensureStore();
+const bootDb = await ensureStore();
+await setupServerLock(bootDb);
 server.listen(PORT, HOST, () => {
   const url = `http://${HOST === "0.0.0.0" ? "localhost" : HOST}:${PORT}`;
   console.log(`Market Pulse AI running at ${url}`);
