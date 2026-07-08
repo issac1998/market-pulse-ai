@@ -78,6 +78,7 @@ import {
   scheduledCollectionRuntime,
 } from "../server/scheduler_guard.mjs";
 import { buildGoLiveLearningStatus, buildLlmKnowledgeScorecard } from "../server/loop_trust.mjs";
+import { buildTraderProfile, buildTraderSystemOverlap } from "../lib/trader_profile.mjs";
 
 function assertApprox(actual, expected, tolerance, message) {
   assert.ok(Math.abs(actual - expected) <= tolerance, `${message}: expected ${expected}, got ${actual}`);
@@ -196,6 +197,109 @@ const fifo = calculateOptionFifoLots([
 assert.equal(fifo.closedLots.length, 1, "Only matching option symbol should close");
 assert.equal(fifo.openLots.length, 2, "One remaining 200 call lot and the untouched 210 call should remain open");
 assert.equal(fifo.realizedPnl, 50, "Option realized PnL should include multiplier");
+
+function testDate(offset) {
+  return new Date(Date.UTC(2026, 0, 1 + offset)).toISOString().slice(0, 10);
+}
+
+function traderBarsFor(ticker, base, slope = 0.6) {
+  return Array.from({ length: 90 }, (_, index) => {
+    const close = base + slope * index;
+    return {
+      ticker,
+      date: testDate(index),
+      open: close - 0.2,
+      high: close + 1,
+      low: close - 1,
+      close,
+      volume: 1_000_000 + index,
+    };
+  });
+}
+
+function assertMetricCellsCarrySampleCounts(value, path = "profile") {
+  if (!value || typeof value !== "object") return;
+  if (Object.prototype.hasOwnProperty.call(value, "id")) {
+    assert.ok(Object.prototype.hasOwnProperty.call(value, "n"), `${path}.${value.id || "metric"} should carry n`);
+    assert.ok(Object.prototype.hasOwnProperty.call(value, "status"), `${path}.${value.id || "metric"} should carry status`);
+    return;
+  }
+  for (const [key, child] of Object.entries(value)) {
+    if (Array.isArray(child)) continue;
+    assertMetricCellsCarrySampleCounts(child, `${path}.${key}`);
+  }
+}
+
+const traderBars = [
+  ...traderBarsFor("AAA", 100, 0.5),
+  ...traderBarsFor("BBB", 80, 0.25),
+  ...traderBarsFor("SPY", 400, 0.3),
+];
+const closedLots30 = Array.from({ length: 30 }, (_, index) => {
+  const ticker = index % 2 === 0 ? "AAA" : "BBB";
+  const openedAt = testDate(25 + index);
+  const closedAt = testDate(28 + index);
+  const entryPrice = ticker === "AAA" ? 100 + 0.5 * (25 + index) : 80 + 0.25 * (25 + index);
+  const winning = index % 2 === 0;
+  const exitPrice = winning ? entryPrice * 1.04 : entryPrice * 0.97;
+  return {
+    id: `lot-${index}`,
+    ticker,
+    positionSide: "long",
+    quantity: 10 + index,
+    entryPrice,
+    exitPrice,
+    openedAt,
+    closedAt,
+    holdingDays: 3,
+    realizedPnl: (exitPrice - entryPrice) * (10 + index),
+  };
+});
+const traderTrades = closedLots30.flatMap((lot) => [
+  { id: `${lot.id}-buy`, ticker: lot.ticker, side: "buy", quantity: lot.quantity, price: lot.entryPrice, executedAt: lot.openedAt },
+  { id: `${lot.id}-sell`, ticker: lot.ticker, side: "sell", quantity: lot.quantity, price: lot.exitPrice, executedAt: lot.closedAt },
+]);
+const traderProfile = buildTraderProfile({
+  closedLots: closedLots30,
+  trades: traderTrades,
+  bars: traderBars,
+  securityMaster: { AAA: { sector: "Technology" }, BBB: { sector: "Healthcare" } },
+});
+assert.equal(traderProfile.schemaVersion, "trader-profile-v1", "Trader profile should expose the documented schema version");
+assert.equal(traderProfile.results.roundTrips.value, 30, "Trader profile should count 30 closed lots");
+assert.equal(traderProfile.results.winRate.n, 30, "Trader win-rate metric should carry sample count");
+assertApprox(traderProfile.results.winRate.value, 50, 1e-9, "Trader profile synthetic win rate should be hand-computed at 50%");
+assert.equal(traderProfile.results.winRate.status, "ok", "30 closed lots should clear the top-level min-sample gate");
+assert.ok(traderProfile.styleTags.some((item) => item.tag !== "insufficient_data"), "30-lot fixture should produce rule-based style tags");
+assertMetricCellsCarrySampleCounts(traderProfile.results);
+assertMetricCellsCarrySampleCounts(traderProfile.entryBehavior);
+assertMetricCellsCarrySampleCounts(traderProfile.exitBehavior);
+assertMetricCellsCarrySampleCounts(traderProfile.sizing);
+assertMetricCellsCarrySampleCounts(traderProfile.concentration);
+assertMetricCellsCarrySampleCounts(traderProfile.counterfactuals);
+const insufficientTraderProfile = buildTraderProfile({ closedLots: closedLots30.slice(0, 5), trades: traderTrades.slice(0, 10), bars: traderBars });
+assert.ok(
+  insufficientTraderProfile.styleTags.every((item) => item.tag === "insufficient_data"),
+  "5-lot fixture should render explicit insufficient-data style tags",
+);
+const overlap = buildTraderSystemOverlap({
+  trades: [
+    { id: "t-follow", ticker: "AAA", side: "buy", executedAt: "2026-02-03" },
+    { id: "t-instinct", ticker: "BBB", side: "buy", executedAt: "2026-02-03" },
+  ],
+  decisions: [
+    { id: "d-follow", ticker: "AAA", action: "买入", actionable: true, generatedAt: "2026-02-02" },
+    { id: "d-ignored", ticker: "CCC", action: "买入", actionable: true, generatedAt: "2026-02-02" },
+  ],
+  outcomes: [
+    { decisionId: "d-follow", outcome: "win", excessPct: 3 },
+    { decisionId: "d-ignored", outcome: "win", excessPct: 5 },
+  ],
+});
+assertApprox(overlap.followRate.value, 50, 1e-9, "One of two trades should match an actionable recommendation");
+assert.equal(overlap.followRate.n, 2, "System-overlap follow rate should carry trade sample count");
+assert.equal(overlap.followedOutcome.n, 1, "Followed cohort outcome should carry n");
+assert.equal(overlap.ignoredWinners.value, 1, "Ignored-winner count should identify untraded winning actionable calls");
 
 assert.equal(normalizeOptionIv(45), 0.45, "Option IV percentages should normalize to decimals");
 const callPrice = blackScholesPrice({ spot: 100, strike: 100, iv: 0.2, dte: 30, optionType: "call", rate: 0.045 });

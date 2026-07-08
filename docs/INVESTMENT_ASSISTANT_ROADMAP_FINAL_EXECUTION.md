@@ -2263,3 +2263,125 @@ Contradictions / deferred live checks:
 
 - No contradiction. The second-server drill ran against a temporary `DATA_DIR` and did not merge drill artifacts into production.
 - The LLM scorecard will remain `insufficient_evidence` until real LLM-counterfactual decisions mature to the `n=20` gate.
+
+---
+
+## WP31 — Trader Mirror: operations profile, Longbridge fills, coaching surface — 2026-07-09
+
+What changed:
+
+- Added deterministic Trader Mirror core in `lib/trader_profile.mjs`.
+  - `buildTraderProfile()` computes results, entry behavior, exit behavior, sizing, concentration/reactivity, counterfactuals, rule-based style tags, equity curve, and `llmGovernance`.
+  - Every metric cell carries `{value,n,status}` and uses `insufficient_data` below the documented sample gates.
+  - `buildTraderSystemOverlap()` computes follow-rate, followed-vs-owner-instinct cohort outcome, and ignored-winner count with sample counts.
+- Added Longbridge fills ingestion.
+  - `POST /api/trades/sync-longbridge` calls `longbridge order executions --history --start <watermark> --format json`.
+  - Fills are normalized through the existing `sanitizeTrade` / `mergeTrades` path with `broker:"longbridge"`, `externalId`, `orderId`, and `market`.
+  - Watermark is stored at `db.tradeSync.longbridge.lastSyncAt` and mirrored into `db.traderProfile.tradeSync.longbridge`.
+- Added Trader Profile APIs and persistence.
+  - `GET /api/trader-profile`
+  - `POST /api/trader-profile/refresh`
+  - `/api/state` now includes `traderProfile` and `config.traderMirror`.
+  - Store key `traderProfile {current,snapshots,tradeSync}` is maintained with `snapshots <= 24`.
+  - SQLite mirror adds `trader_profile_snapshots`.
+- Added UI surface in the operations/journal page.
+  - 交易画像 card shows sync status, sample counts, style tags, metric table with `n` badges, system-overlap panel, insufficient-data copy, and refresh/sync buttons.
+  - Empty ledger shows an ingestion CTA instead of fake zeros.
+- Added opt-in LLM narrator.
+  - New `harness/agents/trader_mirror.md`.
+  - `TRADER_MIRROR_LLM_ENABLED=false` by default.
+  - When enabled, LLM output is stored only as `narrative`; it never writes metrics, style tags, scores, gates, weights, or skill JSON.
+  - Mock invoker now emits schema-valid `trader-mirror-report-v1`.
+- Added disabled-by-default automation flags.
+  - `LONG_BRIDGE_TRADE_SYNC_AUTO_ENABLED=false`: optional post-session Longbridge trade sync.
+  - `TRADER_PROFILE_WEEKLY_REFRESH_ENABLED=false`: optional Sunday weekly profile refresh.
+
+Files/functions:
+
+- `server.mjs`: Longbridge execution parser/sync, Trader Profile build/persist helpers, `/api/trades/sync-longbridge`, `/api/trader-profile`, `/api/trader-profile/refresh`, config/state exposure, optional post-session and weekly refresh hooks.
+- `lib/trader_profile.mjs`: deterministic profile and system-overlap core.
+- `public/app.js`: `traderProfileBlock`, metric rows, sync/refresh button handlers.
+- `public/styles.css`: Trader Profile card/table styling.
+- `scripts/sqlite_store_sync.py`: `trader_profile_snapshots` schema and sync.
+- `harness/agents/trader_mirror.md`: opt-in LLM narrator prompt.
+- `harness/invoker/mock.py`: schema-valid mock output for `trader_mirror`.
+- `scripts/core_regression_tests.mjs`: 30-lot deterministic fixture, 5-lot insufficient-data fixture, system-overlap fixture.
+- `docs/CODEBASE_ROUTE_INVENTORY.md`: route inventory regenerated from the staged/index tree; routes 82 → 85, frontend API calls 43 → 44, store keys 27 → 29.
+
+Verification:
+
+```text
+$ node --check server.mjs && node --check public/app.js && node --check lib/trader_profile.mjs && node --check scripts/core_regression_tests.mjs
+pass
+
+$ python3 -m py_compile scripts/sqlite_store_sync.py harness/agents/loader.py harness/cli.py
+pass
+
+$ python3 -m py_compile scripts/*.py harness/invoker/*.py harness/tools/*.py harness/tests/*.py
+pass
+
+$ node scripts/core_regression_tests.mjs
+core_regression_tests: ok
+
+$ python3 -m harness run --agent trader_mirror --invoker mock --question '{"profile":{"schemaVersion":"trader-profile-v1","status":"empty","sampleCounts":{"closedLots":0}}}'
+schemaVersion=trader-mirror-report-v1
+metricIds=["results.roundTrips"]
+n=0
+```
+
+Isolated empty-ledger API smoke:
+
+```text
+$ DATA_DIR=$(mktemp -d) PORT=5871 HOST=127.0.0.1 SQLITE_MIRROR_ENABLED=false node server.mjs
+$ curl /api/state
+$ curl /api/trader-profile
+$ curl -X POST /api/trader-profile/refresh '{"syncLongbridge":false,"llm":false}'
+{
+  "stateHasTraderProfile": true,
+  "configHasTraderMirror": true,
+  "getStatus": "empty",
+  "refreshStatus": "empty",
+  "closedLots": 0,
+  "narrative": null
+}
+```
+
+Longbridge execution-source smoke:
+
+```text
+$ /Users/a/.local/bin/longbridge order executions --history --start 2019-01-01 --format json
+[]
+
+$ DATA_DIR=$(mktemp -d) PORT=5872 HOST=127.0.0.1 SQLITE_MIRROR_ENABLED=false node server.mjs
+$ curl -X POST /api/trades/sync-longbridge
+$ curl -X POST /api/trades/sync-longbridge
+{
+  "first": {"status":"ok","parsed":0,"imported":0},
+  "second": {"status":"ok","parsed":0,"imported":0},
+  "profile":"empty"
+}
+```
+
+Route inventory:
+
+```text
+$ node scripts/generate_route_inventory.mjs && node scripts/generate_route_inventory.mjs --check
+{"status":"ok","routes":85,"uiFetches":44,"storeKeys":29}
+{"status":"ok","routes":85,"uiFetches":44,"storeKeys":29}
+```
+
+SQLite mirror:
+
+```text
+$ python3 scripts/sqlite_store_sync.py --store-json /tmp/profile-store.json --db /tmp/profile.sqlite
+synced.traderProfileSnapshots=1
+
+$ sqlite3 -json /tmp/profile.sqlite "SELECT status, closed_lots, trades, open_lots, narrative_status FROM trader_profile_snapshots;"
+[{"status":"ok","closed_lots":30,"trades":60,"open_lots":2,"narrative_status":"ok"}]
+```
+
+Contradictions / deferred live checks:
+
+- No implementation contradiction.
+- Longbridge CLI execution endpoint is reachable, but the current account returned zero executions for the tested history window. Therefore duplicate handling and empty-ledger behavior were verified, but no real fill could be hand-checked against broker records in this run.
+- Post-session trade sync and weekly Trader Profile refresh are implemented but disabled by default via `LONG_BRIDGE_TRADE_SYNC_AUTO_ENABLED=false` and `TRADER_PROFILE_WEEKLY_REFRESH_ENABLED=false` to satisfy the background-task ground rule. Manual sync/refresh is available immediately.

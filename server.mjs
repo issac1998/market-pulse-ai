@@ -45,6 +45,7 @@ import {
   selectStarvationBackfillEvaluations,
   stockHistoryPricePath as recommenderStockHistoryPricePath,
 } from "./lib/recommender_core.mjs";
+import { buildTraderProfile, buildTraderSystemOverlap as buildTraderSystemOverlapCore } from "./lib/trader_profile.mjs";
 import {
   deterministicAgentDebateForGate,
   ingestAgentDebateIntoRun,
@@ -1028,6 +1029,7 @@ const LONG_BRIDGE_ENABLED = parseBoolean(process.env.LONG_BRIDGE_ENABLED, true);
 const LONG_BRIDGE_COMMAND = process.env.LONG_BRIDGE_COMMAND || longBridgeDefaultCommand();
 const LONG_BRIDGE_TIMEOUT_MS = Number(process.env.LONG_BRIDGE_TIMEOUT_MS || 30000);
 const LONG_BRIDGE_CONCURRENCY = Math.max(1, Number(process.env.LONG_BRIDGE_CONCURRENCY || 3));
+const LONG_BRIDGE_EXECUTIONS_TIMEOUT_MS = Number(process.env.LONG_BRIDGE_EXECUTIONS_TIMEOUT_MS || 60000);
 const LONG_BRIDGE_MARKET_SUFFIX = process.env.LONG_BRIDGE_MARKET_SUFFIX || "US";
 const LONG_BRIDGE_NEWS_ENABLED = parseBoolean(process.env.LONG_BRIDGE_NEWS_ENABLED, true);
 const LONG_BRIDGE_NEWS_LIMIT = Number(process.env.LONG_BRIDGE_NEWS_LIMIT || 6);
@@ -1184,6 +1186,11 @@ const ALL_STOCK_AGENT_TECHNICAL_PREFETCH_LIMIT = Math.max(
 const ALL_STOCK_AGENT_QUOTE_PREFETCH_LIMIT = Math.max(0, Number(process.env.ALL_STOCK_AGENT_QUOTE_PREFETCH_LIMIT ?? 0));
 const AGENT_DEBATE_INGEST_ENABLED = parseBoolean(process.env.AGENT_DEBATE_INGEST_ENABLED, false);
 const AGENT_DEBATE_INGEST_TOKEN = String(process.env.AGENT_DEBATE_INGEST_TOKEN || "").trim();
+const TRADER_MIRROR_LLM_ENABLED = parseBoolean(process.env.TRADER_MIRROR_LLM_ENABLED, false);
+const TRADER_MIRROR_LLM_INVOKER = process.env.TRADER_MIRROR_LLM_INVOKER || "mock";
+const LONG_BRIDGE_TRADE_SYNC_AUTO_ENABLED = parseBoolean(process.env.LONG_BRIDGE_TRADE_SYNC_AUTO_ENABLED, false);
+const TRADER_PROFILE_WEEKLY_REFRESH_ENABLED = parseBoolean(process.env.TRADER_PROFILE_WEEKLY_REFRESH_ENABLED, false);
+const TRADER_PROFILE_WEEKLY_REFRESH_NEW_YORK_TIME = process.env.TRADER_PROFILE_WEEKLY_REFRESH_NEW_YORK_TIME || "18:45";
 const AGENT_HARNESS_PYTHON = process.env.AGENT_HARNESS_PYTHON || "python3";
 const AGENT_HARNESS_TIMEOUT_MS = Number(process.env.AGENT_HARNESS_TIMEOUT_MS || 300000);
 const FORCED_BENCHMARK_TICKERS = splitList(process.env.FORCED_BENCHMARK_TICKERS || "SPY,QQQ,VTI,VOO,SMH,IWM,XLK,XLV,XLE,XLF,XLY,XLC,XLI,XLP,XLU");
@@ -3922,6 +3929,8 @@ async function ensureStore() {
       runs,
       chat: Array.isArray(db.chat) ? db.chat : [],
       trades: Array.isArray(db.trades) ? db.trades : [],
+      tradeSync: db.tradeSync && typeof db.tradeSync === "object" ? db.tradeSync : {},
+      traderProfile: db.traderProfile && typeof db.traderProfile === "object" ? db.traderProfile : { current: null, snapshots: [], tradeSync: {} },
       stockHistory,
       tradeReviews: Array.isArray(db.tradeReviews) ? db.tradeReviews : [],
       tradeReviewActionState:
@@ -3987,6 +3996,8 @@ async function ensureStore() {
       runs: [],
       chat: [],
       trades: [],
+      tradeSync: {},
+      traderProfile: { current: null, snapshots: [], tradeSync: {} },
       stockHistory: [],
       tradeReviews: [],
       tradeReviewActionState: {},
@@ -5168,6 +5179,7 @@ function sanitizeTrade(item, defaults = {}) {
     externalId: externalId.slice(0, 120),
     orderId: String(item?.orderId || item?.orderID || "").slice(0, 80),
     ticker,
+    market: String(item?.market || item?.exchange || item?.region || defaults.market || "US").toUpperCase().slice(0, 12),
     instrumentType: optionLike ? "option" : "equity",
     ...(optionLike
       ? {
@@ -5371,6 +5383,287 @@ function mergeTrades(existing, incoming) {
   return [...map.values()]
     .sort((a, b) => new Date(b.executedAt) - new Date(a.executedAt))
     .slice(0, TRADE_HISTORY_LIMIT);
+}
+
+function longbridgeExecutionRows(payload) {
+  if (Array.isArray(payload)) return payload;
+  if (Array.isArray(payload?.data)) return payload.data;
+  if (Array.isArray(payload?.items)) return payload.items;
+  if (Array.isArray(payload?.executions)) return payload.executions;
+  if (Array.isArray(payload?.data?.items)) return payload.data.items;
+  if (Array.isArray(payload?.data?.executions)) return payload.data.executions;
+  if (Array.isArray(payload?.data?.orders)) return payload.data.orders;
+  return [];
+}
+
+function longbridgeSymbolParts(value = "") {
+  const raw = String(value || "").trim().toUpperCase();
+  const [ticker, market = "US"] = raw.includes(".") ? raw.split(".", 2) : [raw, "US"];
+  return { ticker: safeTicker(ticker), market: String(market || "US").replace(/[^A-Z0-9]/g, "").slice(0, 12) || "US" };
+}
+
+function normalizeLongbridgeExecution(row = {}) {
+  const symbol = row.symbol || row.stock || row.code || row.security || row.instrument || row.contract?.symbol || row.contract?.code;
+  const parts = longbridgeSymbolParts(symbol);
+  const side = normalizeTradeSide(row.side || row.direction || row.action || row.orderSide || row.tradeSide);
+  const quantity = numberOrNull(row.quantity ?? row.qty ?? row.executedQuantity ?? row.filledQuantity ?? row.shares);
+  const price = numberOrNull(row.price ?? row.executedPrice ?? row.avgPrice ?? row.averagePrice ?? row.tradePrice);
+  const executedAt = normalizeExecutedAt(row.executedAt || row.executed_at || row.tradeTime || row.timestamp || row.createdAt || row.updatedAt);
+  const externalId = String(row.executionId || row.execId || row.id || row.tradeId || row.fillId || "").trim();
+  return sanitizeTrade({
+    ticker: parts.ticker,
+    market: parts.market,
+    side,
+    quantity,
+    price,
+    fees: row.fees ?? row.commission ?? row.charges ?? 0,
+    executedAt,
+    broker: "longbridge",
+    source: "longbridge",
+    externalId,
+    orderId: row.orderId || row.order_id || row.orderNo || "",
+    currency: row.currency || row.settlementCurrency || "USD",
+    notes: row.name || row.remark || "",
+  }, { source: "longbridge", broker: "longbridge", market: parts.market });
+}
+
+async function syncLongbridgeTrades(db = {}) {
+  const startedAt = nowIso();
+  const current = db.tradeSync?.longbridge || db.traderProfile?.tradeSync?.longbridge || {};
+  const start = String(current.lastSyncAt || "2019-01-01").slice(0, 10);
+  const payload = await runLongBridgeJson(
+    ["order", "executions", "--history", "--start", start],
+    Math.max(LONG_BRIDGE_EXECUTIONS_TIMEOUT_MS, LONG_BRIDGE_TIMEOUT_MS),
+  );
+  const parsed = longbridgeExecutionRows(payload)
+    .map(normalizeLongbridgeExecution)
+    .filter(Boolean);
+  const before = sanitizeTrades(db.trades).length;
+  db.trades = mergeTrades(db.trades, parsed);
+  const imported = sanitizeTrades(db.trades).length - before;
+  const lastExecutionAt = parsed
+    .map((trade) => trade.executedAt)
+    .filter(Boolean)
+    .sort()
+    .at(-1) || current.lastSyncAt || "";
+  const sync = {
+    schemaVersion: "longbridge-trade-sync-v1",
+    id: compactId("longbridge-sync"),
+    startedAt,
+    completedAt: nowIso(),
+    status: "ok",
+    start,
+    parsed: parsed.length,
+    imported,
+    lastSyncAt: lastExecutionAt || startedAt,
+  };
+  db.tradeSync = { ...(db.tradeSync || {}), longbridge: sync };
+  db.traderProfile = {
+    ...(db.traderProfile || {}),
+    tradeSync: {
+      ...(db.traderProfile?.tradeSync || {}),
+      longbridge: sync,
+    },
+  };
+  return sync;
+}
+
+async function sqliteRows(sql, timeoutMs = 30000) {
+  if (!existsSync(SQLITE_DB_FILE)) return [];
+  const output = await execFileText("sqlite3", ["-json", SQLITE_DB_FILE, sql], timeoutMs);
+  const text = String(output || "").trim();
+  return text ? JSON.parse(text) : [];
+}
+
+async function traderProfileBarsForTickers(tickers = []) {
+  const symbols = [...new Set([...tickers.map(safeTicker), "SPY"].filter(Boolean))];
+  if (!symbols.length) return [];
+  const sqlList = symbols.map((ticker) => `'${String(ticker).replace(/'/g, "''")}'`).join(",");
+  try {
+    return await sqliteRows(
+      `SELECT ticker,date,open,high,low,close,volume,source FROM historical_bars WHERE ticker IN (${sqlList}) ORDER BY ticker,date;`,
+      45000,
+    );
+  } catch {
+    return [];
+  }
+}
+
+function loadSecurityMasterExtForTraderProfile() {
+  try {
+    const raw = JSON.parse(readFileSync(SECURITY_MASTER_EXT_FILE, "utf8"));
+    const rows = Array.isArray(raw) ? raw : Array.isArray(raw?.rows) ? raw.rows : Array.isArray(raw?.securities) ? raw.securities : [];
+    return rows.map((row) => ({ ...row, ticker: safeTicker(row.ticker || row.symbol) })).filter((row) => row.ticker);
+  } catch {
+    return [];
+  }
+}
+
+function buildTraderSystemOverlapForDb(db = {}) {
+  const trades = sanitizeTrades(db.trades || []);
+  const state = normalizeAllStockAgentState(db.allStockAgent);
+  const decisions = (state.decisions || []).filter((decision) => decision.actionable !== false);
+  return buildTraderSystemOverlapCore({
+    trades,
+    decisions,
+    outcomes: state.outcomeSnapshots || [],
+    generatedAt: nowIso(),
+  });
+}
+
+function compactTraderProfileForNarrator(profile = {}) {
+  return {
+    schemaVersion: profile.schemaVersion,
+    generatedAt: profile.generatedAt,
+    status: profile.status,
+    sampleCounts: profile.sampleCounts,
+    results: profile.results,
+    entryBehavior: profile.entryBehavior,
+    exitBehavior: profile.exitBehavior,
+    sizing: profile.sizing,
+    concentration: profile.concentration,
+    counterfactuals: profile.counterfactuals,
+    styleTags: profile.styleTags,
+    systemOverlap: profile.systemOverlap
+      ? {
+          followRate: profile.systemOverlap.followRate,
+          followedOutcome: profile.systemOverlap.followedOutcome,
+          ownerInstinctOutcome: profile.systemOverlap.ownerInstinctOutcome,
+          ignoredWinners: profile.systemOverlap.ignoredWinners,
+        }
+      : null,
+    llmGovernance: profile.llmGovernance,
+  };
+}
+
+async function buildTraderMirrorNarrative(profile = {}) {
+  if (!TRADER_MIRROR_LLM_ENABLED) return null;
+  const invoker = normalizeHarnessInvoker(TRADER_MIRROR_LLM_INVOKER);
+  const question = JSON.stringify({
+    task: "trader_mirror_report",
+    profile: compactTraderProfileForNarrator(profile),
+  });
+  try {
+    const harness = await runAgentHarnessAgent("trader_mirror", { question }, invoker);
+    const output = harness.payload?.output || harness.payload || {};
+    return {
+      schemaVersion: "trader-mirror-report-v1",
+      status: output.degraded ? "degraded" : "ok",
+      invoker: harness.invoker,
+      generatedAt: nowIso(),
+      styleNarrative: String(output.styleNarrative || output.answer || "").slice(0, 2400),
+      habits: Array.isArray(output.habits) ? output.habits.slice(0, 12) : [],
+      resultsSummary: String(output.resultsSummary || "").slice(0, 1200),
+      coachingInstructions: Array.isArray(output.coachingInstructions) ? output.coachingInstructions.slice(0, 12) : [],
+      disclaimers: Array.isArray(output.disclaimers) ? output.disclaimers.slice(0, 8) : [],
+      trace: harness.payload?.trace ? {
+        agent: harness.payload.trace.agent,
+        invoker: harness.payload.trace.invoker,
+        degraded: harness.payload.trace.degraded,
+        budget: harness.payload.trace.budget,
+      } : null,
+      llmGovernance: {
+        llmWritesMetrics: false,
+        llmWritesStyleTags: false,
+        llmWritesScores: false,
+        llmWritesGates: false,
+        llmWritesWeights: false,
+      },
+    };
+  } catch (error) {
+    return {
+      schemaVersion: "trader-mirror-report-v1",
+      status: "failed",
+      invoker,
+      generatedAt: nowIso(),
+      error: errorZh(error.message),
+      llmGovernance: {
+        llmWritesMetrics: false,
+        llmWritesStyleTags: false,
+        llmWritesScores: false,
+        llmWritesGates: false,
+        llmWritesWeights: false,
+      },
+    };
+  }
+}
+
+async function buildTraderProfileForDb(db = {}, options = {}) {
+  const journal = buildTradeJournalForDb(db, { includeClosedLots: true });
+  const closedLots = journal.closedLots || [];
+  const trades = sanitizeTrades(db.trades || []);
+  const tickers = [...new Set([...closedLots.map((lot) => lot.ticker), ...trades.map((trade) => trade.ticker)].map(safeTicker).filter(Boolean))];
+  const bars = await traderProfileBarsForTickers(tickers);
+  const systemOverlap = buildTraderSystemOverlapForDb(db);
+  const profile = buildTraderProfile({
+    closedLots,
+    openLots: journal.optionFifo?.openLots || [],
+    trades,
+    bars,
+    securityMaster: loadSecurityMasterExtForTraderProfile(),
+    systemOverlap,
+    generatedAt: nowIso(),
+  });
+  const narrative = options.llm === false ? null : await buildTraderMirrorNarrative(profile);
+  return {
+    ...profile,
+    narrative,
+    tradeSync: db.traderProfile?.tradeSync || db.tradeSync || {},
+    sourceRisk: "Trader Mirror is a deterministic behavior mirror. It does not feed factor weights, gates, or broker orders.",
+  };
+}
+
+function persistTraderProfile(db = {}, profile = null) {
+  const current = profile || null;
+  db.traderProfile = {
+    ...(db.traderProfile || {}),
+    current,
+    snapshots: current ? [current, ...(db.traderProfile?.snapshots || [])].slice(0, 24) : (db.traderProfile?.snapshots || []).slice(0, 24),
+    tradeSync: db.traderProfile?.tradeSync || db.tradeSync || {},
+    updatedAt: nowIso(),
+  };
+  return db.traderProfile;
+}
+
+async function refreshTraderProfileForDb(db = {}, options = {}) {
+  let sync = null;
+  if (options.syncLongbridge) {
+    sync = await syncLongbridgeTrades(db);
+  }
+  const profile = await buildTraderProfileForDb(db, { llm: options.llm !== false });
+  persistTraderProfile(db, profile);
+  return { profile, sync, traderProfile: db.traderProfile };
+}
+
+async function maybeAutoSyncTraderProfileAfterCollection(db = {}, session = "", trigger = "") {
+  if (!LONG_BRIDGE_TRADE_SYNC_AUTO_ENABLED) return null;
+  if (session !== "post" || !["schedule", "catch-up"].includes(trigger)) return null;
+  try {
+    const result = await refreshTraderProfileForDb(db, { syncLongbridge: true, llm: false });
+    appendAuditEvent(db, "trader_profile.post_session_auto_sync", {
+      status: result.sync?.status || "ok",
+      imported: result.sync?.imported || 0,
+      parsed: result.sync?.parsed || 0,
+      profileStatus: result.profile?.status || "",
+    });
+    return result;
+  } catch (error) {
+    const sync = {
+      schemaVersion: "longbridge-trade-sync-v1",
+      id: compactId("longbridge-sync"),
+      completedAt: nowIso(),
+      status: "failed",
+      error: errorZh(error.message),
+      mode: "post-session-auto",
+    };
+    db.tradeSync = { ...(db.tradeSync || {}), longbridge: sync };
+    db.traderProfile = {
+      ...(db.traderProfile || {}),
+      tradeSync: { ...(db.traderProfile?.tradeSync || {}), longbridge: sync },
+    };
+    appendAuditEvent(db, "trader_profile.post_session_auto_sync", { status: "failed", error: sync.error }, "warn");
+    return { sync, error: sync.error };
+  }
 }
 
 function findTradeSnapshot(trade, stockHistory) {
@@ -37609,6 +37902,7 @@ async function runCollection(session = "manual", trigger = "manual", options = {
         options: (run.options || []).length,
         errors: (run.errors || []).length,
       });
+      await maybeAutoSyncTraderProfileAfterCollection(db, session, trigger);
       if (trigger === "schedule" || trigger === "catch-up") {
         const p = getNewYorkParts(new Date());
         db.scheduleLog[options.scheduleKey || `${p.ymd}:${session}`] = run.id;
@@ -38582,6 +38876,15 @@ function configForClient(db) {
         llmConcurrency: IBKR_PORTAL_LLM_CONCURRENCY,
       },
     },
+    traderMirror: {
+      longbridgeTradeSyncAutoEnabled: LONG_BRIDGE_TRADE_SYNC_AUTO_ENABLED,
+      longbridgeExecutionTimeoutMs: LONG_BRIDGE_EXECUTIONS_TIMEOUT_MS,
+      weeklyRefreshEnabled: TRADER_PROFILE_WEEKLY_REFRESH_ENABLED,
+      weeklyRefreshNewYorkTime: TRADER_PROFILE_WEEKLY_REFRESH_NEW_YORK_TIME,
+      llmEnabled: TRADER_MIRROR_LLM_ENABLED,
+      llmInvoker: normalizeHarnessInvoker(TRADER_MIRROR_LLM_INVOKER),
+      lastSync: db.tradeSync?.longbridge || db.traderProfile?.tradeSync?.longbridge || null,
+    },
     openbb: {
       enabled: OPENBB_ENABLED,
       mode: OPENBB_MODE,
@@ -39011,6 +39314,41 @@ async function maybeRunWeeklyFactorResearcher() {
   return { status: "ok", due, accepted: result.ingest.accepted.length, rejected: result.ingest.rejected.length };
 }
 
+function dueTraderProfileWeekly(date = new Date(), scheduleLog = {}) {
+  if (!TRADER_PROFILE_WEEKLY_REFRESH_ENABLED) return null;
+  const parts = getNewYorkParts(date);
+  if (parts.weekday !== "Sun") return null;
+  const target = parseNewYorkClock(TRADER_PROFILE_WEEKLY_REFRESH_NEW_YORK_TIME);
+  const nowMinute = parts.hour * 60 + parts.minute;
+  const targetMinute = target.hour * 60 + target.minute;
+  const key = `${parts.ymd}:trader-profile-weekly`;
+  if (scheduleLog[key]) return null;
+  if (nowMinute < targetMinute || nowMinute - targetMinute > SCHEDULE_CATCH_UP_MINUTES) return null;
+  return {
+    key,
+    newYorkDate: parts.ymd,
+    newYorkTime: `${String(target.hour).padStart(2, "0")}:${String(target.minute).padStart(2, "0")}`,
+  };
+}
+
+async function maybeRunWeeklyTraderProfileRefresh() {
+  const db = await ensureStore();
+  const due = dueTraderProfileWeekly(new Date(), db.scheduleLog || {});
+  if (!due) return { status: TRADER_PROFILE_WEEKLY_REFRESH_ENABLED ? "not_due" : "disabled" };
+  const result = await refreshTraderProfileForDb(db, {
+    syncLongbridge: LONG_BRIDGE_TRADE_SYNC_AUTO_ENABLED,
+    llm: TRADER_MIRROR_LLM_ENABLED,
+  });
+  db.scheduleLog[due.key] = result.profile?.generatedAt || nowIso();
+  appendAuditEvent(db, "trader_profile.weekly_refresh", {
+    status: result.profile?.status || "unknown",
+    closedLots: result.profile?.sampleCounts?.closedLots || 0,
+    syncStatus: result.sync?.status || (LONG_BRIDGE_TRADE_SYNC_AUTO_ENABLED ? "not_run" : "disabled"),
+  }, result.sync?.status === "failed" ? "warn" : "ok");
+  await saveStore(db);
+  return { status: "ok", due, profileStatus: result.profile?.status || "", sync: result.sync || null };
+}
+
 async function handleApi(req, res, url) {
   if (req.method === "GET" && url.pathname === "/api/state") {
     const db = await ensureStore();
@@ -39023,6 +39361,7 @@ async function handleApi(req, res, url) {
       chat: db.chat.slice(-20),
       trades: sanitizeTrades(db.trades).slice(0, 200),
       tradeJournal: buildTradeJournalForDb(db),
+      traderProfile: db.traderProfile || { current: null, snapshots: [], tradeSync: db.tradeSync || {} },
       stockHistorySummary: summarizeStockHistory(db.stockHistory),
       tradeReviews: (db.tradeReviews || []).slice(0, 10),
       emailLog: (db.emailLog || []).slice(0, 20),
@@ -40527,6 +40866,45 @@ async function handleApi(req, res, url) {
     });
   }
 
+  if (req.method === "POST" && url.pathname === "/api/trades/sync-longbridge") {
+    const db = await ensureStore();
+    const startedAt = nowIso();
+    try {
+      const sync = await syncLongbridgeTrades(db);
+      const profile = await buildTraderProfileForDb(db, { llm: false });
+      persistTraderProfile(db, profile);
+      appendAuditEvent(db, "trades.longbridge_sync", {
+        status: sync.status,
+        parsed: sync.parsed,
+        imported: sync.imported,
+      });
+      await saveStore(db);
+      return sendJson(res, {
+        sync,
+        traderProfile: db.traderProfile,
+        trades: sanitizeTrades(db.trades).slice(0, 200),
+        tradeJournal: buildTradeJournalForDb(db),
+      });
+    } catch (error) {
+      const sync = {
+        schemaVersion: "longbridge-trade-sync-v1",
+        id: compactId("longbridge-sync"),
+        startedAt,
+        completedAt: nowIso(),
+        status: "failed",
+        error: errorZh(error.message),
+      };
+      db.tradeSync = { ...(db.tradeSync || {}), longbridge: sync };
+      db.traderProfile = {
+        ...(db.traderProfile || {}),
+        tradeSync: { ...(db.traderProfile?.tradeSync || {}), longbridge: sync },
+      };
+      appendAuditEvent(db, "trades.longbridge_sync", { status: "failed", error: sync.error }, "fail");
+      await saveStore(db);
+      return sendJson(res, { sync, error: sync.error }, 502);
+    }
+  }
+
   if (req.method === "POST" && url.pathname === "/api/trades/delete") {
     const body = await readBody(req);
     const id = String(body.id || "");
@@ -40537,6 +40915,40 @@ async function handleApi(req, res, url) {
       trades: sanitizeTrades(db.trades).slice(0, 200),
       tradeJournal: buildTradeJournalForDb(db),
     });
+  }
+
+  if (req.method === "GET" && url.pathname === "/api/trader-profile") {
+    const db = await ensureStore();
+    const current = db.traderProfile?.current || await buildTraderProfileForDb(db, { llm: false });
+    return sendJson(res, {
+      traderProfile: {
+        ...(db.traderProfile || {}),
+        current,
+      },
+    });
+  }
+
+  if (req.method === "POST" && url.pathname === "/api/trader-profile/refresh") {
+    const body = await readBody(req);
+    if (body.__readError) return sendJson(res, { error: body.__readError }, 400);
+    const db = await ensureStore();
+    let sync = null;
+    if (body.syncLongbridge) {
+      try {
+        sync = await syncLongbridgeTrades(db);
+      } catch (error) {
+        sync = { status: "failed", error: errorZh(error.message), completedAt: nowIso() };
+      }
+    }
+    const profile = await buildTraderProfileForDb(db, { llm: body.llm !== false });
+    persistTraderProfile(db, profile);
+    appendAuditEvent(db, "trader_profile.refresh", {
+      status: profile.status,
+      closedLots: profile.sampleCounts?.closedLots || 0,
+      syncStatus: sync?.status || "not_requested",
+    }, sync?.status === "failed" ? "warn" : "ok");
+    await saveStore(db);
+    return sendJson(res, { traderProfile: db.traderProfile, sync });
   }
 
   if (req.method === "POST" && url.pathname === "/api/trade-review") {
@@ -41527,6 +41939,14 @@ if (FACTOR_RESEARCHER_ENABLED) {
   setInterval(() => {
     maybeRunWeeklyFactorResearcher().catch((error) => {
       console.error("Weekly factor researcher failed:", error);
+    });
+  }, 60_000).unref?.();
+}
+
+if (TRADER_PROFILE_WEEKLY_REFRESH_ENABLED) {
+  setInterval(() => {
+    maybeRunWeeklyTraderProfileRefresh().catch((error) => {
+      console.error("Weekly trader profile refresh failed:", error);
     });
   }, 60_000).unref?.();
 }

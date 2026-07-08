@@ -486,6 +486,17 @@ def init_schema(conn: sqlite3.Connection) -> None:
           json TEXT NOT NULL
         );
 
+        CREATE TABLE IF NOT EXISTS trader_profile_snapshots (
+          id TEXT PRIMARY KEY,
+          generated_at TEXT,
+          status TEXT,
+          closed_lots INTEGER DEFAULT 0,
+          trades INTEGER DEFAULT 0,
+          open_lots INTEGER DEFAULT 0,
+          narrative_status TEXT,
+          json TEXT NOT NULL
+        );
+
         CREATE TABLE IF NOT EXISTS metadata (
           key TEXT PRIMARY KEY,
           value TEXT NOT NULL
@@ -510,6 +521,7 @@ def init_schema(conn: sqlite3.Connection) -> None:
         CREATE INDEX IF NOT EXISTS idx_sue_history_ticker_event ON sue_history(ticker, event_date DESC);
         CREATE INDEX IF NOT EXISTS idx_short_interest_ticker_time ON short_interest_history(ticker, captured_at DESC);
         CREATE INDEX IF NOT EXISTS idx_analyst_revision_ticker_time ON analyst_revision_history(ticker, captured_at DESC);
+        CREATE INDEX IF NOT EXISTS idx_trader_profile_generated ON trader_profile_snapshots(generated_at DESC);
         """
     )
     ensure_column(conn, "runs", "slim_json", "TEXT")
@@ -547,6 +559,7 @@ def sync_store(conn: sqlite3.Connection, store: dict[str, Any], since: str = "")
         "analystRevisionHistory": 0,
         "tradeRecommendationReconciliation": 0,
         "userPaperAcceptances": 0,
+        "traderProfileSnapshots": 0,
     }
     runs_to_sync = [run for run in store.get("runs") or [] if isinstance(run, dict) and run_after_since(run, since)]
     with conn:
@@ -1201,6 +1214,52 @@ def sync_store(conn: sqlite3.Connection, store: dict[str, Any], since: str = "")
                         ),
                     )
                     counts["userPaperAcceptances"] += 1
+
+        trader_profile = store.get("traderProfile") or {}
+        if isinstance(trader_profile, dict):
+            profile_rows: dict[str, dict[str, Any]] = {}
+            current = trader_profile.get("current")
+            if isinstance(current, dict):
+                profile_id = text(current.get("id") or f"current:{current.get('generatedAt','')}")
+                if profile_id:
+                    profile_rows[profile_id] = current
+            for index, profile in enumerate(trader_profile.get("snapshots") or []):
+                if not isinstance(profile, dict):
+                    continue
+                profile_id = text(profile.get("id") or f"snapshot:{profile.get('generatedAt','')}:{index}")
+                if profile_id:
+                    profile_rows[profile_id] = profile
+            for profile_id, profile in profile_rows.items():
+                if not row_after_since(profile, since, ("generatedAt", "updatedAt")):
+                    continue
+                sample_counts = profile.get("sampleCounts") if isinstance(profile.get("sampleCounts"), dict) else {}
+                narrative = profile.get("narrative") if isinstance(profile.get("narrative"), dict) else {}
+                conn.execute(
+                    """
+                    INSERT INTO trader_profile_snapshots(
+                      id, generated_at, status, closed_lots, trades, open_lots, narrative_status, json
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(id) DO UPDATE SET
+                      generated_at=excluded.generated_at,
+                      status=excluded.status,
+                      closed_lots=excluded.closed_lots,
+                      trades=excluded.trades,
+                      open_lots=excluded.open_lots,
+                      narrative_status=excluded.narrative_status,
+                      json=excluded.json
+                    """,
+                    (
+                        profile_id,
+                        text(profile.get("generatedAt")),
+                        text(profile.get("status")),
+                        int(sample_counts.get("closedLots") or 0),
+                        int(sample_counts.get("trades") or 0),
+                        int(sample_counts.get("openLots") or 0),
+                        text(narrative.get("status")),
+                        dump(profile),
+                    ),
+                )
+                counts["traderProfileSnapshots"] += 1
 
         for row in store.get("auditEvents") or []:
             if not isinstance(row, dict):

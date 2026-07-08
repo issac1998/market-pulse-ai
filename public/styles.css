@@ -2723,6 +2723,20 @@ body.stock-detail-mode .stock-report-panel {
   gap: 8px;
 }
 
+.trader-profile-card {
+  display: grid;
+  gap: 10px;
+  border: 1px solid rgba(123, 140, 166, 0.28);
+  border-radius: 8px;
+  background: rgba(255, 255, 255, 0.68);
+  backdrop-filter: blur(14px);
+  padding: 12px;
+}
+
+.trader-profile-table .performance-row {
+  grid-template-columns: 1.2fr 0.8fr 0.7fr 0.8fr;
+}
+
 .trade-performance-card h3 {
   font-size: 13px;
 }

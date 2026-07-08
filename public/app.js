@@ -6495,9 +6495,111 @@ function tradeTickerReviewBlock(rows) {
   </section>`;
 }
 
+function traderProfileMetricValue(cell, digits = 1) {
+  if (!cell || cell.status !== "ok") return "-";
+  const value = Number(cell.value);
+  if (!Number.isFinite(value)) return "-";
+  return `${fmtNumber(value, digits)}${cell.unit || ""}`;
+}
+
+function traderProfileMetricRow(label, cell, digits = 1) {
+  const status = cell?.status === "ok" ? "green" : "amber";
+  return `<div class="performance-row">
+    <span>${escapeHtml(label)}</span>
+    <span>${escapeHtml(traderProfileMetricValue(cell, digits))}</span>
+    <span><span class="tag ${status}">n=${escapeHtml(cell?.n ?? 0)}</span></span>
+    <span>${escapeHtml(cell?.status === "ok" ? "可用" : "样本不足")}</span>
+  </div>`;
+}
+
+function traderProfileBlock(traderProfile, mirrorConfig = {}) {
+  const current = traderProfile?.current || null;
+  const sync = traderProfile?.tradeSync?.longbridge || mirrorConfig?.lastSync || null;
+  const syncLabel = sync?.status
+    ? `${sync.status === "ok" ? "同步成功" : "同步异常"} · ${fmtTime(sync.completedAt || sync.lastSyncAt)}`
+    : "尚未同步 Longbridge 成交";
+  if (!current) {
+    return `<section class="trader-profile-card">
+      <div class="row">
+        <h3>交易画像</h3>
+        <span class="tag amber">未生成</span>
+      </div>
+      <p class="muted">暂无操作画像。可以先导入交易记录，或同步 Longbridge 成交后生成。</p>
+      <div class="trade-actions">
+        <button class="icon-text" type="button" data-refresh-trader-profile>刷新画像</button>
+        <button class="icon-text" type="button" data-sync-longbridge-trades>同步 Longbridge 成交</button>
+      </div>
+      <p class="muted">${escapeHtml(syncLabel)}</p>
+    </section>`;
+  }
+  const samples = current.sampleCounts || {};
+  const tags = (current.styleTags || []).slice(0, 8);
+  const rows = [
+    ["胜率", current.results?.winRate, 1],
+    ["盈利因子", current.results?.profitFactor, 2],
+    ["期望收益", current.results?.expectancyPct, 2],
+    ["追高率", current.entryBehavior?.chaseRate, 1],
+    ["回调买入率", current.entryBehavior?.pullbackRate, 1],
+    ["MFE 捕获率", current.exitBehavior?.mfeCapturePct, 1],
+    ["最大单名义占比", current.sizing?.maxSingleNameSharePct, 1],
+    ["跟随系统比例", current.systemOverlap?.followRate, 1],
+  ];
+  const overlap = current.systemOverlap || {};
+  const narrative = current.narrative;
+  return `<section class="trader-profile-card">
+    <div class="row">
+      <h3>交易画像</h3>
+      <span class="tag ${current.status === "ok" ? "green" : "amber"}">${escapeHtml(current.status === "ok" ? "已生成" : current.status || "unknown")}</span>
+    </div>
+    <div class="trade-summary">
+      ${metric(samples.trades || 0, "交易")}
+      ${metric(samples.closedLots || 0, "闭合段")}
+      ${metric(samples.openLots || 0, "未平仓")}
+      ${metric(samples.barTickers || 0, "K线覆盖")}
+    </div>
+    <div class="feed-meta trade-status">
+      <span class="tag">${escapeHtml(syncLabel)}</span>
+      <span class="tag">${escapeHtml(mirrorConfig.llmEnabled ? "LLM 叙述已启用" : "LLM 叙述默认关闭")}</span>
+      <span class="tag">${escapeHtml(mirrorConfig.weeklyRefreshEnabled ? "周刷新已启用" : "周刷新关闭")}</span>
+    </div>
+    <div class="trade-actions">
+      <button class="icon-text" type="button" data-refresh-trader-profile>刷新画像</button>
+      <button class="icon-text" type="button" data-sync-longbridge-trades>同步 Longbridge 成交</button>
+    </div>
+    ${
+      samples.closedLots < 20
+        ? `<p class="muted">闭合交易段少于 20，风格判断会保持样本不足，不会强行归因。</p>`
+        : ""
+    }
+    <div class="feed-meta">
+      ${tags.map((item) => `<span class="tag ${item.status === "ok" ? "green" : "amber"}" title="${escapeHtml((item.evidence || []).map((e) => `${e.metricId || ""} n=${e.n ?? ""}`).join("；"))}">${escapeHtml(`${item.axis}: ${item.tag}`)}</span>`).join("")}
+    </div>
+    <div class="performance-table trader-profile-table">
+      <div class="performance-row head"><span>指标</span><span>数值</span><span>样本</span><span>状态</span></div>
+      ${rows.map(([label, cell, digits]) => traderProfileMetricRow(label, cell, digits)).join("")}
+    </div>
+    <div class="trade-performance-card">
+      <div class="row">
+        <h3>系统重合度</h3>
+        <span class="tag">n=${escapeHtml(overlap.followRate?.n ?? 0)}</span>
+      </div>
+      <p class="muted">跟随系统：${escapeHtml(traderProfileMetricValue(overlap.followRate, 1))}；跟随后平均超额：${escapeHtml(traderProfileMetricValue(overlap.followedOutcome, 2))}；本能交易平均超额：${escapeHtml(traderProfileMetricValue(overlap.ownerInstinctOutcome, 2))}；忽略后胜出：${escapeHtml(overlap.ignoredWinners?.value ?? "-")}。</p>
+    </div>
+    ${
+      narrative
+        ? `<div class="trade-performance-card">
+            <div class="row"><h3>LLM 复盘叙述</h3><span class="tag ${narrative.status === "ok" ? "green" : "amber"}">${escapeHtml(narrative.status || "disabled")}</span></div>
+            <p>${escapeHtml(narrative.styleNarrative || narrative.error || "LLM 叙述未生成。")}</p>
+            ${(narrative.coachingInstructions || []).length ? `<ul>${narrative.coachingInstructions.slice(0, 4).map((item) => `<li>${escapeHtml(item.rule || item.why || "")}</li>`).join("")}</ul>` : ""}
+          </div>`
+        : ""
+    }
+  </section>`;
+}
+
 function renderTradeJournal(journal, reviews, ibkr) {
   if (!journal?.totals) {
-    els.tradeJournalBox.innerHTML = empty("暂无操作记录。");
+    els.tradeJournalBox.innerHTML = `${empty("暂无操作记录。")}${traderProfileBlock(appState.traderProfile, appState.config?.traderMirror)}`;
     els.tradeReviewBox.innerHTML = "";
     return;
   }
@@ -6521,6 +6623,7 @@ function renderTradeJournal(journal, reviews, ibkr) {
   <div class="trade-insights">${(journal.insights || [])
     .map((item) => `<p>${escapeHtml(item)}</p>`)
     .join("")}</div>
+  ${traderProfileBlock(appState.traderProfile, appState.config?.traderMirror)}
   ${tradeMemoryBlock(journal.tradeMemory)}
   ${tradeTickerReviewBlock(journal.byTicker)}
   ${tradeOptionFifoBlock(journal.optionFifo)}
@@ -8648,6 +8751,39 @@ els.tradeEditCancel.addEventListener("click", () => {
 });
 
 els.tradeJournalBox.addEventListener("click", async (event) => {
+  const syncLongbridgeButton = event.target.closest("[data-sync-longbridge-trades]");
+  if (syncLongbridgeButton) {
+    setBusy(true);
+    try {
+      const result = await api("/api/trades/sync-longbridge", { method: "POST" });
+      appState.trades = result.trades || appState.trades;
+      appState.tradeJournal = result.tradeJournal || appState.tradeJournal;
+      appState.traderProfile = result.traderProfile || appState.traderProfile;
+      renderTradeJournal(appState.tradeJournal, appState.tradeReviews || [], appState.config?.ibkr);
+    } catch (error) {
+      alert(error.message);
+    } finally {
+      setBusy(false);
+    }
+    return;
+  }
+  const refreshTraderProfileButton = event.target.closest("[data-refresh-trader-profile]");
+  if (refreshTraderProfileButton) {
+    setBusy(true);
+    try {
+      const result = await api("/api/trader-profile/refresh", {
+        method: "POST",
+        body: JSON.stringify({ syncLongbridge: false, llm: false }),
+      });
+      appState.traderProfile = result.traderProfile || appState.traderProfile;
+      renderTradeJournal(appState.tradeJournal, appState.tradeReviews || [], appState.config?.ibkr);
+    } catch (error) {
+      alert(error.message);
+    } finally {
+      setBusy(false);
+    }
+    return;
+  }
   const actionButton = event.target.closest("[data-review-action-id]");
   if (actionButton) {
     const isNoteEdit = actionButton.dataset.reviewActionNoteEdit === "true";

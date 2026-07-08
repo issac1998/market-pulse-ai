@@ -388,6 +388,8 @@ The single biggest discount on every backtest number so far: the 45-ticker corpu
 
 ## WP31 — Trader Mirror: read the owner's operations, classify style, coach
 
+**Status: [x] Completed 2026-07-09.** See `docs/INVESTMENT_ASSISTANT_ROADMAP_FINAL_EXECUTION.md` for verification output and disabled-by-default flags.
+
 **Order: 31a → 31b → 31c ∥ 31e → 31d.** Reuse the existing trade stack (`sanitizeTrade`/`mergeTrades`, `calculateTradeJournal` closed lots, `/api/trade-recommendation-reconciliation`, IBKR Flex sync). Do not re-implement FIFO matching or journal performance splits.
 
 - **31a — Longbridge fills ingestion.** New bridge using the verified CLI shape `longbridge order executions --history --start <watermark> --format json` (values may be strings — coerce, same as kline). Map fills → trade schema (`ticker` from `SYM.US`, `side`, `quantity`, `price`, `executedAt`, `broker:"longbridge"`, `externalId` = execution id, `orderId`), merge via `mergeTrades` (dedup on `externalId`). Watermark `db.tradeSync.longbridge.lastSyncAt` (start default 2019-01-01 on first run). Daily auto-sync after the post-session collection + `POST /api/trades/sync-longbridge` manual trigger + button in the trades UI. Fills for non-US markets are kept but flagged `market` so US-only analytics can filter. **Verify**: run against the owner's real account; imported count reported; re-running imports 0 duplicates; a hand-checked fill matches broker records exactly.

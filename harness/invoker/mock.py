@@ -26,6 +26,7 @@ def _role_from_system(system):
         ("risk", "你是 Market Pulse AI 的风险经理"),
         ("coordinator", "你是 Market Pulse AI 的辩论协调者"),
         ("factor_researcher", "你是 Market Pulse AI 的因子研究员"),
+        ("trader_mirror", "你是 Market Pulse AI 的操作画像叙述员"),
     ]
     for role, needle in checks:
         if needle in text:
@@ -55,6 +56,34 @@ class MockInvoker:
                     "confidence": 55,
                     "rationale": ["mock 汇总：已验证协调者输出兼容字段。"],
                 },
+            }
+            return LlmResult(json.dumps(payload, ensure_ascii=False), "mock:%s" % tier)
+        if role == "trader_mirror":
+            payload = {
+                "action": "final",
+                "schemaVersion": "trader-mirror-report-v1",
+                "styleNarrative": "mock 画像叙述：当前只验证 Trader Mirror 输出协议，不代表真实交易风格。",
+                "habits": [
+                    {
+                        "title": "样本纪律",
+                        "observation": "mock 引用 results.roundTrips，n=0；样本不足时只能提示继续积累。",
+                        "metricIds": ["results.roundTrips"],
+                        "n": 0,
+                    }
+                ],
+                "resultsSummary": "mock 结果摘要：没有足够样本，不生成真实结论。",
+                "coachingInstructions": [
+                    {
+                        "rule": "如果闭合交易段不足 20，则只记录交易并等待样本成熟。",
+                        "why": "results.roundTrips n=0，未达到画像门槛。",
+                        "metricIds": ["results.roundTrips"],
+                        "n": 0,
+                    }
+                ],
+                "disclaimers": [
+                    "该报告只做交易行为复盘，不构成投资建议。",
+                    "LLM 只负责叙述，不写入任何评分、门控或权重。",
+                ],
             }
             return LlmResult(json.dumps(payload, ensure_ascii=False), "mock:%s" % tier)
 
