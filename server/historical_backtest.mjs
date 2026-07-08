@@ -272,6 +272,74 @@ function securityMasterMap(rows = []) {
   return map;
 }
 
+function normalizeUniverseMembership(rows = []) {
+  return (rows || [])
+    .map((row) => {
+      let json = row.json || row.payload || null;
+      if (typeof json === "string") {
+        try {
+          json = JSON.parse(json);
+        } catch {
+          json = null;
+        }
+      }
+      return {
+        ticker: safeTicker(row.ticker ?? json?.ticker),
+        addedAt: ymd(row.added_at ?? row.addedAt ?? row.start_date ?? json?.addedAt),
+        removedAt: ymd(row.removed_at ?? row.removedAt ?? row.end_date ?? json?.removedAt),
+        source: row.source || json?.sourceMeta?.sourceUrl || json?.sourceMeta?.repository || "",
+        json,
+      };
+    })
+    .filter((row) => row.ticker && row.addedAt)
+    .sort((a, b) => a.ticker.localeCompare(b.ticker) || a.addedAt.localeCompare(b.addedAt));
+}
+
+function activeUniverseTickersForDate(rows = [], date = "") {
+  const target = ymd(date);
+  const active = new Set();
+  for (const row of rows) {
+    if (!row.ticker || !row.addedAt) continue;
+    if (row.addedAt > target) continue;
+    if (row.removedAt && row.removedAt <= target) continue;
+    active.add(row.ticker);
+  }
+  return active;
+}
+
+function universeCoverageSummary(byTicker = new Map(), membershipRows = [], dates = [], mode = "watchlist") {
+  if (mode !== "pit") {
+    const tickers = [...byTicker.keys()].filter((ticker) => !isBenchmarkTicker(ticker));
+    return {
+      schemaVersion: "universe-coverage-v1",
+      mode: "watchlist",
+      totalMembers: tickers.length,
+      membersWithBars: tickers.length,
+      coveragePct: tickers.length ? 100 : null,
+      missingBarsSample: [],
+    };
+  }
+  const start = dates[0] || "0000-00-00";
+  const end = dates.at(-1) || "9999-12-31";
+  const members = new Set();
+  for (const row of membershipRows) {
+    if (!row.ticker) continue;
+    if (row.addedAt > end) continue;
+    if (row.removedAt && row.removedAt <= start) continue;
+    members.add(row.ticker);
+  }
+  const withBars = [...members].filter((ticker) => byTicker.has(ticker));
+  const missing = [...members].filter((ticker) => !byTicker.has(ticker)).sort();
+  return {
+    schemaVersion: "universe-coverage-v1",
+    mode: "pit",
+    totalMembers: members.size,
+    membersWithBars: withBars.length,
+    coveragePct: members.size ? Number(((withBars.length / members.size) * 100).toFixed(2)) : null,
+    missingBarsSample: missing.slice(0, 25),
+  };
+}
+
 function benchmarkBasketForTicker(ticker = "", securityMaster = new Map(), byTicker = new Map()) {
   const row = securityMaster.get(safeTicker(ticker)) || {};
   const sectorEtf = sectorEtfForSecurity(row);
@@ -1155,20 +1223,30 @@ export function runHistoricalWalkForwardFromRows({ bars = [], regimes = [], conf
     maxStepPct: Math.max(0, Math.min(2, Number(config.maxStepPct || 1))),
     pitFundamentalsError: config.pitFundamentalsError || "",
     securityMasterExtError: config.securityMasterExtError || "",
+    universeMode: ["pit", "watchlist"].includes(String(config.universeMode || "watchlist").toLowerCase())
+      ? String(config.universeMode || "watchlist").toLowerCase()
+      : "watchlist",
+    universeMembershipError: config.universeMembershipError || "",
   };
   const strategyHash = hashJson({ engine: "historical-walk-forward-v1", config: runConfig, weights: DEFAULT_WEIGHTS });
   const byTicker = groupBars(bars);
   const securityMaster = securityMasterMap(config.securityMasterExt || []);
   const pitRows = Array.isArray(config.pitFundamentals) ? config.pitFundamentals : [];
+  const universeMembership = normalizeUniverseMembership(config.universeMembership || []);
   const dates = allDatesFromBars(byTicker, runConfig.minLookback).slice(-runConfig.maxDates);
+  const universeCoverage = universeCoverageSummary(byTicker, universeMembership, dates, runConfig.universeMode);
   const spyRows = byTicker.get("SPY") || [];
   const decisions = [];
   const outcomes = [];
   const roundTripCostBps = runConfig.costBps + runConfig.slippageBps;
   for (const signalDate of dates) {
     const scored = [];
+    const activeUniverse = runConfig.universeMode === "pit"
+      ? activeUniverseTickersForDate(universeMembership, signalDate)
+      : null;
     for (const [ticker, rows] of byTicker.entries()) {
       if (isBenchmarkTicker(ticker)) continue;
+      if (activeUniverse && !activeUniverse.has(ticker)) continue;
       const eligibleBars = rows.filter((row) => row.date <= signalDate);
       if (eligibleBars.length < runConfig.minLookback) continue;
       const { factorSnapshot, recommendationScore } = buildFactorSnapshotAsOf({
@@ -1303,10 +1381,15 @@ export function runHistoricalWalkForwardFromRows({ bars = [], regimes = [], conf
     scope: {
       tickers: [...byTicker.keys()].filter((ticker) => !isBenchmarkTicker(ticker)).length,
       benchmarkTickers: [...byTicker.keys()].filter(isBenchmarkTicker).sort(),
+      universeMode: runConfig.universeMode,
+      pointInTimeMembers: universeCoverage.totalMembers,
+      pointInTimeMembersWithBars: universeCoverage.membersWithBars,
+      pointInTimeCoveragePct: universeCoverage.coveragePct,
       dates: dates.length,
       barRows: normalizeHistoricalBars(bars).length,
       regimeRows: regimes.length,
       pitFundamentalRows: pitRows.length,
+      universeMembershipRows: universeMembership.length,
       horizons: runConfig.horizons,
     },
     config: runConfig,
@@ -1341,7 +1424,11 @@ export function runHistoricalWalkForwardFromRows({ bars = [], regimes = [], conf
         qualityGrowth: "not-reconstructable-until-WP6",
         valuationExpectation: "not-reconstructable-until-WP6",
       },
-      universeCaveat: "Universe comes from historical_bars currently present in SQLite; the Tier-1 corpus has survivorship caveats until delisted constituents are added.",
+      universeMode: runConfig.universeMode,
+      universeCoverage,
+      universeCaveat: runConfig.universeMode === "pit"
+        ? "Universe is filtered by point-in-time universe_membership active rows on each signal date; missing bars are disclosed in coverage and excluded from candidates."
+        : "Universe comes from historical_bars currently present in SQLite; the Tier-1 corpus has survivorship caveats until point-in-time mode is used.",
       strategyHash,
       config: runConfig,
       backtestWeightsUsage: "candidate-only",
@@ -1350,7 +1437,9 @@ export function runHistoricalWalkForwardFromRows({ bars = [], regimes = [], conf
       diagnostics: {
         pitFundamentalsError: runConfig.pitFundamentalsError,
         securityMasterExtError: runConfig.securityMasterExtError,
+        universeMembershipError: runConfig.universeMembershipError,
         securityMasterExtRows: securityMaster.size,
+        universeMembershipRows: universeMembership.length,
         sectorBasketStatusCounts,
         missingBenchmark: metrics.missingBenchmark,
       },
@@ -1360,6 +1449,9 @@ export function runHistoricalWalkForwardFromRows({ bars = [], regimes = [], conf
       "Backtest outputs are labeled historical-backtest and must not blend with live recommendation rows.",
       "Benchmark tickers are loaded independently and excluded from the trading universe/cross-section; missing benchmark rows make outcomes unusable instead of treating raw return as excess.",
       "Sector baskets use security_master_ext when present; if a mapped sector ETF has no historical bars, the basket uses available benchmark components only with partial_benchmark disclosure.",
+      runConfig.universeMode === "pit"
+        ? `PIT mode: ${universeCoverage.membersWithBars} of ${universeCoverage.totalMembers} point-in-time members have bars (${universeCoverage.coveragePct ?? "n/a"}%).`
+        : "Watchlist mode: membership filtering is disabled, so headline levels retain current-universe survivorship caveats.",
       roundTripCostBps > 0 ? "Costs/slippage are included in raw and benchmark returns." : "Zero-cost run is labeled frictionless-reference.",
     ],
   };
@@ -1370,20 +1462,63 @@ export async function runHistoricalWalkForwardFromSqlite({ sqlitePath, config = 
   if (!sqlitePath) throw new Error("sqlitePath is required");
   const start = config.startDate ? ymd(config.startDate) : "";
   const end = config.endDate ? ymd(config.endDate) : "";
+  const universeMode = ["pit", "watchlist"].includes(String(config.universeMode || "watchlist").toLowerCase())
+    ? String(config.universeMode || "watchlist").toLowerCase()
+    : "watchlist";
   const where = [
     start ? `date >= '${sqlText(start)}'` : "",
     end ? `date <= '${sqlText(end)}'` : "",
   ].filter(Boolean);
   const limitTickers = Math.max(0, Number(config.maxTickers || 0));
   const benchmarkSqlList = BENCHMARK_TICKERS.map((ticker) => `'${sqlText(ticker)}'`).join(",");
-  const tickerRows = await sqliteJson(
-    sqlitePath,
-    `SELECT DISTINCT ticker FROM historical_bars ${where.length ? `WHERE ${where.join(" AND ")} AND` : "WHERE"} ticker NOT IN (${benchmarkSqlList}) ORDER BY ticker${limitTickers ? ` LIMIT ${limitTickers}` : ""};`,
-    config.sqliteTimeoutMs || 30000,
-  );
+  let universeMembership = [];
+  let universeMembershipError = "";
+  if (universeMode === "pit") {
+    try {
+      const overlapWhere = [
+        end ? `added_at <= '${sqlText(end)}'` : "",
+        start ? `(removed_at IS NULL OR removed_at='' OR removed_at >= '${sqlText(start)}')` : "",
+      ].filter(Boolean);
+      universeMembership = await sqliteJson(
+        sqlitePath,
+        `SELECT ticker,added_at,removed_at,source,json FROM universe_membership ${overlapWhere.length ? `WHERE ${overlapWhere.join(" AND ")}` : ""} ORDER BY ticker,added_at;`,
+        config.sqliteTimeoutMs || 30000,
+      );
+    } catch (error) {
+      universeMembershipError = error.message;
+      universeMembership = [];
+    }
+  }
+  const pitTickerCandidates = universeMode === "pit"
+    ? [...new Set(universeMembership.map((row) => safeTicker(row.ticker)).filter(Boolean))].sort()
+    : [];
+  const limitedPitTickers = limitTickers && pitTickerCandidates.length
+    ? pitTickerCandidates.slice(0, limitTickers)
+    : pitTickerCandidates;
+  let tickerRows = [];
+  if (universeMode === "pit" && !limitedPitTickers.length) {
+    tickerRows = [];
+  } else if (universeMode === "pit") {
+    const pitTickerList = limitedPitTickers.map((ticker) => `'${sqlText(ticker)}'`).join(",");
+    tickerRows = await sqliteJson(
+      sqlitePath,
+      `SELECT DISTINCT ticker FROM historical_bars WHERE ticker IN (${pitTickerList})${where.length ? ` AND ${where.join(" AND ")}` : ""} AND ticker NOT IN (${benchmarkSqlList}) ORDER BY ticker;`,
+      config.sqliteTimeoutMs || 30000,
+    );
+  } else {
+    tickerRows = await sqliteJson(
+      sqlitePath,
+      `SELECT DISTINCT ticker FROM historical_bars ${where.length ? `WHERE ${where.join(" AND ")} AND` : "WHERE"} ticker NOT IN (${benchmarkSqlList}) ORDER BY ticker${limitTickers ? ` LIMIT ${limitTickers}` : ""};`,
+      config.sqliteTimeoutMs || 30000,
+    );
+  }
   const tickers = tickerRows.map((row) => safeTicker(row.ticker)).filter(Boolean);
   if (!tickers.length) {
-    const result = runHistoricalWalkForwardFromRows({ bars: [], regimes: [], config });
+    const result = runHistoricalWalkForwardFromRows({
+      bars: [],
+      regimes: [],
+      config: { ...config, universeMode, universeMembership, universeMembershipError },
+    });
     await applyMetricBridges(result.run, config);
     result.report = buildReport(result.run);
     result.run.persistence = await persistHistoricalBacktestRun(
@@ -1444,7 +1579,16 @@ export async function runHistoricalWalkForwardFromSqlite({ sqlitePath, config = 
   const result = runHistoricalWalkForwardFromRows({
     bars,
     regimes,
-    config: { ...config, pitFundamentals, pitFundamentalsError, securityMasterExt, securityMasterExtError },
+    config: {
+      ...config,
+      universeMode,
+      universeMembership,
+      universeMembershipError,
+      pitFundamentals,
+      pitFundamentalsError,
+      securityMasterExt,
+      securityMasterExtError,
+    },
   });
   await applyMetricBridges(result.run, config);
   result.report = buildReport(result.run);

@@ -1382,6 +1382,23 @@ const historicalWalkForward = runHistoricalWalkForwardFromRows({
     ],
   },
 });
+const historicalPitWalkForward = runHistoricalWalkForwardFromRows({
+  bars: historicalBacktestBars,
+  regimes: [{ date: "2026-01-01", bucket: "宏观顺风", risk_score: 38 }],
+  config: {
+    universeMode: "pit",
+    universeMembership: [
+      { ticker: "AAPL", added_at: "2020-01-01", removed_at: "", source: "fixture" },
+      { ticker: "MSFT", added_at: "2020-01-01", removed_at: "2026-02-01", source: "fixture" },
+      { ticker: "TSLA", added_at: "2027-01-01", removed_at: "", source: "fixture" },
+    ],
+    minLookback: 20,
+    maxDates: 4,
+    topN: 2,
+    horizons: [1],
+    primaryHorizon: 1,
+  },
+});
 const handComputedDrawdown = historicalMaxDrawdownFromReturns([10, -5, -5, 2, 4, -1, 3, -2, 1, 1]);
 assertApprox(
   handComputedDrawdown.pct,
@@ -1391,6 +1408,25 @@ assertApprox(
 );
 assert.equal(historicalWalkForward.run.status, "ok", "Historical walk-forward fixture should produce a runnable backtest");
 assert.ok(historicalWalkForward.run.decisions.length > 0, "Historical walk-forward should freeze pseudo-decisions");
+assert.equal(
+  historicalPitWalkForward.run.provenance.universeMode,
+  "pit",
+  "PIT walk-forward should stamp universe mode in provenance",
+);
+assert.ok(
+  historicalPitWalkForward.run.decisions.length > 0 && historicalPitWalkForward.run.decisions.every((item) => item.ticker === "AAPL"),
+  "PIT walk-forward should only score tickers active in universe_membership on the signal date",
+);
+assert.equal(
+  historicalPitWalkForward.run.scope.pointInTimeMembers,
+  1,
+  "PIT coverage should count only membership rows overlapping the tested signal window",
+);
+assert.equal(
+  historicalPitWalkForward.run.scope.pointInTimeMembersWithBars,
+  1,
+  "PIT coverage should report members with available historical bars",
+);
 assert.ok(
   historicalWalkForward.run.decisions.some((item) => item.sectorBasketStatus === "sector_mapping_ok" && item.benchmarkBasket.some((basket) => basket.ticker === "XLK")),
   "Historical walk-forward should use security_master_ext sector ETF baskets when sector bars exist",

@@ -2114,3 +2114,79 @@ pass
 Contradictions / deferred live checks:
 
 - I did not start the production server solely to force the startup migration against the live store in this heartbeat. The migration logic is covered by the dual-active fixture; live proof will occur on the next normal server restart if the current store still contains dual-active rows.
+
+---
+
+## WP29 — Point-in-time universe corpus — 2026-07-09
+
+What changed:
+
+- Added `scripts/build_universe_membership.py`.
+  - Primary source: `fja05680/sp500` `sp500_ticker_start_end.csv`.
+  - License check: the script fetches the upstream `LICENSE` and requires MIT before using the GitHub source.
+  - Fallback: Wikipedia S&P 500 current table, labeled as lower-quality current-constituent fallback.
+  - Tables: `universe_membership(ticker, added_at, removed_at, source, json)` and `universe_coverage_status(ticker, status, source, last_attempt_at, json)`.
+  - Optional `--backfill-bars` delegates to the existing Longbridge-first `scripts/build_historical_bars.py`; unfetched members remain `bars_unavailable`, never silently dropped.
+- Added `universeMode:"pit" | "watchlist"` to the historical walk-forward engine.
+  - PIT mode reads active membership on each signal date.
+  - Candidate scoring excludes benchmark tickers and filters to active PIT members with available bars.
+  - Reports now include `universeMode`, PIT membership count, members-with-bars count, coverage percent, and a missing-bars sample.
+- Added a regression fixture proving PIT mode filters out already-removed and future-added tickers.
+- Recorded the D17 evidence note in the capability-gap decision record.
+
+Files/functions:
+
+- `scripts/build_universe_membership.py`: membership import, MIT source validation, coverage status, optional member-bar backfill.
+- `server/historical_backtest.mjs`: `normalizeUniverseMembership`, `activeUniverseTickersForDate`, `universeCoverageSummary`, PIT filtering in `runHistoricalWalkForwardFromRows`, SQLite membership loading in `runHistoricalWalkForwardFromSqlite`.
+- `scripts/core_regression_tests.mjs`: PIT universe fixture.
+
+Verification:
+
+```text
+$ node --check server/historical_backtest.mjs && node --check scripts/core_regression_tests.mjs
+pass
+
+$ python3 -m py_compile scripts/build_universe_membership.py scripts/build_historical_bars.py
+pass
+
+$ node scripts/core_regression_tests.mjs
+core_regression_tests: ok
+```
+
+Membership smoke:
+
+```text
+$ python3 scripts/build_universe_membership.py --db /tmp/mp_universe.sqlite --source fja05680 --start 20190101 --end 20260709 --limit-tickers 8 --fetch-timeout 30
+{"status":"ok","source":{"repository":"fja05680/sp500","license":"MIT","sourceRows":667,"eventMatchPct":100},"membershipRows":8,"uniqueTickers":8,"insertedOrReplaced":8,"coverage":{"not_checked":8}}
+
+$ sqlite3 -json /tmp/mp_universe.sqlite "SELECT COUNT(*) AS n, MIN(added_at) AS min_added, MAX(COALESCE(removed_at,'')) AS max_removed FROM universe_membership; SELECT status, COUNT(*) AS n FROM universe_coverage_status GROUP BY status ORDER BY status;"
+[{"n":8,"min_added":"1996-01-02","max_removed":"2024-09-23"}]
+[{"status":"not_checked","n":8}]
+```
+
+Live SQLite PIT smoke:
+
+```text
+$ python3 scripts/build_universe_membership.py --db data/market_pulse.sqlite --source fja05680 --start 20190101 --end 20260709 --fetch-timeout 30
+{"status":"ok","sourceRows":667,"membershipRows":667,"uniqueTickers":665,"coverage":{"bars_available":19,"not_checked":646}}
+
+$ node --input-type=module <runHistoricalWalkForwardFromSqlite universeMode=pit, 2025-01-01..2026-07-02, maxDates=5>
+status=ok
+universeMode=pit
+pointInTimeMembers=503
+pointInTimeMembersWithBars=19
+pointInTimeCoveragePct=3.78
+decisions=25
+outcomes=30
+sampleCount=5
+T+5 avgExcessPct=-14.7606, n=5
+T+5 hitRate=0, n=5
+missingBenchmark=0, n=5
+momentum rankIC=-0.2809, n=30, effectiveN=25
+persisted=true
+```
+
+Contradictions / deferred live checks:
+
+- No contradiction in the implementation path.
+- The PIT evidence rerun is intentionally labeled low-coverage: only 19 of 503 point-in-time members in the tested window currently have bars. This validates the machinery and proves the survivorship-bias disclosure, but it is not enough for final factor calibration. Full D17 judgement requires running `scripts/build_universe_membership.py --backfill-bars` or otherwise populating historical bars for the PIT member set.

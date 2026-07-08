@@ -357,7 +357,7 @@ Facts (F14): two versions are simultaneously `status:"active", active:true` beca
 - Enforce exactly one active per `strategyType`: inserting an active sets the previous active's `activeTo`, `status:"superseded"`, and appends `stateHistory`. Startup migration repairs existing dual-active rows (newest stays active; older → superseded + `strategy_version.migrated` audit event). Regression fixture: upserting two actives leaves exactly one.
 - **Verify**: after migration, `/api/strategy-versions` shows one active; agent decisions stamp that version id; fixture green.
 
-## WP29 — Point-in-time universe corpus (P0 for evidence trust — kills survivorship bias)
+## ☑ WP29 — Point-in-time universe corpus (P0 for evidence trust — kills survivorship bias)
 
 The single biggest discount on every backtest number so far: the 45-ticker corpus is *today's watchlist* — stocks that already won. All excess metrics are upper bounds; the rankIC conclusions (including the momentum-reversal rationale behind the two-sleeve design) inherit the bias.
 
