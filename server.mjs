@@ -56,6 +56,7 @@ import {
   applyAllStockAgentShadowGates,
 } from "./server/all_stock/debate_gate.mjs";
 import { intradayWatcherConfigFromEnv, runIntradayWatcherOnce } from "./server/intraday_watcher.mjs";
+import { buildGoLiveLearningStatus, buildLlmKnowledgeScorecard } from "./server/loop_trust.mjs";
 import {
   addFactorCandidate,
   appendFactorPostmortem,
@@ -121,7 +122,7 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const ENV_FILE = path.join(__dirname, ".env");
 loadEnvFile(ENV_FILE);
 
-const DATA_DIR = path.join(__dirname, "data");
+const DATA_DIR = path.resolve(__dirname, process.env.DATA_DIR || "data");
 const PUBLIC_DIR = path.join(__dirname, "public");
 const DB_FILE = path.join(DATA_DIR, "store.json");
 const SERVER_LOCK_FILE = path.join(DATA_DIR, "server.lock");
@@ -22748,7 +22749,11 @@ function buildAllStockAgentEvaluation(run = {}, tickerPoolItem = {}, state = {},
   const gates = [...configuredGates];
   if (debateGate && !gates.some((item) => item.id === debateGate.id)) gates.push(debateGate);
   const shadowGates = gates.filter((item) => /^shadow_/.test(item.action || ""));
+  const shadowGatesWithoutLlm = debateGate
+    ? shadowGates.filter((item) => item.id !== debateGate.id)
+    : shadowGates;
   const gateActions = new Set(gates.map((item) => item.action));
+  const configuredGateActions = new Set(configuredGates.map((item) => item.action));
   const hasAgentPosition = Boolean(ctx.activePosition);
   const hasRealPosition = Boolean(ctx.position);
   const hasPosition = hasAgentPosition || hasRealPosition;
@@ -22780,10 +22785,40 @@ function buildAllStockAgentEvaluation(run = {}, tickerPoolItem = {}, state = {},
   const sellThreshold = numberOrNull(skill.settings?.sellThreshold) ?? 58;
   const allowAddToExisting = Boolean(skill.settings?.allowAddToExisting);
   const vetoBuy = gateActions.has("veto_buy") || gateActions.has("cap_buy");
+  const mechanicalVetoBuy = configuredGateActions.has("veto_buy") || configuredGateActions.has("cap_buy");
+  const mechanicalAdjustedBuy = applyAllStockAgentShadowGates(buy.score, shadowGatesWithoutLlm, buyThreshold);
+  const mechanicalBuyEligible = mechanicalAdjustedBuy.score >= buyThreshold && !mechanicalVetoBuy && (allowAddToExisting || !hasPosition);
   const adjustedBuy = applyAllStockAgentShadowGates(buy.score, shadowGates, buyThreshold);
   const buyEligible = adjustedBuy.score >= buyThreshold && !vetoBuy && (allowAddToExisting || !hasPosition);
   const sellEligible = hasPosition && sell.score >= sellThreshold;
   const sourceRunAgeHours = allStockAgentSourceRunAgeHours(run);
+  const llmCounterfactuals = debateGate
+    ? [{
+        schemaVersion: "llm-channel-counterfactual-v1",
+        channel: "agent-debate-shadow-gate",
+        source: ctx.agentDebate?.source || ctx.agentDebate?.provider || "agent-debate",
+        ticker,
+        gateId: debateGate.id,
+        gateAction: debateGate.action,
+        finalDecision: ctx.agentDebate?.finalDecision || null,
+        mechanicalWithoutLlm: {
+          buyScore: mechanicalAdjustedBuy.score,
+          rawBuyScore: buy.score,
+          buyEligible: mechanicalBuyEligible,
+          vetoBuy: mechanicalVetoBuy,
+          shadowPenalties: mechanicalAdjustedBuy.penalties || [],
+        },
+        withLlmApplied: {
+          buyScore: adjustedBuy.score,
+          rawBuyScore: buy.score,
+          buyEligible,
+          vetoBuy,
+          shadowPenalties: adjustedBuy.penalties || [],
+        },
+        scoreDelta: adjustedBuy.score - mechanicalAdjustedBuy.score,
+        note: "LLM debate is measured as a shadow knowledge channel; it does not write factor scores, weights, hard gates, or skill JSON.",
+      }]
+    : [];
   const evaluation = {
     schemaVersion: "all-stock-agent-evaluation-v1",
     ticker,
@@ -22817,6 +22852,7 @@ function buildAllStockAgentEvaluation(run = {}, tickerPoolItem = {}, state = {},
     rawBuyScore: buy.score,
     trackingEligible: buyEligible,
     shadowPenalties: adjustedBuy.penalties,
+    llmCounterfactuals,
     sellScore: sell.score,
     confidence,
     buyEligible,
@@ -22909,6 +22945,7 @@ function allStockAgentDecisionFromEvaluation(evaluation, action, runId, trigger)
       modelProvider: "",
       schemaValidationStatus: "deterministic_record",
     },
+    llmCounterfactuals: evaluation.llmCounterfactuals || [],
     matchedFactors: evaluation.matchedFactors || [],
     confidence: evaluation.confidence,
     advisorAction: evaluation.advisorAction,
@@ -24857,6 +24894,47 @@ function buildStrategyValidationPayload(db = {}) {
       candidateCount: candidates.length,
       rule: "候选权重只在 walk-forward 同时不弱于 active 的超额收益与 MaxDD 后才可人工采纳；validate 只写 validationRecords，promote 才能切 active。",
     },
+  };
+}
+
+function learningLoopSwitchesForClient() {
+  return [
+    {
+      key: "INTRADAY_WATCHER_ENABLED",
+      label: "盘中 watcher",
+      enabled: INTRADAY_WATCHER_CONFIG.enabled,
+      detail: `interval=${INTRADAY_WATCHER_CONFIG.intervalMs || 0}ms`,
+    },
+    {
+      key: "PUSH_PROVIDER/PUSH_TARGET",
+      label: "推送 provider/target",
+      enabled: Boolean(process.env.PUSH_PROVIDER && process.env.PUSH_TARGET),
+      configured: Boolean(process.env.PUSH_PROVIDER && process.env.PUSH_TARGET),
+      detail: process.env.PUSH_PROVIDER ? `provider=${process.env.PUSH_PROVIDER}` : "未配置 PUSH_PROVIDER/PUSH_TARGET",
+    },
+    {
+      key: "AGENT_DEBATE_DAILY_ENABLED",
+      label: "每日 shadow debate",
+      enabled: AGENT_DEBATE_DAILY_ENABLED,
+      detail: `${AGENT_DEBATE_DAILY_NEW_YORK_TIME} ET · topN=${AGENT_DEBATE_DAILY_TOP_N}`,
+    },
+    {
+      key: "FACTOR_RESEARCHER_ENABLED",
+      label: "因子研究员",
+      enabled: FACTOR_RESEARCHER_ENABLED,
+      detail: `${FACTOR_RESEARCHER_NEW_YORK_TIME} ET · invoker=${normalizeHarnessInvoker(FACTOR_RESEARCHER_INVOKER)}`,
+    },
+  ];
+}
+
+function learningLoopStatusForClient(db = {}) {
+  const llmScorecard = buildLlmKnowledgeScorecard(db);
+  return {
+    llmKnowledgeScorecard: llmScorecard,
+    goLiveStatus: buildGoLiveLearningStatus(db, {
+      llmScorecard,
+      switches: learningLoopSwitchesForClient(),
+    }),
   };
 }
 
@@ -38626,6 +38704,7 @@ function configForClient(db) {
       scheduleLlmStageTimeoutMs: SCHEDULE_LLM_STAGE_TIMEOUT_MS,
       staleAgentSourceMaxHours: AGENT_MAX_SOURCE_AGE_HOURS,
     },
+    learningLoop: learningLoopStatusForClient(db),
   };
 }
 
@@ -39484,6 +39563,11 @@ async function handleApi(req, res, url) {
       active: activeStrategyVersion(state.strategyVersions) || state.runs?.[0]?.skill?.strategyVersion || null,
       rollbackAvailable: Boolean(state.strategyVersionRollbackStack?.length),
     });
+  }
+
+  if (req.method === "GET" && url.pathname === "/api/learning-loop/status") {
+    const db = await ensureStore();
+    return sendJson(res, { learningLoop: learningLoopStatusForClient(db) });
   }
 
   if ((req.method === "GET" || req.method === "POST") && url.pathname === "/api/strategy-versions/validate") {

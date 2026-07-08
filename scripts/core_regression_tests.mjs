@@ -77,6 +77,7 @@ import {
   registerCatchUpAttempt,
   scheduledCollectionRuntime,
 } from "../server/scheduler_guard.mjs";
+import { buildGoLiveLearningStatus, buildLlmKnowledgeScorecard } from "../server/loop_trust.mjs";
 
 function assertApprox(actual, expected, tolerance, message) {
   assert.ok(Math.abs(actual - expected) <= tolerance, `${message}: expected ${expected}, got ${actual}`);
@@ -1067,6 +1068,46 @@ assert.equal(activeStrategyVersion(promoted.rows).id, candidateStrategy.id, "Pro
 const rolledBack = rollbackStrategyVersions(promoted.rows, [{ id: "rollback-1", snapshot: beforePromotionSnapshot }]);
 assert.equal(rolledBack.ok, true, "Rollback fixture should restore previous snapshot");
 assert.deepEqual(rolledBack.rows, beforePromotionSnapshot, "Rollback must restore strategy versions byte-equivalent after normalization");
+
+const trustLoopDb = {
+  allStockAgent: {
+    decisions: [
+      {
+        id: "decision-llm",
+        ticker: "NVDA",
+        llmCounterfactuals: [{
+          channel: "agent-debate-shadow-gate",
+          mechanicalWithoutLlm: { buyScore: 68, buyEligible: true },
+          withLlmApplied: { buyScore: 60, buyEligible: false },
+        }],
+      },
+      { id: "decision-control", ticker: "MSFT" },
+    ],
+    outcomeSnapshots: [
+      { decisionId: "decision-llm", outcome: "loss", excessPct: -2, outcomeUsable: true, evaluatedAt: "2026-07-08T00:00:00.000Z" },
+      { decisionId: "decision-control", outcome: "win", excessPct: 3, outcomeUsable: true, evaluatedAt: "2026-07-08T00:00:00.000Z" },
+    ],
+    shadowDebates: [{ id: "debate-1", generatedAt: "2026-07-08T00:00:00.000Z" }],
+  },
+  factorRegistry: { factors: [{ factorId: "llmIdea", createdBy: "llm:factor_researcher", createdAt: "2026-07-08T00:00:00.000Z" }] },
+};
+const llmScorecard = buildLlmKnowledgeScorecard(trustLoopDb, { minSamples: 20, generatedAt: "2026-07-09T00:00:00.000Z" });
+assert.equal(llmScorecard.status, "insufficient_evidence", "LLM knowledge channel must honestly report insufficient evidence below n=20");
+assert.equal(llmScorecard.withLlm.avgExcessPct.n, 1, "LLM scorecard metrics must carry sample counts");
+assert.equal(llmScorecard.withoutLlm.hitRate.n, 1, "LLM control metrics must carry sample counts");
+const goLiveStatus = buildGoLiveLearningStatus(trustLoopDb, {
+  llmScorecard,
+  switches: [
+    { key: "INTRADAY_WATCHER_ENABLED", enabled: false },
+    { key: "AGENT_DEBATE_DAILY_ENABLED", enabled: true },
+  ],
+  now: new Date("2026-07-09T00:00:00.000Z"),
+});
+assert.equal(goLiveStatus.switches.find((item) => item.key === "INTRADAY_WATCHER_ENABLED")?.status, "off", "Go-live status should surface disabled learning switches");
+assert.ok(
+  goLiveStatus.channels.every((item) => Number.isFinite(item.samples) && Number.isFinite(item.minSamples)),
+  "Go-live learning channels must carry sample counts and min-sample gates",
+);
 
 const splitPayload = buildRegimeSplitEvaluationPayload({
   liveOutcomes: [

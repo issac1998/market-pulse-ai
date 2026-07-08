@@ -2190,3 +2190,76 @@ Contradictions / deferred live checks:
 
 - No contradiction in the implementation path.
 - The PIT evidence rerun is intentionally labeled low-coverage: only 19 of 503 point-in-time members in the tested window currently have bars. This validates the machinery and proves the survivorship-bias disclosure, but it is not enough for final factor calibration. Full D17 judgement requires running `scripts/build_universe_membership.py --backfill-bars` or otherwise populating historical bars for the PIT member set.
+
+---
+
+## WP30 — Trust the loop: promotion drill, LLM scorecard, go-live status — 2026-07-09
+
+What changed:
+
+- Added `DATA_DIR` env override for `server.mjs`, defaulting to the existing repo `data/` path. This enables isolated second-server drills without touching production `data/store.json`.
+- Added `scripts/strategy_promotion_drill.mjs`.
+  - Copies the production store into a temporary `DATA_DIR`.
+  - Injects a non-production candidate version with a `source:"drill"` passed validation record.
+  - Starts a second local server on a test port.
+  - Calls the real `/api/strategy-versions/promote` and `/api/strategy-versions/rollback` endpoints.
+  - Verifies active weight hash changes after promote and returns byte-equivalent hash after rollback.
+- Added `server/loop_trust.mjs`.
+  - `buildLlmKnowledgeScorecard()` aggregates LLM shadow/cap/knowledge applications with sample-counted outcome metrics and reports `insufficient_evidence` below `n=20`.
+  - `buildGoLiveLearningStatus()` lists learning-critical switches and per-channel sample clocks / days-to-min-samples.
+- Added counterfactual snapshots on agent-debate shadow gates.
+  - Each affected evaluation/decision records `mechanicalWithoutLlm` versus `withLlmApplied`.
+  - The record is measurement-only and preserves `llmWritesScores:false`, `llmWritesGates:false`, `llmWritesWeights:false`.
+- Added `/api/learning-loop/status` and included the same payload in `config.learningLoop`.
+- Added a configuration-page learning-loop card with disabled switches, sample clocks, and LLM scorecard status.
+
+Files/functions:
+
+- `server.mjs`: `DATA_DIR` env override, `learningLoopStatusForClient`, `/api/learning-loop/status`, LLM counterfactuals on debate shadow gates.
+- `server/loop_trust.mjs`: scorecard and go-live status pure functions.
+- `scripts/strategy_promotion_drill.mjs`: isolated second-server drill runner.
+- `public/app.js`: `renderLearningLoopStatus`.
+- `scripts/core_regression_tests.mjs`: LLM scorecard and go-live status fixtures.
+- `docs/CODEBASE_ROUTE_INVENTORY.md`: route inventory regenerated; routes 81 → 82.
+
+Verification:
+
+```text
+$ node --check server.mjs && node --check public/app.js && node --check server/loop_trust.mjs && node --check scripts/strategy_promotion_drill.mjs && node --check scripts/core_regression_tests.mjs
+pass
+
+$ python3 -m py_compile scripts/*.py harness/invoker/*.py harness/tools/*.py harness/tests/*.py
+pass
+
+$ node scripts/core_regression_tests.mjs
+core_regression_tests: ok
+
+$ node scripts/generate_route_inventory.mjs && node scripts/generate_route_inventory.mjs --check && git diff --check
+{"status":"ok","routes":82,"uiFetches":43,"storeKeys":27}
+{"status":"ok","routes":82,"uiFetches":43,"storeKeys":27}
+```
+
+Promotion drill:
+
+```text
+$ node scripts/strategy_promotion_drill.mjs --port 5867
+{
+  "status": "ok",
+  "candidateId": "drill-candidate-151dd0859a",
+  "activeBefore": "all-stock-e07073aab308",
+  "activeAfterPromote": "drill-candidate-151dd0859a",
+  "activeAfterRollback": "all-stock-e07073aab308",
+  "weightHashes": {
+    "before": "7fc56732f6514ab480f1fed97b55e0e6356d3fcafb552b95a2f380f54a8914eb",
+    "promoted": "e7fc799b2d6e31da8b7288a026bd81a32e76f2a208a1895cdc86f8cd2a176d89",
+    "rollback": "7fc56732f6514ab480f1fed97b55e0e6356d3fcafb552b95a2f380f54a8914eb"
+  },
+  "rollbackAvailableAfterPromote": true,
+  "note": "Drill uses a temporary DATA_DIR and never writes production store.json."
+}
+```
+
+Contradictions / deferred live checks:
+
+- No contradiction. The second-server drill ran against a temporary `DATA_DIR` and did not merge drill artifacts into production.
+- The LLM scorecard will remain `insufficient_evidence` until real LLM-counterfactual decisions mature to the `n=20` gate.

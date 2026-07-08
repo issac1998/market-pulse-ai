@@ -367,7 +367,7 @@ The single biggest discount on every backtest number so far: the 45-ticker corpu
 - **29d — re-judge the evidence.** Re-run factor rankIC + horizon metrics under PIT mode; record the outcome as Decision **D17** in CAPABILITY_GAPS §9, explicitly re-evaluating the two-sleeve (short-horizon reversal) rationale. If momentum rankIC flips sign, flag the two-sleeve plan for revision — evidence and judgement only, no scoring-semantics change in this WP.
 - **Verify**: membership spans 2019–2026 and matches the source's change events ≥95%; PIT report shows coverage + mode; D17 recorded with numbers.
 
-## WP30 — Trust the loop: promotion drill, LLM scorecard, go-live status (P1)
+## ☑ WP30 — Trust the loop: promotion drill, LLM scorecard, go-live status (P1)
 
 - **30a — promotion fire-drill (sandboxed).** Copy the store; run a second server instance on a test port against the copy; take a real candidate version, attach a drill validation record (`source:"drill"`, clearly non-production), promote, verify active weights actually change agent scoring output, rollback, verify byte-identical restoration. Log everything in the execution doc. Production store untouched; drill artifacts never merged back. Closes the "promotion path has never actually run" gap (F16 / deferred WP8 gate).
 - **30b — LLM knowledge-channel scorecard.** Every LLM-sourced veto/cap/knowledge application records a counterfactual snapshot (the mechanical decision absent the LLM input). As outcomes mature, a report cell aggregates: n, avg excess with vs. without, hit-rate delta; below n=20 it prints "insufficient evidence" (honestly). Measurement only — no behavior change. This decides whether the LLM channel earns its latency and cost.

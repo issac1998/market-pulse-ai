@@ -7349,6 +7349,46 @@ function renderIntegrationReadiness(config = {}) {
   </div>`;
 }
 
+function renderLearningLoopStatus(config = {}) {
+  const loop = config.learningLoop || {};
+  const status = loop.goLiveStatus || {};
+  const scorecard = loop.llmKnowledgeScorecard || {};
+  const switches = Array.isArray(status.switches) ? status.switches : [];
+  const channels = Array.isArray(status.channels) ? status.channels : [];
+  if (!switches.length && !channels.length) return "";
+  const offCount = switches.filter((item) => item.status === "off").length;
+  const switchRows = switches
+    .map((item) => `<div class="diagnostic-row">
+      <div>
+        <strong>${escapeHtml(item.label || item.key)}</strong>
+        <p class="muted">${escapeHtml(item.detail || item.key || "")}</p>
+      </div>
+      <span class="tag ${item.status === "on" ? "green" : "amber"}">${escapeHtml(item.status === "on" ? "已启用" : "未启用")}</span>
+    </div>`)
+    .join("");
+  const channelRows = channels
+    .map((item) => `<div class="diagnostic-row">
+      <div>
+        <strong>${escapeHtml(item.label || item.id)}</strong>
+        <p class="muted">${escapeHtml(item.source || "")}</p>
+      </div>
+      <span class="tag ${item.status === "ready" ? "green" : item.status === "accruing" ? "amber" : "red"}">${escapeHtml(item.samples)}/${escapeHtml(item.minSamples)} · ${escapeHtml(item.daysToMinSamples === null ? "无速率" : `${item.daysToMinSamples}天`)}</span>
+    </div>`)
+    .join("");
+  return `<div class="quality-section">
+    <div class="quality-row">
+      <div>
+        <h3>学习闭环上线状态</h3>
+        <p class="muted">${escapeHtml(status.summary || "学习通道状态未生成。")}</p>
+      </div>
+      <span class="tag ${offCount ? "amber" : "green"}">${escapeHtml(offCount)} 个关键开关关闭</span>
+    </div>
+    ${switchRows}
+    ${channelRows ? `<h3>样本时钟</h3>${channelRows}` : ""}
+    <p class="${scorecard.status === "ready" ? "muted" : "quality-error"}">LLM 知识通道：${escapeHtml(scorecard.status === "ready" ? "证据可读" : "样本不足")}；应用 ${escapeHtml(scorecard.applicationCount || 0)} 次，成熟 outcome ${escapeHtml(scorecard.maturedApplicationCount || 0)}/${escapeHtml(scorecard.minSamples || 20)}。</p>
+  </div>`;
+}
+
 function diagnosticMapByKey(diagnostics = null) {
   return new Map((diagnostics?.rows || []).map((row) => [row.key, row]));
 }
@@ -7940,10 +7980,11 @@ function renderProviders(providers, dataQuality, providerDetails = {}, sourceCon
   const customFeedsBlock = renderCustomSocialFeeds(customSocialFeeds);
   const llmRoutingBlock = renderLlmRouting(llmRouting);
   const integrationReadinessBlock = renderIntegrationReadiness(fullConfig);
+  const learningLoopBlock = renderLearningLoopStatus(fullConfig);
   const setupLinksBlock = setupLinkCards(fullConfig, sourceDiagnostics);
   const setupChecklistBlock = renderSetupChecklist(fullConfig, dataQuality, sourceDiagnostics);
   const storageHealthBlock = renderStorageHealth(fullConfig.storage);
-  els.providerBox.innerHTML = `${integrationReadinessBlock}${setupLinksBlock}${setupChecklistBlock}${storageHealthBlock}${providerRows}${readinessBlock}${llmRoutingBlock}${sourceControlsBlock}${customFeedsBlock}${
+  els.providerBox.innerHTML = `${integrationReadinessBlock}${learningLoopBlock}${setupLinksBlock}${setupChecklistBlock}${storageHealthBlock}${providerRows}${readinessBlock}${llmRoutingBlock}${sourceControlsBlock}${customFeedsBlock}${
     diagnostics
   }${
     actions ? `<div class="quality-section"><h3>需要处理</h3>${actions}</div>` : ""
