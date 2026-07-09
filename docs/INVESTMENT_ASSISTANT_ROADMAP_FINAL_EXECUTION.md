@@ -2385,3 +2385,110 @@ Contradictions / deferred live checks:
 - No implementation contradiction.
 - Longbridge CLI execution endpoint is reachable, but the current account returned zero executions for the tested history window. Therefore duplicate handling and empty-ledger behavior were verified, but no real fill could be hand-checked against broker records in this run.
 - Post-session trade sync and weekly Trader Profile refresh are implemented but disabled by default via `LONG_BRIDGE_TRADE_SYNC_AUTO_ENABLED=false` and `TRADER_PROFILE_WEEKLY_REFRESH_ENABLED=false` to satisfy the background-task ground rule. Manual sync/refresh is available immediately.
+
+---
+
+## External Review (Claude) — Rounds 6–7 (WP26–WP31) — 2026-07-09
+
+Reviewed against the Round 6/7 specs. **Code-level review: all six WPs PASS.** Live validation was interrupted by an environment incident (F18, below) that took the machine's filesystem hostage mid-review — the deferred live checks remain open through no fault of the implementation.
+
+### Code verdicts (verified in source before/despite the incident)
+
+| WP | Verdict | Key evidence |
+|---|---|---|
+| WP26 memory/crash | **PASS (code)** | `ensureStore()` returns the shared store object (no clone, `server.mjs:3911`); `saveStore` aliases `storeCache = db` (`:4038`); `archiveRuns` uses `runArchiveDirtyIds` dirty tracking — no stringify-to-discover-cleanliness; heap telemetry + `server.heap_pressure` alert; `data/server.lock` + `server.crash_detected`; F17 hotfix absorbed via `server/scheduler_guard.mjs` (`scheduledCollectionRuntime()` — regression-covered); catch-up capped at `SCHEDULE_CATCH_UP_MAX_ATTEMPTS=2` per key/day with blocked alert |
+| WP27 benchmark integrity | **PASS (code)** | Frozen `BENCHMARK_TICKERS` export; dedicated benchmark-bar SQL query unaffected by `maxTickers`; `excess = Number.isFinite(raw) && Number.isFinite(benchmarkPct) ? raw − benchmarkPct : null` (`historical_backtest.mjs:1311`) — raw-as-excess is dead; `benchmarkStatus:"missing_benchmark"` → `outcomeUsable:false`; `missingBenchmark {count,n}` in metrics; Codex's capped smoke shows 9/9 non-null benchmarks with benchmark tickers excluded from decisions |
+| WP28 single-active | **PASS (code)** | `repairStrategyVersionActiveInvariant()` keeps newest active, supersedes others with `activeTo`/`supersededByVersionId`/`stateHistory`; enforced by default inside `normalizeStrategyVersions()` so every path (upsert/promote/rollback/display) shares the rule; startup migration + `strategy_version.migrated` audit wired at `ensureStore` |
+| WP29 PIT universe | **PASS (code + partial data)** | `build_universe_membership.py` verifies upstream MIT license before use; live SQLite has **667 membership rows / 665 tickers** (verified today); `universeMode:"pit"` filters candidates to date-active members; coverage summary + missing-bars disclosure in reports; PIT fixture in regression suite. **Honest low-coverage caveat stands**: only 19/503 PIT members have bars — D17 judgement blocked until `--backfill-bars` runs |
+| WP30 drill/scorecard/status | **PASS — and the drill actually ran** | `strategy_promotion_drill.mjs` executed against an isolated `DATA_DIR` on port 5867: real `/api/strategy-versions/promote` + `rollback`, weight-hash before == rollback hash (byte-identical restoration proven). **This closes the WP8 review gate deferred since Round 1.** Verified today: zero `drill-candidate` artifacts in production store. `loop_trust.mjs` scorecard honestly reports `insufficient_evidence` below n=20; counterfactual records preserve `llmWritesScores/Gates/Weights:false` |
+| WP31 Trader Mirror | **PASS (code)** | `lib/trader_profile.mjs` (23 KB): every metric cell `{value,n,status}` with `insufficient_data` gates; rule-based style tags; `buildTraderSystemOverlap`; Longbridge sync via existing `sanitizeTrade`/`mergeTrades` with watermark; `trader_profile_snapshots` SQLite table present; empty-ledger CTA instead of fake zeros; LLM narrator opt-in (`TRADER_MIRROR_LLM_ENABLED=false`), narrative-only. Codex's live check: account returned zero executions in the tested window — real-fill hand-check deferred until fills exist |
+
+### F18 (CRITICAL, environment — not a code defect) — iCloud eviction incident took the system down mid-review
+
+- The repo lives on the iCloud-synced Desktop; the disk hit ~95% full; macOS "Optimize Mac Storage" **evicted cold files to iCloud** (`dataless` flag). This network's iCloud data plane is blocked (metadata syncs; bulk downloads never complete — same class as the FRED/EastMoney blocks), so evicted files are locally unreadable (`ETIMEDOUT` on read).
+- Blast radius at review time: **5,363 evicted files and growing** (114 inside `.git` including `HEAD`/`config` → git history unusable; 95/554 git objects; five `server/*.mjs` modules + `strategies/us_stock_strategies.json` + `data/company_tickers.json`) — **the server cannot boot** (module import ETIMEDOUT), and `core_regression_tests.mjs` now fails the same way (they passed for Codex at 06:43 — eviction progressed within hours).
+- Recovery attempted: `brctl download` (queued, never materializes), Documents working copy (older snapshot, also dataless), APFS local snapshots (none), git blobs via index parse (all 7 needed blobs evicted). Restored `server/cli_process.mjs` from exact content read earlier in this session. The other five modules were never read into a session and cannot be reconstructed locally.
+- **Owner actions required (in order)**: (1) restore iCloud data connectivity — most likely the proxy/network: allow Apple/iCloud domains to bypass the proxy, or temporarily use a network where iCloud works; then `brctl download .` (or just open the folder in Finder) re-materializes everything; (2) free disk space (the disk-full pressure is the eviction trigger; candidates: `data/store.backup-summary-format-*.json` 97 MB, old caches) and/or disable "Optimize Mac Storage"; (3) **move the repo out of the iCloud-synced Desktop** (e.g. `~/code/market-pulse-ai`) — a git repo + SQLite (with `-wal`) + a long-running server under iCloud sync is an integrity hazard; the `.git/index 2` sync-conflict artifact is the warning shot. Commit to a remote (GitHub private) so file history stops depending on one Mac.
+
+### Live validations still open (re-run after F18 recovery)
+
+1. Full collection under `--max-old-space-size=2048` with default retention (WP26 verify; drop the interim env flags).
+2. `kill -9` → restart → `server.crash_detected` alert (WP26c).
+3. Startup dual-active migration audit against the live store (WP28; fixture-proven).
+4. WP29 `--backfill-bars` for the 646 unchecked PIT members → full-corpus PIT walk-forward → **D17 judgement** (the two-sleeve re-check).
+5. WP27 full-corpus evidence rerun (headline numbers must not be trusted until then).
+6. WP31 real-fill hand-check once the Longbridge account has executions in the sync window.
+
+### F18 recovery addendum — 2026-07-09 (late) — system restored without iCloud
+
+- **All six evicted first-party files were recovered byte-perfectly** from the Codex CLI session logs (`~/.codex/sessions/2026/06/02/rollout-*.jsonl` — outside iCloud): parsed the `apply_patch` Add/Update records, reconstructed `runtime_utils.mjs` by replaying its two updates over the base, and **verified every recovered file against the git blob SHA recorded in `.git/index`** (index itself was readable). All matched: `text_utils` 380db6b3, `env_utils` 135e29f7, `runtime_utils` ab46d031, `process_errors` 32c87117, `all_stock/debate_gate` 9ebef448, `strategies/us_stock_strategies.json` 3a4967e1. The reviewer's earlier from-context `cli_process.mjs` restoration also matches its blob (137f6cd7). `data/company_tickers.json` re-downloaded from SEC (10,418 tickers).
+- **Server boots again — under `--max-old-space-size=2048`** (WP26 verify condition), `data/server.lock` present. **WP28 startup migration verified live**: `/api/strategy-versions` now shows exactly one active (`all-stock-e07073aab308`) with the former dual-active superseded.
+- **Still evicted (recover when iCloud connectivity returns)**: `harness/**` (~33 files — Python debate harness + persona/agent defs) and the launch-agent scripts. Consequence: `AGENT_DEBATE_DAILY_ENABLED`, `FACTOR_RESEARCHER_ENABLED`, and `TRADER_MIRROR_LLM_ENABLED` **must stay off** until the harness files are readable again; enabling them would fail with confusing ETIMEDOUT errors.
+- In-flight tonight: catch-up collection under the 2 GB heap (completes WP26 live verify) and `build_universe_membership.py --backfill-bars` for the 646 unchecked PIT members (unblocks WP29's D17 judgement + WP27 evidence rerun).
+
+### Round 6–7 live verifications — completed 2026-07-09 (late)
+
+All WP26/WP28 deferred live checks now **PASS on the production system**:
+
+- **WP26 full collection under 2 GB heap**: today's pre-market run (`1783598901143-pre`, `trigger:"schedule"`, 24 news items) completed normally on a server started with `--max-old-space-size=2048`; heap telemetry live in `storePersistenceStatus` (`heapUsedRatio` 0.126 at idle). The interim env mitigations (`RUN_HISTORY_LIMIT=6`, `RUN_INLINE_FULL_LIMIT=3`, `RUN_ARCHIVE_ENABLED=false`, 6 GB heap) are **no longer required** — the server now runs on defaults.
+- **WP26c crash drill**: `kill -9` → `server.lock` survived → restart raised the high-severity "检测到上一次服务非正常退出" alert. Verified live.
+- **WP28 startup migration**: live store now holds exactly one active strategy version (`all-stock-e07073aab308`); former dual-active superseded with state history.
+- **WP24 on real data**: latest scheduled agent run tracked **5 decisions (1 organic + 4 starvation-backfill)** — the sample-accrual guarantee is functioning in production, not just fixtures.
+- **Scheduler continuity**: `2026-07-08:pre/post/agent` and `2026-07-09:pre` all ran via normal `schedule` triggers — first fully clean scheduled day since the June-30 gap began.
+
+Remaining open items: WP29 bars backfill (in flight tonight) → PIT walk-forward → D17; WP27 full-corpus evidence rerun (after backfill); WP31 real-fill hand-check (awaiting fills); WP5/WP6 historic deferrals unchanged; `harness/**` re-materialization awaits iCloud connectivity (owner).
+
+---
+
+## WP32 — Sectioned Store Persistence — 2026-07-10
+
+What changed:
+
+- Added `server/sectioned_store.mjs` for per-section JSON persistence under `data/store/`.
+- `ensureStore()` now loads sectioned JSON first, falls back to legacy `data/store.json`, and normalizes the assembled store into the same in-memory schema as before.
+- `saveStore()` writes only hash-changed top-level sections with atomic tmp+rename. A clean save writes no section files and no manifest.
+- First successful sectioned save after legacy load renames `data/store.json` to `data/store.legacy.json`; it does not delete the legacy payload.
+- SQLite mirror compatibility is preserved by generating a temporary compact store snapshot only for the sync subprocess, then deleting it.
+- Config center storage metadata now advertises `primary:"sectioned-json"` and exposes the section directory plus legacy paths.
+
+Files/functions:
+
+- `server/sectioned_store.mjs`: `readSectionedStore`, `writeSectionedStore`.
+- `server.mjs`: `loadStorePayload`, `normalizeStorePayload`, `writeSqliteMirrorStoreSnapshot`, sectioned `ensureStore`/`saveStore`, storage config metadata.
+- `scripts/core_regression_tests.mjs`: sectioned store regression fixture.
+
+Verification output:
+
+```text
+$ node --check server.mjs
+<no output>
+
+$ node --check server/sectioned_store.mjs
+<no output>
+
+$ node --check scripts/core_regression_tests.mjs
+<no output>
+
+$ node scripts/core_regression_tests.mjs
+core_regression_tests: ok
+
+$ node --check public/app.js
+<no output>
+
+$ git diff --check
+<no output>
+```
+
+Sectioned-store smoke:
+
+```json
+{"ok":true,"dataDir":"/var/folders/96/c5h3q34n73s1ss_1tlvcyp1m0000gn/T/market-pulse-sectioned-smoke-ejTdyK","watchlistBytes":8,"storage":"sectioned-json"}
+```
+
+The smoke used a temporary `DATA_DIR` with a legacy `store.json`, started the server, triggered a watchlist save, verified `data/store/watchlist.json`, verified `store.legacy.json`, and confirmed `/api/state` reports sectioned storage.
+
+Contradictions / deferred checks:
+
+- No implementation contradiction.
+- The WP32 watcher-only p95 save timing was not run against the production watcher loop in this session; the regression fixture verifies the underlying dirty-section behavior by changing only `intradayWatcher` and asserting only `intradayWatcher.json` is written.
+- WP33 remains open and is the next Round 8 item.

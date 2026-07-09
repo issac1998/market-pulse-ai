@@ -1,5 +1,7 @@
 import assert from "node:assert/strict";
 import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
 import zlib from "node:zlib";
 import {
   blackScholesPrice,
@@ -46,6 +48,7 @@ import {
 import { runIntradayWatcherOnce } from "../server/intraday_watcher.mjs";
 import { historicalMaxDrawdownFromReturns, runHistoricalWalkForwardFromRows } from "../server/historical_backtest.mjs";
 import { proxyFetchResponse } from "../server/network_fetch.mjs";
+import { readSectionedStore, writeSectionedStore } from "../server/sectioned_store.mjs";
 import { evaluateFactorSpec, parseFactorSpec } from "../lib/factor_spec.mjs";
 import {
   addFactorCandidate,
@@ -98,6 +101,50 @@ const proxyResponse = proxyFetchResponse(
   chunkedBuffer(zlib.gzipSync(Buffer.from(JSON.stringify(proxyPayload), "utf8"))),
 );
 assert.deepEqual(await proxyResponse.json(), proxyPayload, "Proxy fetch should decode chunked gzip bodies before JSON parsing");
+
+const sectionedStoreTmp = fs.mkdtempSync(path.join(os.tmpdir(), "market-pulse-sectioned-store-"));
+try {
+  const storeDir = path.join(sectionedStoreTmp, "store");
+  const legacyFile = path.join(sectionedStoreTmp, "store.json");
+  const legacyBackupFile = path.join(sectionedStoreTmp, "store.legacy.json");
+  const legacyStore = {
+    watchlist: ["AAPL", "MSFT"],
+    intradayWatcher: { lastTickAt: "2026-07-09T14:00:00.000Z", fired: 1 },
+    runs: [{ id: "run-1", completedAt: "2026-07-09T13:00:00.000Z" }],
+  };
+  fs.writeFileSync(legacyFile, JSON.stringify(legacyStore), "utf8");
+  const firstWrite = await writeSectionedStore(storeDir, legacyStore, {
+    legacyFile,
+    legacyBackupFile,
+    migrateLegacy: true,
+  });
+  assert.equal(fs.existsSync(legacyBackupFile), true, "Legacy store should be renamed only after section files are written");
+  assert.equal(fs.existsSync(path.join(storeDir, "runs.json")), true, "Runs section should be written");
+  const loaded = await readSectionedStore(storeDir);
+  assert.deepEqual(loaded.store, legacyStore, "Sectioned store cold load should reconstruct the legacy payload");
+
+  const changed = {
+    ...legacyStore,
+    intradayWatcher: { ...legacyStore.intradayWatcher, lastTickAt: "2026-07-09T14:02:00.000Z" },
+  };
+  const secondWrite = await writeSectionedStore(storeDir, changed, {
+    previousHashes: firstWrite.sectionHashes,
+  });
+  assert.deepEqual(secondWrite.written.sort(), ["intradayWatcher"], "Single-section changes should only write that section");
+  const thirdWrite = await writeSectionedStore(storeDir, changed, {
+    previousHashes: secondWrite.sectionHashes,
+  });
+  assert.equal(thirdWrite.written.length, 0, "Clean sectioned store save should skip all sections");
+  assert.equal(thirdWrite.manifestWritten, false, "Clean sectioned store save should skip the manifest too");
+
+  const partialDir = path.join(sectionedStoreTmp, "partial-store");
+  fs.mkdirSync(partialDir, { recursive: true });
+  fs.writeFileSync(path.join(partialDir, "alerts.json"), JSON.stringify([{ id: "a1" }]), "utf8");
+  const partial = await readSectionedStore(partialDir);
+  assert.deepEqual(partial.store, { alerts: [{ id: "a1" }] }, "Partial section writes should still leave a loadable store");
+} finally {
+  fs.rmSync(sectionedStoreTmp, { recursive: true, force: true });
+}
 
 assert.equal(isNyseTradingDay("2026-07-03"), false, "Independence Day observed should be closed in 2026");
 assert.equal(isNyseTradingDay("2026-07-06"), true, "Monday after observed Independence Day should trade");

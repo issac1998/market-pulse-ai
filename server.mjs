@@ -116,6 +116,7 @@ import {
 import { serveStatic } from "./server/static_files.mjs";
 import { errorZh } from "./server/text_utils.mjs";
 import { evaluateFactorSpec } from "./lib/factor_spec.mjs";
+import { readSectionedStore, writeSectionedStore } from "./server/sectioned_store.mjs";
 
 installProcessErrorHandlers();
 
@@ -126,6 +127,8 @@ loadEnvFile(ENV_FILE);
 const DATA_DIR = path.resolve(__dirname, process.env.DATA_DIR || "data");
 const PUBLIC_DIR = path.join(__dirname, "public");
 const DB_FILE = path.join(DATA_DIR, "store.json");
+const STORE_SECTION_DIR = path.join(DATA_DIR, process.env.STORE_SECTION_DIR || "store");
+const STORE_LEGACY_FILE = path.join(DATA_DIR, "store.legacy.json");
 const SERVER_LOCK_FILE = path.join(DATA_DIR, "server.lock");
 const UZI_DEFAULT_REPO_DIR = "/Users/a/.codex/vendor/UZI-Skill";
 const UZI_ENABLED = parseBoolean(process.env.UZI_ENABLED, true);
@@ -1204,6 +1207,9 @@ let sqliteMirrorLastResult = null;
 let storeCache = null;
 let storeCacheMtimeMs = 0;
 let storeLastSavedHash = "";
+let storeSectionHashes = new Map();
+let storeLoadedFromLegacy = false;
+let storeLastLoadBackend = "unknown";
 let sqliteMirrorLastWatermark = "";
 const runArchiveContentHashes = new Map();
 const runArchiveObjectRefs = new Map();
@@ -3843,7 +3849,7 @@ function cloneStoreValue(value) {
 
 function storePayloadWarning(payloadBytes) {
   if (!Number.isFinite(payloadBytes) || payloadBytes < STORE_SIZE_WARN_BYTES) return "";
-  return `store.json 当前约 ${(payloadBytes / 1024 / 1024).toFixed(1)}MB，超过告警阈值 ${(STORE_SIZE_WARN_BYTES / 1024 / 1024).toFixed(0)}MB；旧 run 已归档，建议继续观察 SQLite mirror。`;
+  return `store 持久化 payload 当前约 ${(payloadBytes / 1024 / 1024).toFixed(1)}MB，超过告警阈值 ${(STORE_SIZE_WARN_BYTES / 1024 / 1024).toFixed(0)}MB；旧 run 已归档，建议继续观察 SQLite mirror。`;
 }
 
 function storeHeapTelemetry() {
@@ -3904,61 +3910,145 @@ function updateStorePersistenceStatus(patch = {}) {
   return storePersistenceStatus;
 }
 
+function defaultStorePayload() {
+  return {
+    watchlist: DEFAULT_WATCHLIST,
+    portfolio: [],
+    signalHistory: [],
+    alerts: [],
+    alertState: {},
+    emailLog: [],
+    runs: [],
+    chat: [],
+    trades: [],
+    tradeSync: {},
+    traderProfile: { current: null, snapshots: [], tradeSync: {} },
+    stockHistory: [],
+    tradeReviews: [],
+    tradeReviewActionState: {},
+    ibkrSyncLog: [],
+    akshareGlobalNewsLog: [],
+    consensusSnapshots: [],
+    historicalBacktests: [],
+    intradayWatcher: {},
+    pushDeliveryState: {},
+    intradayExplain: {},
+    auditEvents: [],
+    scheduleLog: {},
+    scheduleAttempts: { catchUp: {} },
+    sourceControls: { disabled: [], updatedAt: "" },
+    sourceDiagnostics: null,
+    customSocialFeeds: [],
+    articleCache: {},
+    optionsCache: {},
+    ibkrPortalFeed: { updatedAt: "", entries: [] },
+    allStockAgent: normalizeAllStockAgentState(),
+    factorRegistry: normalizeFactorRegistry(),
+  };
+}
+
+function normalizeStorePayload(db = {}) {
+  const runs = Array.isArray(db.runs) ? db.runs : [];
+  const stockHistory =
+    Array.isArray(db.stockHistory) && db.stockHistory.length
+      ? db.stockHistory
+      : runs.flatMap((run) => buildStockHistorySnapshots(run)).slice(0, STOCK_HISTORY_LIMIT);
+  const articleCache = normalizeArticleCache(db.articleCache);
+  const optionsCache = normalizeOptionsCache(db.optionsCache);
+  const ibkrPortalFeed = normalizeIbkrPortalFeed(db.ibkrPortalFeed);
+  return {
+    watchlist: Array.isArray(db.watchlist) ? normalizeWatchlist(db.watchlist) : DEFAULT_WATCHLIST,
+    portfolio: Array.isArray(db.portfolio) ? db.portfolio : [],
+    signalHistory: Array.isArray(db.signalHistory) ? db.signalHistory : [],
+    alerts: Array.isArray(db.alerts) ? db.alerts : [],
+    alertState: db.alertState && typeof db.alertState === "object" ? db.alertState : {},
+    emailLog: Array.isArray(db.emailLog) ? db.emailLog : [],
+    runs,
+    chat: Array.isArray(db.chat) ? db.chat : [],
+    trades: Array.isArray(db.trades) ? db.trades : [],
+    tradeSync: db.tradeSync && typeof db.tradeSync === "object" ? db.tradeSync : {},
+    traderProfile:
+      db.traderProfile && typeof db.traderProfile === "object"
+        ? db.traderProfile
+        : { current: null, snapshots: [], tradeSync: {} },
+    stockHistory,
+    tradeReviews: Array.isArray(db.tradeReviews) ? db.tradeReviews : [],
+    tradeReviewActionState:
+      db.tradeReviewActionState && typeof db.tradeReviewActionState === "object"
+        ? db.tradeReviewActionState
+        : {},
+    ibkrSyncLog: Array.isArray(db.ibkrSyncLog) ? db.ibkrSyncLog : [],
+    akshareGlobalNewsLog: Array.isArray(db.akshareGlobalNewsLog) ? db.akshareGlobalNewsLog : [],
+    consensusSnapshots: Array.isArray(db.consensusSnapshots) ? db.consensusSnapshots : [],
+    historicalBacktests: Array.isArray(db.historicalBacktests)
+      ? db.historicalBacktests.slice(0, 50).map((run) => compactHistoricalRun(run, { detailLimit: 20 }))
+      : [],
+    intradayWatcher: db.intradayWatcher && typeof db.intradayWatcher === "object" ? db.intradayWatcher : {},
+    pushDeliveryState: db.pushDeliveryState && typeof db.pushDeliveryState === "object" ? db.pushDeliveryState : {},
+    intradayExplain: db.intradayExplain && typeof db.intradayExplain === "object" ? db.intradayExplain : {},
+    auditEvents: normalizeAuditEvents(db.auditEvents),
+    scheduleLog: db.scheduleLog || {},
+    scheduleAttempts: normalizeCatchUpAttempts(db.scheduleAttempts),
+    sourceControls: normalizeSourceControls(db.sourceControls),
+    sourceDiagnostics: normalizeSourceDiagnostics(db.sourceDiagnostics),
+    customSocialFeeds: normalizeCustomSocialFeeds(db.customSocialFeeds),
+    articleCache: Object.keys(articleCache).length ? articleCache : buildArticleCacheFromRuns(runs),
+    optionsCache: Object.keys(optionsCache).length ? optionsCache : buildOptionsCacheFromRuns(runs),
+    ibkrPortalFeed,
+    allStockAgent: normalizeAllStockAgentState(db.allStockAgent),
+    factorRegistry: normalizeFactorRegistry(db.factorRegistry),
+  };
+}
+
+function sectionHashesToMap(hashes = {}) {
+  return new Map(Object.entries(hashes || {}));
+}
+
+async function loadStorePayload() {
+  const sectioned = await readSectionedStore(STORE_SECTION_DIR);
+  if (sectioned.exists) {
+    return {
+      backend: "sectioned-json",
+      payload: sectioned.store,
+      payloadBytes: sectioned.totalBytes,
+      mtimeMs: sectioned.maxMtimeMs,
+      payloadHash: sectioned.fullHash || sha256Text(JSON.stringify(sectioned.sectionHashes || {})),
+      sectionHashes: sectioned.sectionHashes || {},
+      sectionCount: Object.keys(sectioned.sectionHashes || {}).length,
+      sectionErrors: sectioned.errors || [],
+      loadedFromLegacy: false,
+    };
+  }
+  const fileStat = await stat(DB_FILE);
+  const raw = await readFile(DB_FILE, "utf8");
+  return {
+    backend: "legacy-json",
+    payload: JSON.parse(raw),
+    payloadBytes: Buffer.byteLength(raw, "utf8"),
+    mtimeMs: fileStat.mtimeMs,
+    payloadHash: sha256Text(raw),
+    sectionHashes: {},
+    sectionCount: 0,
+    sectionErrors: [],
+    loadedFromLegacy: true,
+  };
+}
+
+async function writeSqliteMirrorStoreSnapshot() {
+  const db = await ensureStore();
+  const payload = stringifyPersistedJson(compactStoreForSave(db));
+  const temp = path.join(DATA_DIR, `.store-sqlite-sync-${process.pid}-${Date.now()}-${Math.random().toString(36).slice(2)}.json`);
+  await writeFile(temp, payload, "utf8");
+  return temp;
+}
+
 async function ensureStore() {
+  if (storeCache) return storeCache;
   await mkdir(DATA_DIR, { recursive: true });
   try {
-    const fileStat = await stat(DB_FILE);
-    if (storeCache && storeCacheMtimeMs === fileStat.mtimeMs) return storeCache;
-    const raw = await readFile(DB_FILE, "utf8");
-    const db = JSON.parse(raw);
-    const runs = Array.isArray(db.runs) ? db.runs : [];
-    const stockHistory =
-      Array.isArray(db.stockHistory) && db.stockHistory.length
-        ? db.stockHistory
-        : runs.flatMap((run) => buildStockHistorySnapshots(run)).slice(0, STOCK_HISTORY_LIMIT);
-    const articleCache = normalizeArticleCache(db.articleCache);
-    const optionsCache = normalizeOptionsCache(db.optionsCache);
-    const ibkrPortalFeed = normalizeIbkrPortalFeed(db.ibkrPortalFeed);
-    const normalized = {
-      watchlist: Array.isArray(db.watchlist) ? normalizeWatchlist(db.watchlist) : DEFAULT_WATCHLIST,
-      portfolio: Array.isArray(db.portfolio) ? db.portfolio : [],
-      signalHistory: Array.isArray(db.signalHistory) ? db.signalHistory : [],
-      alerts: Array.isArray(db.alerts) ? db.alerts : [],
-      alertState: db.alertState && typeof db.alertState === "object" ? db.alertState : {},
-      emailLog: Array.isArray(db.emailLog) ? db.emailLog : [],
-      runs,
-      chat: Array.isArray(db.chat) ? db.chat : [],
-      trades: Array.isArray(db.trades) ? db.trades : [],
-      tradeSync: db.tradeSync && typeof db.tradeSync === "object" ? db.tradeSync : {},
-      traderProfile: db.traderProfile && typeof db.traderProfile === "object" ? db.traderProfile : { current: null, snapshots: [], tradeSync: {} },
-      stockHistory,
-      tradeReviews: Array.isArray(db.tradeReviews) ? db.tradeReviews : [],
-      tradeReviewActionState:
-        db.tradeReviewActionState && typeof db.tradeReviewActionState === "object"
-          ? db.tradeReviewActionState
-          : {},
-      ibkrSyncLog: Array.isArray(db.ibkrSyncLog) ? db.ibkrSyncLog : [],
-      akshareGlobalNewsLog: Array.isArray(db.akshareGlobalNewsLog) ? db.akshareGlobalNewsLog : [],
-      consensusSnapshots: Array.isArray(db.consensusSnapshots) ? db.consensusSnapshots : [],
-      historicalBacktests: Array.isArray(db.historicalBacktests)
-        ? db.historicalBacktests.slice(0, 50).map((run) => compactHistoricalRun(run, { detailLimit: 20 }))
-        : [],
-      intradayWatcher: db.intradayWatcher && typeof db.intradayWatcher === "object" ? db.intradayWatcher : {},
-      pushDeliveryState: db.pushDeliveryState && typeof db.pushDeliveryState === "object" ? db.pushDeliveryState : {},
-      intradayExplain: db.intradayExplain && typeof db.intradayExplain === "object" ? db.intradayExplain : {},
-      auditEvents: normalizeAuditEvents(db.auditEvents),
-      scheduleLog: db.scheduleLog || {},
-      scheduleAttempts: normalizeCatchUpAttempts(db.scheduleAttempts),
-      sourceControls: normalizeSourceControls(db.sourceControls),
-      sourceDiagnostics: normalizeSourceDiagnostics(db.sourceDiagnostics),
-      customSocialFeeds: normalizeCustomSocialFeeds(db.customSocialFeeds),
-      articleCache: Object.keys(articleCache).length ? articleCache : buildArticleCacheFromRuns(runs),
-      optionsCache: Object.keys(optionsCache).length ? optionsCache : buildOptionsCacheFromRuns(runs),
-      ibkrPortalFeed,
-      allStockAgent: normalizeAllStockAgentState(db.allStockAgent),
-      factorRegistry: normalizeFactorRegistry(db.factorRegistry),
-    };
-    const strategyRepair = repairStrategyVersionActiveInvariant(db.allStockAgent?.strategyVersions, {
+    const loaded = await loadStorePayload();
+    const normalized = normalizeStorePayload(loaded.payload);
+    const strategyRepair = repairStrategyVersionActiveInvariant(loaded.payload?.allStockAgent?.strategyVersions, {
       migratedAt: nowIso(),
       reason: "startup-single-active-migration",
       actor: "server-startup",
@@ -3976,50 +4066,27 @@ async function ensureStore() {
       return storeCache || normalized;
     }
     storeCache = normalized;
-    storeCacheMtimeMs = fileStat.mtimeMs;
-    storeLastSavedHash = sha256Text(raw);
+    storeCacheMtimeMs = loaded.mtimeMs;
+    storeLastSavedHash = loaded.payloadHash;
+    storeSectionHashes = sectionHashesToMap(loaded.sectionHashes);
+    storeLoadedFromLegacy = loaded.loadedFromLegacy;
+    storeLastLoadBackend = loaded.backend;
     updateStorePersistenceStatus({
       status: "loaded",
-      payloadBytes: Buffer.byteLength(raw, "utf8"),
-      mtimeMs: fileStat.mtimeMs,
+      backend: loaded.backend,
+      storeDir: path.relative(__dirname, STORE_SECTION_DIR),
+      legacyStoreFile: path.relative(__dirname, DB_FILE),
+      payloadBytes: loaded.payloadBytes,
+      payloadHash: loaded.payloadHash,
+      sectionCount: loaded.sectionCount,
+      sectionErrors: loaded.sectionErrors,
+      mtimeMs: loaded.mtimeMs,
       loadedAt: nowIso(),
     });
     return storeCache;
-  } catch {
-    const db = {
-      watchlist: DEFAULT_WATCHLIST,
-      portfolio: [],
-      signalHistory: [],
-      alerts: [],
-      alertState: {},
-      emailLog: [],
-      runs: [],
-      chat: [],
-      trades: [],
-      tradeSync: {},
-      traderProfile: { current: null, snapshots: [], tradeSync: {} },
-      stockHistory: [],
-      tradeReviews: [],
-      tradeReviewActionState: {},
-      ibkrSyncLog: [],
-      akshareGlobalNewsLog: [],
-      consensusSnapshots: [],
-      historicalBacktests: [],
-      intradayWatcher: {},
-      pushDeliveryState: {},
-      intradayExplain: {},
-      auditEvents: [],
-      scheduleLog: {},
-      scheduleAttempts: { catchUp: {} },
-      sourceControls: { disabled: [], updatedAt: "" },
-      sourceDiagnostics: null,
-      customSocialFeeds: [],
-      articleCache: {},
-      optionsCache: {},
-      ibkrPortalFeed: { updatedAt: "", entries: [] },
-      allStockAgent: normalizeAllStockAgentState(),
-      factorRegistry: normalizeFactorRegistry(),
-    };
+  } catch (error) {
+    console.warn(`Store load failed; creating default store: ${error.message}`);
+    const db = defaultStorePayload();
     await saveStore(db);
     return db;
   }
@@ -4030,45 +4097,53 @@ async function saveStore(db) {
   const started = Date.now();
   const heap = storeHeapTelemetry();
   appendHeapPressureAlert(db, heap);
-  const payload = stringifyPersistedJson(compactStoreForSave(db));
-  const payloadBytes = Buffer.byteLength(payload, "utf8");
-  const payloadHash = sha256Text(payload);
   const writeTask = saveQueue.then(async () => {
     await mkdir(DATA_DIR, { recursive: true });
     storeCache = db;
     updateStorePersistenceStatus({
       status: "pending",
-      payloadBytes,
-      payloadHash,
+      backend: "sectioned-json",
+      storeDir: path.relative(__dirname, STORE_SECTION_DIR),
+      legacyStoreFile: path.relative(__dirname, DB_FILE),
+      payloadBytes: storePersistenceStatus.payloadBytes,
       heap,
     });
-    if (storeLastSavedHash === payloadHash) {
-      updateStorePersistenceStatus({
-        status: "skipped-clean",
-        payloadBytes,
-        payloadHash,
-        lastSkippedAt: nowIso(),
-        lastSaveMs: Date.now() - started,
-        heap: storeHeapTelemetry(),
-      });
-      return;
-    }
-    const temp = `${DB_FILE}.${Date.now()}-${Math.random().toString(36).slice(2)}.tmp`;
-    await writeFile(temp, payload, "utf8");
-    await rename(temp, DB_FILE);
-    const fileStat = await stat(DB_FILE);
-    storeCacheMtimeMs = fileStat.mtimeMs;
-    storeLastSavedHash = payloadHash;
+    const compacted = compactStoreForSave(db);
+    const previousHashes = Object.fromEntries(storeSectionHashes.entries());
+    const result = await writeSectionedStore(STORE_SECTION_DIR, compacted, {
+      pretty: STORE_PRETTY_JSON,
+      previousHashes,
+      migrateLegacy: storeLoadedFromLegacy,
+      legacyFile: DB_FILE,
+      legacyBackupFile: STORE_LEGACY_FILE,
+    });
+    storeSectionHashes = sectionHashesToMap(result.sectionHashes);
+    storeLastSavedHash = result.fullHash;
+    storeLoadedFromLegacy = false;
+    storeLastLoadBackend = "sectioned-json";
+    storeCacheMtimeMs = Date.now();
+    const status = result.written.length ? "saved" : "skipped-clean";
     updateStorePersistenceStatus({
-      status: "saved",
-      payloadBytes,
-      payloadHash,
-      lastSavedAt: nowIso(),
-      mtimeMs: fileStat.mtimeMs,
+      status,
+      backend: "sectioned-json",
+      storeDir: path.relative(__dirname, STORE_SECTION_DIR),
+      legacyStoreFile: path.relative(__dirname, DB_FILE),
+      payloadBytes: result.totalBytes,
+      payloadHash: result.fullHash,
+      sectionCount: Object.keys(result.sectionHashes || {}).length,
+      sectionsWritten: result.written,
+      sectionsSkipped: result.skipped,
+      manifestBytes: result.manifestBytes,
+      manifestWritten: result.manifestWritten,
+      manifestReadError: result.manifestReadError,
+      legacyMigration: result.legacyMigration,
+      lastSavedAt: status === "saved" ? nowIso() : storePersistenceStatus.lastSavedAt,
+      lastSkippedAt: status === "skipped-clean" ? nowIso() : storePersistenceStatus.lastSkippedAt,
+      mtimeMs: storeCacheMtimeMs,
       lastSaveMs: Date.now() - started,
       heap: storeHeapTelemetry(),
     });
-    scheduleSqliteMirrorSync();
+    if (status === "saved") scheduleSqliteMirrorSync();
   });
   saveQueue = writeTask.catch(() => {});
   return writeTask;
@@ -4192,13 +4267,9 @@ async function runSqliteStoreSync(statusOnly = false, options = {}) {
       error: `SQLite 同步脚本不存在：${path.relative(__dirname, SQLITE_SYNC_SCRIPT)}`,
     };
   }
-  const args = [
-    SQLITE_SYNC_SCRIPT,
-    "--store-json",
-    DB_FILE,
-    "--db",
-    SQLITE_DB_FILE,
-  ];
+  let storeJsonFile = DB_FILE;
+  if (!statusOnly) storeJsonFile = await writeSqliteMirrorStoreSnapshot();
+  const args = [SQLITE_SYNC_SCRIPT, "--store-json", storeJsonFile, "--db", SQLITE_DB_FILE];
   if (statusOnly) args.push("--status");
   if (!statusOnly && options.incremental && sqliteMirrorLastWatermark) args.push("--since", sqliteMirrorLastWatermark);
   try {
@@ -4219,6 +4290,14 @@ async function runSqliteStoreSync(statusOnly = false, options = {}) {
       script: path.relative(__dirname, SQLITE_SYNC_SCRIPT),
       error: error.message,
     };
+  } finally {
+    if (!statusOnly && storeJsonFile !== DB_FILE) {
+      try {
+        await unlink(storeJsonFile);
+      } catch (cleanupError) {
+        console.warn(`Failed to remove SQLite sync snapshot ${storeJsonFile}: ${cleanupError.message}`);
+      }
+    }
   }
 }
 
@@ -38738,8 +38817,11 @@ function configForClient(db) {
     email: publicReportEmailStatus(db),
     schedule: publicScheduleStatus(db),
     storage: {
-      primary: "JSON",
-      storeFile: path.relative(__dirname, DB_FILE),
+      primary: "sectioned-json",
+      sectioned: true,
+      storeFile: path.relative(__dirname, STORE_SECTION_DIR),
+      legacyStoreFile: path.relative(__dirname, DB_FILE),
+      legacyBackupFile: path.relative(__dirname, STORE_LEGACY_FILE),
       prettyJson: STORE_PRETTY_JSON,
       status: storePersistenceStatus,
       warningThresholdBytes: STORE_SIZE_WARN_BYTES,

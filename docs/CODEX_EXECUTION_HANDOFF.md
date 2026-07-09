@@ -411,3 +411,31 @@ The single biggest discount on every backtest number so far: the 45-ticker corpu
 - 31b/31c consume `historical_bars` + `security_master_ext` — both already populated (52,172 bars / 57 tickers; 9,432 securities). Bars missing for a traded ticker ⇒ that lot's context metrics are `insufficient_data`, never fabricated.
 - Counterfactual and entry-context metrics must use bars ≤ the relevant dates only (same PIT discipline as the walk-forward).
 - No scoring-semantics changes; the profile must never feed factor weights or gates — it is a mirror for the human, not an input to the machine.
+
+---
+
+# Round 8 — Durability & self-diagnosis (WP32–WP33)
+
+> Written 2026-07-09 (Claude) after the F18 incident (execution log) proved two structural weaknesses that are project-level, not just environment-level. Small round; independent of any pending Round 6–7 follow-ups.
+
+## WP32 — Kill the giant-JSON write amplification (P1)
+
+**Status: [x] Completed 2026-07-10.** See `docs/INVESTMENT_ASSISTANT_ROADMAP_FINAL_EXECUTION.md` WP32 section for implementation details and verification output.
+
+Every save rewrites one ~50 MB `store.json`. Beyond the F12/F15 heap+latency costs (now mitigated), F18 showed the disk-level cost: dozens of full-file rewrites per day amplify into OS version-store/sync churn measured in tens of GB, and a single file is a single point of loss. Fix: **split persistence into per-section files** under `data/store/` — one file per top-level store key (`runs.json`, `allStockAgent.json`, `alerts.json`, …), each saved only when its section is dirty (track dirty keys at mutation sites or hash per section at save). Loader assembles the store from sections with a one-time migration from legacy `store.json` (keep it as `store.legacy.json` until first successful sectioned save; never delete it in the same run). Skip-clean, atomic tmp+rename, and the SQLite mirror stay as-is. **Verify**: a watcher tick that only touches `intradayWatcher` writes only that section (<1 MB) instead of 50 MB; total save p95 <100 ms; cold load produces an identical store object (deep-equal fixture against a legacy-format copy); crash between section writes leaves a loadable store (sections are independently valid JSON).
+
+## WP33 — Repo/runtime integrity self-check (P2)
+
+F18 went undetected until the process died mid-import. Two cheap detectors:
+- **33a — boot preflight**: before starting the HTTP listener, stat+open-read 1 byte from every first-party module in the import graph (`server/**/*.mjs`, `lib/*.mjs`) and the critical data files (`strategies/*.json`); on failure, print ONE clear line naming the unreadable file (and hint: iCloud eviction / permissions) and exit non-zero. Budget <200 ms.
+- **33b — `scripts/verify_repo_integrity.mjs`**: compares working-tree files against `.git/index` blob SHAs (pure Node, no git binary needed — the reviewer's recovery used exactly this technique) and reports missing/dataless/modified files. Run it in the go-live status card (WP30c) as a daily "repo integrity" row.
+- **33c — harness fail-fast**: when `AGENT_DEBATE_DAILY_ENABLED` / `FACTOR_RESEARCHER_ENABLED` / `TRADER_MIRROR_LLM_ENABLED` is on, preflight the `harness/` tree the same way before invoking Python; unreadable files → one structured diagnostic (`harness_unreadable` source status), never a raw ETIMEDOUT stack.
+**Verify**: fixture with a chmod-000 module → preflight names it and exits cleanly; integrity script flags a deliberately truncated file; harness preflight downgrades gracefully with debates enabled and a file unreadable.
+
+## WP33 addendum — 33d: SQLite writer contention in bridge scripts (found live 2026-07-09)
+
+First `--backfill-bars` run against the production `data/market_pulse.sqlite` failed wholesale with `sqlite3.OperationalError: database is locked` — the server's mirror sync held the writer lock through the pre-market collection window, and `build_historical_bars.py` (and its callers) neither sets `PRAGMA busy_timeout` nor retries. All 646 members were marked `bars_unavailable` with zero rows written (the coverage labels were honest, which is how it was caught). Fix: (1) every bridge script that writes SQLite sets `busy_timeout >= 30000` on connect and retries the final metadata/coverage transaction; (2) `build_universe_membership.py` gains a `--merge-into <db>` mode formalizing the reviewer's workaround — backfill into an isolated working DB, then merge `historical_bars`/`universe_coverage_status` into the target in one short `ATTACH` transaction; (3) document in the script header that long backfills must not share a writer with a live server. **Verify**: backfill completes with the server running and mirror-sync active; zero `database is locked` in output; merge is atomic.
+
+## WP33d addendum 2 — actual root cause of the backfill lock (hotfixed in review, absorb the diff)
+
+The `database is locked` failures were **not** (primarily) server contention: `build_universe_membership.py` held an **uncommitted write transaction** (from `insert_membership`) while spawning `build_historical_bars.py` subprocesses against the same DB file — the parent deadlocked its own children, 100% failure both times, including against an isolated DB. Reviewer hotfix (in working tree): `conn.commit()` immediately after `insert_membership` with a comment. Codex: absorb the diff; keep the WP33d busy_timeout + `--merge-into` items (they are still correct hardening); add a regression-style smoke that runs `--limit-tickers 2 --backfill-bars` against a temp DB and asserts `coverage.bars_available == 2` — the original WP29 verification never exercised `--backfill-bars` end-to-end, which is how this shipped. `update_coverage_status` itself was correct (per-ticker bar-count check) — no change needed there.
