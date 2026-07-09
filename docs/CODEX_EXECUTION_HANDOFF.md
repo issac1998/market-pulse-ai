@@ -445,3 +445,15 @@ First `--backfill-bars` run against the production `data/market_pulse.sqlite` fa
 **Status: [x] Completed as part of WP33 on 2026-07-10.**
 
 The `database is locked` failures were **not** (primarily) server contention: `build_universe_membership.py` held an **uncommitted write transaction** (from `insert_membership`) while spawning `build_historical_bars.py` subprocesses against the same DB file — the parent deadlocked its own children, 100% failure both times, including against an isolated DB. Reviewer hotfix (in working tree): `conn.commit()` immediately after `insert_membership` with a comment. Codex: absorb the diff; keep the WP33d busy_timeout + `--merge-into` items (they are still correct hardening); add a regression-style smoke that runs `--limit-tickers 2 --backfill-bars` against a temp DB and asserts `coverage.bars_available == 2` — the original WP29 verification never exercised `--backfill-bars` end-to-end, which is how this shipped. `update_coverage_status` itself was correct (per-ticker bar-count check) — no change needed there.
+
+## WP34 — Walk-forward engine at honest-universe scale (P1, added 2026-07-10 after the first full PIT run)
+
+**Status: [x] Completed 2026-07-10.** Batched bar loading, chunked SQLite detail persistence, explicit grid metadata, equity-book cost sensitivity, and the 1/5/20/60 PIT rerun are implemented and verified in `hist-bt-1783632041459-f87d2d9d`.
+
+The engine was built for a 45-ticker corpus; at 641 tickers / 642k bars, four scale defects surfaced (details + evidence in the execution log "First honest training run" section):
+- **34a — batched bar loading**: replace the single `sqliteJson` bars query (reviewer band-aided `maxBuffer` 64 MB→1 GB) with per-ticker-chunk loads or a temp NDJSON file; remove the band-aid after.
+- **34b — chunked persistence**: `persistHistoricalBacktestRun` must insert outcomes/decisions in chunks (≤500 rows/INSERT) and stringify per row — never one `JSON.stringify` of the whole run (`Invalid string length` at 25k outcomes; full-grid details currently unpersisted). Re-persist by re-running the PIT config after the fix.
+- **34c — explicit grid**: omitted `maxDates` silently truncates to ~30 dates; require it explicitly for CLI/worker runs or emit `gridTruncated:true` prominently in metrics + report header.
+- **34d — cost-sensitivity + implementation honesty**: equity-book metrics must carry a cost-sensitivity row (0/5/15 bps) and label the implementation ("daily-rebalanced always-invested topN") so −65% maxDD-style numbers can't be misread as strategy quality; per-decision metrics stay primary.
+- **34e — T+60 + regime-conditioned rerun**: after 34a-c, rerun PIT with horizons 1/5/20/60 and a per-regime breakdown (macroRegime is the strongest reconstructable signal, rankIC +0.046) and append the results to the D17 record.
+**Verify**: full-grid PIT run persists all details to SQLite (row counts match detailCounts); no maxBuffer/string-length band-aids remain (grep); report shows cost-sensitivity + universe coverage + grid flags; T+60 numbers recorded in D17.

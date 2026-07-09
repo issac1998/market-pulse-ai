@@ -178,6 +178,29 @@ function sqlJson(value) {
   return sqlText(JSON.stringify(value ?? null));
 }
 
+function chunks(rows = [], size = 500) {
+  const chunkSize = Math.max(1, Number(size || 500));
+  const out = [];
+  for (let index = 0; index < rows.length; index += chunkSize) out.push(rows.slice(index, index + chunkSize));
+  return out;
+}
+
+function sqlInList(values = []) {
+  return values.map((value) => `'${sqlText(value)}'`).join(",");
+}
+
+async function sqliteJsonForTickerChunks(dbPath, tickers = [], selectSqlForTickers, options = {}) {
+  const unique = [...new Set((tickers || []).map(safeTicker).filter(Boolean))].sort();
+  const chunkSize = Math.max(1, Number(options.chunkSize || 80));
+  const timeoutMs = options.timeoutMs || 30000;
+  const rows = [];
+  for (const chunk of chunks(unique, chunkSize)) {
+    if (!chunk.length) continue;
+    rows.push(...(await sqliteJson(dbPath, selectSqlForTickers(chunk), timeoutMs)));
+  }
+  return rows;
+}
+
 function groupBars(rows = []) {
   const byTicker = new Map();
   for (const row of normalizeHistoricalBars(rows)) {
@@ -188,6 +211,23 @@ function groupBars(rows = []) {
   }
   for (const rowsForTicker of byTicker.values()) rowsForTicker.sort((a, b) => a.date.localeCompare(b.date));
   return byTicker;
+}
+
+function lastBarIndexAtOrBefore(rows = [], date = "") {
+  const target = ymd(date);
+  let low = 0;
+  let high = rows.length - 1;
+  let answer = -1;
+  while (low <= high) {
+    const mid = Math.floor((low + high) / 2);
+    if (rows[mid]?.date <= target) {
+      answer = mid;
+      low = mid + 1;
+    } else {
+      high = mid - 1;
+    }
+  }
+  return answer;
 }
 
 function regimeForDate(regimes = [], date = "") {
@@ -518,6 +558,66 @@ function aggregateOutcomes(outcomes = [], primaryHorizon = 20, dailyRows = []) {
     dailyExcess,
     wins,
     losses,
+  };
+}
+
+function horizonBreakdown(outcomes = []) {
+  const horizons = [...new Set((outcomes || []).map((row) => Number(row.horizonDays || 0)).filter(Boolean))].sort((a, b) => a - b);
+  return Object.fromEntries(horizons.map((horizon) => {
+    const rowsAll = outcomes.filter((row) => row.horizonDays === horizon);
+    const rows = rowsAll.filter((row) => row.outcomeUsable !== false);
+    const excess = rows.map((row) => pct(row.excessPct)).filter(Number.isFinite);
+    const raw = rows.map((row) => pct(row.rawReturnPct)).filter(Number.isFinite);
+    const benchmark = rows.map((row) => pct(row.benchmarkReturnPct)).filter(Number.isFinite);
+    const wins = rows.filter((row) => row.outcome === "win").length;
+    const missingBenchmark = rowsAll.filter((row) => row.benchmarkStatus === "missing_benchmark" || row.outcomeUsable === false && row.excessPct === null).length;
+    return [String(horizon), {
+      horizonDays: horizon,
+      sampleCount: rows.length,
+      missingBenchmark: { count: missingBenchmark, n: rowsAll.length, source: "historical-backtest" },
+      avgExcessPct: metric(mean(excess), rows.length),
+      avgRawReturnPct: metric(mean(raw), rows.length),
+      avgBenchmarkReturnPct: metric(mean(benchmark), rows.length),
+      hitRate: metric(rows.length ? wins / rows.length : null, rows.length),
+      source: "historical-backtest",
+    }];
+  }));
+}
+
+function compactMetricCell(cell = {}) {
+  return {
+    value: Number.isFinite(cell.value) ? cell.value : null,
+    n: Number(cell.n || 0),
+    source: cell.source || "historical-backtest",
+  };
+}
+
+function equityBookCostSensitivity(decisions = [], byTicker = new Map(), spyRows = [], outcomes = [], primaryHorizon = 20, configuredRoundTripCostBps = 0) {
+  const costRows = [...new Set([0, 5, 15, Number(configuredRoundTripCostBps || 0)].filter((value) => Number.isFinite(value) && value >= 0))]
+    .sort((a, b) => a - b);
+  return {
+    schemaVersion: "historical-equity-book-cost-sensitivity-v1",
+    implementation: "daily-rebalanced always-invested topN",
+    note: "Equity-book sensitivity is diagnostic only; per-decision excess metrics remain the primary evidence.",
+    rows: costRows.map((roundTripCostBps) => {
+      const daily = mergeOutcomeSamplesIntoDaily(
+        portfolioDailyBook(decisions, byTicker, spyRows, primaryHorizon, roundTripCostBps),
+        outcomes,
+        primaryHorizon,
+      );
+      const metrics = aggregateOutcomes(outcomes, primaryHorizon, daily);
+      return {
+        roundTripCostBps,
+        dailyCount: daily.length,
+        excessReturnPct: compactMetricCell(metrics.excessReturnPct),
+        totalReturnPct: compactMetricCell(metrics.totalReturnPct),
+        benchmarkTotalReturnPct: compactMetricCell(metrics.benchmarkTotalReturnPct),
+        portfolioDailyExcessPct: compactMetricCell(metrics.portfolioDailyExcessPct),
+        maxDrawdown: metrics.maxDrawdown,
+        sharpe: compactMetricCell(metrics.sharpe),
+        cagr: compactMetricCell(metrics.cagr),
+      };
+    }),
   };
 }
 
@@ -915,6 +1015,9 @@ function buildReport(run = {}) {
     id: run.id,
     generatedAt: new Date().toISOString(),
     narrativeZh: summary,
+    grid: run.metrics?.grid || run.provenance?.grid || null,
+    implementation: run.metrics?.implementation || run.provenance?.implementation || null,
+    costSensitivity: run.metrics?.costSensitivity || null,
     json: run,
     provenance: run.provenance,
   };
@@ -1088,7 +1191,14 @@ async function persistHistoricalBacktestRun(sqlitePath, run = {}, report = {}, t
     equityCurve: run.equityCurve || [],
     drawdownCurve: run.drawdownCurve || [],
   };
-  const statements = [
+  const compactReport = {
+    ...(report || {}),
+    json: compactJson,
+  };
+  const decisionCount = run.decisions?.length || run.detailCounts?.decisions || 0;
+  const outcomeCount = run.outcomes?.length || run.detailCounts?.outcomes || 0;
+  const dailyCount = run.daily?.length || run.detailCounts?.daily || 0;
+  await sqliteExec(sqlitePath, [
     "PRAGMA busy_timeout=60000;",
     historicalRunSchemaSql(),
     "BEGIN;",
@@ -1099,27 +1209,71 @@ async function persistHistoricalBacktestRun(sqlitePath, run = {}, report = {}, t
     `DELETE FROM historical_backtest_daily WHERE run_id='${sqlText(run.id)}';`,
     `DELETE FROM historical_backtest_runs WHERE id='${sqlText(run.id)}';`,
     `INSERT INTO historical_backtest_runs(id, generated_at, status, decisions_count, outcomes_count, daily_count, summary_json, metrics_json, report_json, json)
-      VALUES ('${sqlText(run.id)}','${sqlText(run.generatedAt)}','${sqlText(run.status)}',${Number(run.decisions?.length || 0)},${Number(run.outcomes?.length || 0)},${Number(run.daily?.length || 0)},'${sqlJson(summary)}','${sqlJson(run.metrics || {})}','${sqlJson(report || {})}','${sqlJson(compactJson)}');`,
-  ];
-  for (const decision of run.decisions || []) {
-    const values = `('${sqlText(run.id)}','${sqlText(decision.id)}','${sqlText(decision.ticker)}','${sqlText(ymd(decision.signalDate || decision.generatedAt))}',${pct(decision.actionScore) ?? "NULL"},${pct(decision.alphaScore) ?? "NULL"},'${sqlJson(decision)}')`;
-    statements.push(`INSERT OR REPLACE INTO historical_backtest_decisions(run_id, id, ticker, signal_date, action_score, alpha_score, json) VALUES ${values};`);
-    statements.push(`INSERT OR REPLACE INTO historical_decisions(run_id, id, ticker, signal_date, action_score, alpha_score, json) VALUES ${values};`);
-  }
-  for (const outcome of run.outcomes || []) {
-    const values = `('${sqlText(run.id)}','${sqlText(outcome.decisionId)}','${sqlText(outcome.ticker)}',${Number(outcome.horizonDays || 0)},'${sqlText(ymd(outcome.decisionAt))}','${sqlText(outcome.entryDate)}','${sqlText(outcome.exitDate)}',${pct(outcome.rawReturnPct) ?? "NULL"},${pct(outcome.benchmarkReturnPct) ?? "NULL"},${pct(outcome.excessPct) ?? "NULL"},'${sqlText(outcome.outcome)}','${sqlText(outcome.outcomeQualityStatus)}','${sqlText(outcomeRegimeBucket(outcome))}','${sqlJson(outcome)}')`;
-    statements.push(`INSERT OR REPLACE INTO historical_backtest_outcomes(run_id, decision_id, ticker, horizon_days, decision_at, entry_date, exit_date, raw_return_pct, benchmark_return_pct, excess_pct, outcome, outcome_quality_status, regime, json) VALUES ${values};`);
-    statements.push(`INSERT OR REPLACE INTO historical_outcomes(run_id, decision_id, ticker, horizon_days, decision_at, entry_date, exit_date, raw_return_pct, benchmark_return_pct, excess_pct, outcome, outcome_quality_status, regime, json) VALUES ${values};`);
-  }
-  for (const row of run.daily || []) {
-    statements.push(
-      `INSERT OR REPLACE INTO historical_backtest_daily(run_id, date, decisions, outcome_samples, avg_excess_pct, json)
-       VALUES ('${sqlText(run.id)}','${sqlText(row.date)}',${Number(row.decisions || 0)},${Number(row.outcomeSamples || 0)},${pct(row.avgExcessPct) ?? "NULL"},'${sqlJson(row)}');`,
+      VALUES ('${sqlText(run.id)}','${sqlText(run.generatedAt)}','${sqlText(run.status)}',${Number(decisionCount)},${Number(outcomeCount)},${Number(dailyCount)},'${sqlJson(summary)}','${sqlJson(run.metrics || {})}','${sqlJson(compactReport)}','${sqlJson(compactJson)}');`,
+    "COMMIT;",
+  ].join("\n"), timeoutMs);
+
+  let decisionRows = 0;
+  for (const chunk of chunks(run.decisions || [], 500)) {
+    const values = chunk.map((decision) =>
+      `('${sqlText(run.id)}','${sqlText(decision.id)}','${sqlText(decision.ticker)}','${sqlText(ymd(decision.signalDate || decision.generatedAt))}',${pct(decision.actionScore) ?? "NULL"},${pct(decision.alphaScore) ?? "NULL"},'${sqlJson(decision)}')`,
     );
+    if (!values.length) continue;
+    await sqliteExec(sqlitePath, [
+      "PRAGMA busy_timeout=60000;",
+      "BEGIN;",
+      `INSERT OR REPLACE INTO historical_backtest_decisions(run_id, id, ticker, signal_date, action_score, alpha_score, json) VALUES ${values.join(",")};`,
+      `INSERT OR REPLACE INTO historical_decisions(run_id, id, ticker, signal_date, action_score, alpha_score, json) VALUES ${values.join(",")};`,
+      "COMMIT;",
+    ].join("\n"), timeoutMs);
+    decisionRows += chunk.length;
   }
-  statements.push("COMMIT;");
-  await sqliteExec(sqlitePath, statements.join("\n"), timeoutMs);
-  return { persisted: true, runId: run.id };
+
+  let outcomeRows = 0;
+  for (const chunk of chunks(run.outcomes || [], 500)) {
+    const values = chunk.map((outcome) =>
+      `('${sqlText(run.id)}','${sqlText(outcome.decisionId)}','${sqlText(outcome.ticker)}',${Number(outcome.horizonDays || 0)},'${sqlText(ymd(outcome.decisionAt))}','${sqlText(outcome.entryDate)}','${sqlText(outcome.exitDate)}',${pct(outcome.rawReturnPct) ?? "NULL"},${pct(outcome.benchmarkReturnPct) ?? "NULL"},${pct(outcome.excessPct) ?? "NULL"},'${sqlText(outcome.outcome)}','${sqlText(outcome.outcomeQualityStatus)}','${sqlText(outcomeRegimeBucket(outcome))}','${sqlJson(outcome)}')`,
+    );
+    if (!values.length) continue;
+    await sqliteExec(sqlitePath, [
+      "PRAGMA busy_timeout=60000;",
+      "BEGIN;",
+      `INSERT OR REPLACE INTO historical_backtest_outcomes(run_id, decision_id, ticker, horizon_days, decision_at, entry_date, exit_date, raw_return_pct, benchmark_return_pct, excess_pct, outcome, outcome_quality_status, regime, json) VALUES ${values.join(",")};`,
+      `INSERT OR REPLACE INTO historical_outcomes(run_id, decision_id, ticker, horizon_days, decision_at, entry_date, exit_date, raw_return_pct, benchmark_return_pct, excess_pct, outcome, outcome_quality_status, regime, json) VALUES ${values.join(",")};`,
+      "COMMIT;",
+    ].join("\n"), timeoutMs);
+    outcomeRows += chunk.length;
+  }
+
+  let dailyRows = 0;
+  for (const chunk of chunks(run.daily || [], 500)) {
+    const values = chunk.map((row) =>
+      `('${sqlText(run.id)}','${sqlText(row.date)}',${Number(row.decisions || 0)},${Number(row.outcomeSamples || 0)},${pct(row.avgExcessPct) ?? "NULL"},'${sqlJson(row)}')`,
+    );
+    if (!values.length) continue;
+    await sqliteExec(sqlitePath, [
+      "PRAGMA busy_timeout=60000;",
+      "BEGIN;",
+      `INSERT OR REPLACE INTO historical_backtest_daily(run_id, date, decisions, outcome_samples, avg_excess_pct, json) VALUES ${values.join(",")};`,
+      "COMMIT;",
+    ].join("\n"), timeoutMs);
+    dailyRows += chunk.length;
+  }
+  return {
+    persisted: true,
+    runId: run.id,
+    chunkSize: 500,
+    inserted: {
+      decisions: decisionRows,
+      outcomes: outcomeRows,
+      daily: dailyRows,
+    },
+    detailCounts: {
+      decisions: decisionCount,
+      outcomes: outcomeCount,
+      daily: dailyCount,
+    },
+  };
 }
 
 export function compactHistoricalRun(run = {}, options = {}) {
@@ -1207,10 +1361,12 @@ async function applyMetricBridges(run = {}, options = {}) {
 }
 
 export function runHistoricalWalkForwardFromRows({ bars = [], regimes = [], config = {} } = {}) {
+  const maxDatesExplicit = config.maxDates !== undefined && config.maxDates !== null && String(config.maxDates).trim() !== "";
   const runConfig = {
     schemaVersion: "historical-walk-forward-config-v1",
     topN: Math.max(1, Number(config.topN || 10)),
     maxDates: Math.max(1, Number(config.maxDates || 30)),
+    maxDatesExplicit,
     minLookback: Math.max(20, Number(config.minLookback || 60)),
     horizons: (Array.isArray(config.horizons) && config.horizons.length ? config.horizons : DEFAULT_HORIZONS)
       .map((item) => Number(item))
@@ -1232,29 +1388,54 @@ export function runHistoricalWalkForwardFromRows({ bars = [], regimes = [], conf
   const byTicker = groupBars(bars);
   const securityMaster = securityMasterMap(config.securityMasterExt || []);
   const pitRows = Array.isArray(config.pitFundamentals) ? config.pitFundamentals : [];
+  const pitRowsByTicker = new Map();
+  for (const row of pitRows) {
+    const ticker = safeTicker(row.ticker);
+    if (!ticker) continue;
+    if (!pitRowsByTicker.has(ticker)) pitRowsByTicker.set(ticker, []);
+    pitRowsByTicker.get(ticker).push(row);
+  }
   const universeMembership = normalizeUniverseMembership(config.universeMembership || []);
-  const dates = allDatesFromBars(byTicker, runConfig.minLookback).slice(-runConfig.maxDates);
+  const availableDates = allDatesFromBars(byTicker, runConfig.minLookback);
+  const dates = availableDates.slice(-runConfig.maxDates);
+  const grid = {
+    schemaVersion: "historical-backtest-grid-v1",
+    maxDatesExplicit,
+    maxDates: runConfig.maxDates,
+    availableDates: availableDates.length,
+    selectedDates: dates.length,
+    gridTruncated: availableDates.length > dates.length,
+    warning: !maxDatesExplicit
+      ? "maxDates omitted; default grid applied. Pass maxDates explicitly for training/evidence runs."
+      : availableDates.length > dates.length
+        ? "Date grid was intentionally truncated by maxDates."
+        : "",
+  };
   const universeCoverage = universeCoverageSummary(byTicker, universeMembership, dates, runConfig.universeMode);
   const spyRows = byTicker.get("SPY") || [];
   const decisions = [];
   const outcomes = [];
   const roundTripCostBps = runConfig.costBps + runConfig.slippageBps;
+  const regimeBySignalDate = new Map();
   for (const signalDate of dates) {
     const scored = [];
     const activeUniverse = runConfig.universeMode === "pit"
       ? activeUniverseTickersForDate(universeMembership, signalDate)
       : null;
+    if (!regimeBySignalDate.has(signalDate)) regimeBySignalDate.set(signalDate, regimeForDate(regimes, signalDate));
+    const historicalRegime = regimeBySignalDate.get(signalDate);
     for (const [ticker, rows] of byTicker.entries()) {
       if (isBenchmarkTicker(ticker)) continue;
       if (activeUniverse && !activeUniverse.has(ticker)) continue;
-      const eligibleBars = rows.filter((row) => row.date <= signalDate);
-      if (eligibleBars.length < runConfig.minLookback) continue;
+      const eligibleEndIndex = lastBarIndexAtOrBefore(rows, signalDate);
+      if (eligibleEndIndex + 1 < runConfig.minLookback) continue;
+      const eligibleBars = rows.slice(0, eligibleEndIndex + 1);
       const { factorSnapshot, recommendationScore } = buildFactorSnapshotAsOf({
         ticker,
         asOf: signalDate,
-        bars: rows,
-        historicalRegime: regimeForDate(regimes, signalDate),
-        pitFundamentals: pitRows.filter((row) => safeTicker(row.ticker) === ticker),
+        bars: eligibleBars,
+        historicalRegime,
+        pitFundamentals: pitRowsByTicker.get(ticker) || [],
         weights: DEFAULT_WEIGHTS,
       });
       scored.push({ ticker, factorSnapshot, recommendationScore, latestBar: eligibleBars.at(-1) });
@@ -1363,10 +1544,25 @@ export function runHistoricalWalkForwardFromRows({ bars = [], regimes = [], conf
     runConfig.primaryHorizon,
   );
   const metrics = aggregateOutcomes(outcomes, runConfig.primaryHorizon, daily);
+  const byHorizon = horizonBreakdown(outcomes);
   const periods = periodTable(outcomes, runConfig.primaryHorizon);
   const factorPack = factorAnalysis(outcomes);
   const weights = weightOutputs(stats, DEFAULT_WEIGHTS, runConfig, outcomes);
   const equityCurve = equityAndDrawdownCurve(daily);
+  const implementation = {
+    schemaVersion: "historical-backtest-implementation-v1",
+    equityBook: "daily-rebalanced always-invested topN",
+    primaryEvidence: "per-decision outcome metrics",
+    note: "Equity-book metrics are implementation diagnostics and can overstate turnover/cost drag; per-decision metrics remain primary.",
+  };
+  const costSensitivity = equityBookCostSensitivity(
+    decisions,
+    byTicker,
+    spyRows,
+    outcomes,
+    runConfig.primaryHorizon,
+    roundTripCostBps,
+  );
   const sectorBasketStatusCounts = decisions.reduce((acc, decision) => {
     const key = decision.sectorBasketStatus || "unknown";
     acc[key] = (acc[key] || 0) + 1;
@@ -1391,12 +1587,18 @@ export function runHistoricalWalkForwardFromRows({ bars = [], regimes = [], conf
       pitFundamentalRows: pitRows.length,
       universeMembershipRows: universeMembership.length,
       horizons: runConfig.horizons,
+      grid,
     },
     config: runConfig,
     strategyHash,
     decisions,
     outcomes,
     daily,
+    detailCounts: {
+      decisions: decisions.length,
+      outcomes: outcomes.length,
+      daily: daily.length,
+    },
     equityCurve,
     drawdownCurve: equityCurve.map((row) => ({ date: row.date, drawdownPct: row.drawdownPct, n: row.n })),
     periods,
@@ -1410,6 +1612,11 @@ export function runHistoricalWalkForwardFromRows({ bars = [], regimes = [], conf
       })) : null, daily.length),
       costDrag: metric(roundTripCostBps / 100, decisions.length),
       exposure: metric(daily.length ? mean(daily.map((row) => Math.min(1, (row.decisions || 0) / runConfig.topN))) : null, daily.length),
+      byHorizon,
+      byHorizonDays: byHorizon,
+      grid,
+      implementation,
+      costSensitivity,
     },
     factorAnalysis: factorPack,
     factorStats: factorPack.factorStats,
@@ -1433,6 +1640,8 @@ export function runHistoricalWalkForwardFromRows({ bars = [], regimes = [], conf
       config: runConfig,
       backtestWeightsUsage: "candidate-only",
       friction: roundTripCostBps > 0 ? "costed" : "frictionless-reference",
+      grid,
+      implementation,
       sectorBasketStatus: Object.keys(sectorBasketStatusCounts).length ? sectorBasketStatusCounts : { missing_sector_mapping: decisions.length },
       diagnostics: {
         pitFundamentalsError: runConfig.pitFundamentalsError,
@@ -1448,12 +1657,14 @@ export function runHistoricalWalkForwardFromRows({ bars = [], regimes = [], conf
       "Walk-forward uses only dates present in historical_bars and never reads rows after the signal date.",
       "Backtest outputs are labeled historical-backtest and must not blend with live recommendation rows.",
       "Benchmark tickers are loaded independently and excluded from the trading universe/cross-section; missing benchmark rows make outcomes unusable instead of treating raw return as excess.",
+      grid.warning || "",
+      `${implementation.equityBook}: ${implementation.note}`,
       "Sector baskets use security_master_ext when present; if a mapped sector ETF has no historical bars, the basket uses available benchmark components only with partial_benchmark disclosure.",
       runConfig.universeMode === "pit"
         ? `PIT mode: ${universeCoverage.membersWithBars} of ${universeCoverage.totalMembers} point-in-time members have bars (${universeCoverage.coveragePct ?? "n/a"}%).`
         : "Watchlist mode: membership filtering is disabled, so headline levels retain current-universe survivorship caveats.",
       roundTripCostBps > 0 ? "Costs/slippage are included in raw and benchmark returns." : "Zero-cost run is labeled frictionless-reference.",
-    ],
+    ].filter(Boolean),
   };
   return { run, report: buildReport(run) };
 }
@@ -1541,11 +1752,15 @@ export async function runHistoricalWalkForwardFromSqlite({ sqlitePath, config = 
   const benchmarkTickers = benchmarkRows.map((row) => safeTicker(row.ticker)).filter(Boolean);
   const allBarTickers = [...new Set([...tickers, ...benchmarkTickers])];
   const tickerList = tickers.map((ticker) => `'${sqlText(ticker)}'`).join(",");
-  const barTickerList = allBarTickers.map((ticker) => `'${sqlText(ticker)}'`).join(",");
-  const bars = await sqliteJson(
+  const bars = await sqliteJsonForTickerChunks(
     sqlitePath,
-    `SELECT ticker,date,open,high,low,close,volume,source FROM historical_bars WHERE ticker IN (${barTickerList})${where.length ? ` AND ${where.join(" AND ")}` : ""} ORDER BY ticker,date;`,
-    config.sqliteTimeoutMs || 30000,
+    allBarTickers,
+    (chunk) =>
+      `SELECT ticker,date,open,high,low,close,volume,source FROM historical_bars WHERE ticker IN (${sqlInList(chunk)})${where.length ? ` AND ${where.join(" AND ")}` : ""} ORDER BY ticker,date;`,
+    {
+      chunkSize: config.barLoadChunkSize || 80,
+      timeoutMs: config.sqliteTimeoutMs || 30000,
+    },
   );
   const regimes = await sqliteJson(
     sqlitePath,

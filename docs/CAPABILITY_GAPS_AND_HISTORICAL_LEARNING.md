@@ -309,7 +309,7 @@ Role split, per owner 2026-07-05: **Claude decides, Codex executes.** The decisi
 - **D2 — Factor-IC engine = alphalens-reloaded via bridge.** `scripts/alphalens_bridge.py` (input: long-format factor values + close prices exported from SQLite; output: IC by horizon, quantile mean returns, turnover, as JSON). Pin `pandas>=2.2.2, numpy>=2` in the bridge venv; this is the §7.2 factor-level report.
 - **D3 — All EDGAR work goes through edgartools.** Tier-2 PIT fundamentals (`scripts/edgar_pit_bridge.py`: XBRL facts keyed by **filing date**, never period date), 13F holdings deltas for the `smartMoney` upgrade, Form 4 parsing, and the watcher's W2 real-time filings polling. Do not hand-roll EDGAR XBRL parsing anywhere.
 - **D4 — Technical-factor expansion = curated Alpha158 subset, in-house.** Implement ~24 features (k-bar shape family; ROC/MA/STD over [5,20,60]; RSV, RANK, IMAX/IMIN, CORR(price,volume), CNTP/CNTN, WVMA) inside the shared snapshot builder (`lib/` — JS, or the historical Python builder with identical formulas + parity fixtures). Not all 158: orthogonality (§2.1.3) and interpretability outrank feature count. These enter as *inputs to the momentum/technical factor group*, at token weight, under the standard earn-your-weight rule.
-- **D5 — Historical bars source = existing AkShare bridge (bulk mode), gap-filled by Finnhub/Alpha Vantage.** It is already proven in this codebase (~1,500 daily bars ≈ 6 years per ticker). No new yfinance dependency; no new provider integration for Tier 1.
+- **D5 — Historical bars source. AMENDED 2026-07-05 after live verification**: from this network, EastMoney is unreachable (direct and proxied), Finnhub candles are 403 (free tier), and no Alpha Vantage key exists — all three original sources are dead here. Verified working alternative already in-repo: **Longbridge CLI `kline <SYM>.US --period day --count 1000` returns ~4 years of daily bars (tested: AAPL back to 2022-07)**. New order: **Longbridge CLI primary → IBKR socket `history_payload` (duration "2 Y"+) secondary → AkShare/Finnhub/Alpha Vantage tertiary when reachable**. FRED regimes work (direct and proxied) — earlier timeouts were sandbox artifacts. Original rationale stands otherwise: no yfinance; Stooq rejected (JS proof-of-work wall); Yahoo v8 rate-limited.
 - **D6 — No vectorbt.** Parameter sweeps (thresholds, cooldowns, blackout windows) are a ~100-line pandas loop over frozen snapshots in `scripts/param_sweep.py`; Commons-Clause license surface not justified for that. Sweep outputs are evidence for human threshold changes via the strategy-version workflow, never auto-applied.
 - **D7 — No framework adoption, ever, for scoring.** abu/qlib/zipline/backtrader/FinRL are reference material. Anything that computes a recommendation score outside `lib/recommender_core.mjs` is an automatic review reject (§6.2.2).
 - **D8 — abu's UMP-judge idea is deferred to Phase 3** as a designed-in-house shadow challenger (classifier trained on failed frozen trades, vetoing similar setups), entering through the same shadow→cap→veto promotion ladder as the debate gate. No abu code (GPL, unmaintained).
@@ -349,3 +349,63 @@ WP1 → (WP2 ∥ WP3+WP4) → Phase-2 machinery on historical evidence (D11)
 ```
 
 Net: Phase 2 arrives roughly a quarter earlier than the FINAL roadmap's "Months 5–6"; Phase 3's two evidence gates keep live-only clocks, one of which can start today.
+
+---
+
+## 11. External open-source scan, round 2 (2026-07-05): news, stock/market analysis, recommendations, portfolio
+
+Requested scope: anything usable for news collection, single-stock analysis, market analysis, recommendations, and quant. All states verified via web on 2026-07-05. Same governing rule as §8: **libraries serve the pipeline (data, formulas, reporting); no framework replaces our scoring or decides trades.**
+
+| Project | Verified state | Verdict | What it gives us |
+|---|---|---|---|
+| **FinanceDatabase** (JerBouma) | MIT, v2.3.0, active, 300k+ symbols | ✅ **adopt** | Offline sector/industry/country classification for every US ticker — directly fixes the WP4 `missing_sector_mapping` (sector benchmark baskets) and upgrades peer-set generation. Static data files, no API key. |
+| **FinanceToolkit** (JerBouma) | MIT, active, 200+ ratios, 30y statements | ✅ **borrow formulas** | Transparent reference implementations for the exact ratios WP7 approximated (Piotroski F, Altman Z, accruals, 150+ more). Caveat: its default data source is FinancialModelingPrep (paid key) — we feed **our own PIT data** into its calculation layer or port the formulas; never depend on FMP. |
+| **pandas-market-calendars** (rsheftel) | Active (docs built May 2026), NYSE 1885→present incl. early closes | ✅ **adopt as validator** | Our NYSE calendar in `lib/market_core.mjs` is hand-rolled — a silent-drift risk (early closes, new holidays like Juneteenth analogues). Generate a static holiday/early-close JSON (2019–2028) from it; JS calendar consumes + is fixture-verified against it. |
+| **ai-hedge-fund** (virattt) | MIT, 60.8k★, active | ✅ **borrow prompts only** | The persona-agent checklists (Damodaran valuation discipline, Graham value, Munger quality, Burry deep value, Wood growth) are excellent prompt material for our harness personas/debate. Its *architecture* (LLM agents make the trading decision) violates our constitution — prompts yes, control flow no. |
+| **Riskfolio-Lib** (dcajasn) | BSD-3, v7.3.0 (2026-06), 13 risk measures, HRP/HERC | ✅ **adopt when Phase 3.2 starts** | The portfolio-risk assistant's engine: risk parity, CVaR/CDaR, hierarchical clustering allocation — via the standard bridge pattern. Decision recorded now so 3.2 doesn't re-litigate. PyPortfolioOpt (MIT, active) is the simpler fallback. |
+| **FinNLP / FinGPT** (AI4Finance) | MIT, FinNLP 482★, 19 news + 8 social + 3 filing source adapters | 📖 **reference only** | Catalog of scraper adapters (Seeking Alpha, CNBC paths etc.) to consult if we add sources; most wrap APIs we already integrate with more robustness (extraction, dedup, circuit breakers). FinGPT's fine-tuned models: skip — we route general LLMs via CLI. |
+| TradingAgents / FinRobot | (assessed in IMPROVEMENT_PLAN_V3) | 📖 already referenced | Competitor architecture references; nothing new to adopt. |
+
+Net-new capability unlocked by this round: **real sector benchmark baskets** (FinanceDatabase), **exact ratio fidelity** (FinanceToolkit formulas over PIT data), **calendar correctness insurance** (pandas-market-calendars), **richer debate personas** (ai-hedge-fund prompts), and a pre-made decision for the Phase-3.2 portfolio engine (Riskfolio-Lib). Implementation queue: handoff doc Round 5 (WP25).
+
+---
+
+## §12 Round 6 — review findings & blind-spot solutions (2026-07-07)
+
+Post-Rounds-3–5 review (verdicts in the execution log) surfaced defects **and** confirmed four strategic blind spots. Solutions are specced as handoff Round 6 (WP26–WP30). Summary of the reasoning:
+
+| Blind spot / defect | Why it discounts the outcome | Solution |
+|---|---|---|
+| **Server OOM crash** (F12): full-store `structuredClone` per save blew the 2 GB heap mid-collection | Silent process death ⇒ missed runs, stale data, and the likeliest root cause of the June-30→July-4 scheduler gap | WP26 (remove clone, heap telemetry, crash-detection lock file, launchd restart) |
+| **Benchmark integrity** (F13): capped runs never load SPY; missing benchmark silently makes excess = raw; sector ETFs only excluded as literal "SPY" | "Excess return" numbers that are actually raw returns poison every comparison; ETF bars (now loaded for sector baskets) would be traded as stocks | WP27 (benchmark set isolation, `missing_benchmark` quality flag, evidence re-run) |
+| **Survivorship bias**: the corpus is today's watchlist — winners by construction | Every backtest excess number is an upper bound, possibly 100% artifact; rankIC conclusions (two-sleeve rationale) inherit the bias | WP29 (PIT S&P membership table, member-bars backfill, `universeMode:"pit"`, D17 re-judgement) |
+| **Never-exercised promotion path** + **unmeasured LLM channel** + **invisible calendar bottleneck** | First real promotion would debut untested machinery; LLM channel cost/benefit unknown; owner switches (watcher/push/debate) stay off because nothing surfaces them | WP30 (sandboxed promotion fire-drill, LLM counterfactual scorecard, go-live status card) |
+| **Dual-active strategy versions** (F14) | Audit trail cannot say which version governed a decision | WP28 (single-active invariant + migration) |
+
+Standing caution until WP27 lands: `historical_bars` now contains 12 sector-ETF ticker sets (loaded 2026-07-07 to enable sector baskets) — **do not treat new uncapped walk-forward runs as evidence** until the benchmark/universe split is merged.
+
+Owner actions (not Codex work, restated): enable `INTRADAY_WATCHER_ENABLED` + push, enable `AGENT_DEBATE_DAILY_ENABLED` (starts the Phase-3.1 shadow clock and feeds WP30b), commit the still-uncommitted README.md / ROADMAP_FINAL.md, and start the server with `NODE_OPTIONS=--max-old-space-size=6144` until WP26 lands.
+
+---
+
+## §13 Trader Mirror agent（操作画像）— design (2026-07-07)
+
+**Owner request**: an agent that reads the owner's real buy/sell operations, concludes what they usually do, classifies their style, shows how it turned out, and coaches based on it.
+
+**What exists already (build on, do not duplicate)**: `db.trades` ledger with `sanitizeTrade`/`mergeTrades` (dedup on `externalId`/`orderId`), manual + CSV/text import + IBKR Flex sync (`/api/ibkr/flex-sync`), FIFO closed-lot matching in `calculateTradeJournal` with performance splits (strategy/emotion/tag/month/holding-bucket/plan-quality), equity curve + realized max-DD, and `/api/trade-recommendation-reconciliation` (trade↔recommendation matching). **The ledger is currently empty** — the owner has never imported trades — so ingestion is the first mile. Verified today: `longbridge order executions --history --start <date> --format json` returns the owner's real fills (primary broker).
+
+**Constitution fit**: all numbers, cohorts, and style *tags* are computed deterministically with thresholds in versioned code; the LLM writes narrative and coaching **on top of** the computed metrics, citing metric ids, and never assigns tags, scores, or thresholds. Every metric carries `n`; any dimension below its min-samples reports `insufficient_data` instead of a confident label ("you can backtest an equation; you cannot backtest a mood" applies to the owner too).
+
+Architecture (→ handoff Round 7, WP31):
+
+1. **Fills ingestion (31a)** — Longbridge executions bridge with a sync watermark, merged into `db.trades` via the existing dedup; IBKR Flex stays; daily auto-sync + manual button.
+2. **Behavioral metrics engine (31b)** — `lib/trader_profile.mjs`, consuming the journal's closed lots + `historical_bars` context. New metric families: entry behavior (chase rate = buys within 2% of trailing 20d high vs pullback entries, each cohort's outcome), exit behavior (disposition ratio: holding days losers vs winners; MFE capture = exit vs max close in window; revenge re-entry rate after losses), sizing (size CV, size-vs-outcome correlation), concentration (sector HHI via `security_master_ext`), reactivity (activity after big SPY/VIX moves), counterfactuals (hold-20-more-days and SPY-same-window alternative returns → "sold too early/late" evidence). Rule-based style classifier over 5 axes (horizon / entry style / risk discipline / diversification / turnover), thresholds versioned as `styleSchema`.
+3. **System-overlap (31c)** — follow-rate vs the recommender's actionable list, outcome comparison of system-followed vs owner-instinct trades, "ignored winners" count. Answers: does the owner beat their own tool?
+4. **LLM narrator (31d)** — `harness/agents/trader_mirror.md`, narrative-only, every claim cites metric ids, coaching must be if-then behavioral rules tied to cohort deltas. Privacy: sending trade data to an LLM provider is opt-in (`TRADER_MIRROR_LLM_ENABLED`, default false); the deterministic report renders fully without it.
+5. **API/UI (31e)** — `GET /api/trader-profile`, `POST /api/trader-profile/refresh`; 交易画像 card: style tags with evidence, metric table with `n` badges, coaching list, overlap panel; profile snapshots persisted for future drift view.
+
+### D17 (2026-07-10) — Survivorship re-judgement on the PIT universe (closes the WP29d question)
+
+Evidence: run `hist-bt-1783626982204-07952cba` (8,556 decisions / 25,519 outcomes / 1,830 days; 603-member PIT coverage 90.7%). T+20 excess −0.139% (n=8,411), hit 49.2%; momentum rankIC −0.0155 (n=25,445) — same sign as the watchlist corpus. **Decisions**: (1) all pre-PIT excess metrics are demoted to "survivorship-contaminated — do not cite"; (2) the two-sleeve design (short-horizon reversal handling) **stands** — reversal is universe-independent; (3) macroRegime (+0.046 rankIC) is promoted to first-class evidence — regime-conditioned analysis becomes a standing report section; (4) factor-development priority shifts decisively to non-price factors (PIT fundamentals, revisions, catalyst) since the price sleeve alone shows ≈0 net alpha on the honest universe — the backtest cannot see the live-only factors, so live shadow evidence remains the deciding channel for them.
+
+WP34 full-grid addendum: run `hist-bt-1783632041459-f87d2d9d` persisted full detail rows after chunked SQLite persistence (8,556 decisions / 33,693 outcomes / 1,830 daily rows; 601 of 662 PIT members with bars = 90.79% coverage; gridTruncated=false). Horizon evidence is now explicit: T+1 excess −0.095% (n=8,536), T+5 +0.057% (n=8,498), T+20 −0.139% (n=8,411), T+60 −0.272% (n=8,157). Across the 1/5/20/60 outcome set, momentum rankIC is −0.0405 (n=33,602, effectiveN 8,536) and macroRegime rankIC is +0.0651 (n=33,602, effectiveN 8,536). Cost sensitivity for the diagnostic daily-rebalanced always-invested topN equity book remains poor even before friction (0 bps excessReturnPct −47.66%, MaxDD −63.54%, Sharpe −0.789; 15 bps excessReturnPct −51.45%, MaxDD −65.41%, Sharpe −0.891), reinforcing the rule that per-decision horizon metrics are the primary evidence and equity-book metrics are implementation diagnostics only.

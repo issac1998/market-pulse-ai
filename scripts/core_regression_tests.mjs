@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { execFileSync } from "node:child_process";
 import crypto from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
@@ -47,7 +48,12 @@ import {
   normalizeHistoricalBars,
 } from "../lib/historical_features.mjs";
 import { runIntradayWatcherOnce } from "../server/intraday_watcher.mjs";
-import { historicalMaxDrawdownFromReturns, runHistoricalWalkForwardFromRows } from "../server/historical_backtest.mjs";
+import {
+  historicalBacktestDetailsFromSqlite,
+  historicalMaxDrawdownFromReturns,
+  runHistoricalWalkForwardFromRows,
+  runHistoricalWalkForwardFromSqlite,
+} from "../server/historical_backtest.mjs";
 import { proxyFetchResponse } from "../server/network_fetch.mjs";
 import {
   gitBlobSha1,
@@ -1689,6 +1695,46 @@ assert.ok(
   historicalWalkForward.run.daily.some((row) => Number.isFinite(row.portfolioReturnPct)),
   "Historical daily book should expose equal-weight open-position portfolio returns",
 );
+assert.equal(
+  historicalWalkForward.run.metrics.grid.maxDatesExplicit,
+  true,
+  "Historical walk-forward should record whether maxDates was explicit",
+);
+assert.ok(
+  historicalWalkForward.run.metrics.costSensitivity.rows.map((row) => row.roundTripCostBps).includes(0) &&
+    historicalWalkForward.run.metrics.costSensitivity.rows.map((row) => row.roundTripCostBps).includes(5) &&
+    historicalWalkForward.run.metrics.costSensitivity.rows.map((row) => row.roundTripCostBps).includes(15),
+  "Historical equity-book metrics should include 0/5/15 bps cost sensitivity rows",
+);
+assert.ok(
+  historicalWalkForward.run.metrics.byHorizonDays["1"]?.sampleCount > 0 &&
+    historicalWalkForward.run.metrics.byHorizonDays["3"]?.sampleCount > 0,
+  "Historical metrics should expose per-horizon summaries for report/D17 evidence",
+);
+assert.equal(
+  historicalWalkForward.run.metrics.implementation.equityBook,
+  "daily-rebalanced always-invested topN",
+  "Historical report should label the equity-book implementation honestly",
+);
+const omittedGridWalkForward = runHistoricalWalkForwardFromRows({
+  bars: historicalBacktestBars,
+  regimes: [{ date: "2026-01-01", bucket: "宏观顺风", risk_score: 38 }],
+  config: {
+    minLookback: 20,
+    topN: 2,
+    horizons: [1],
+    primaryHorizon: 1,
+  },
+});
+assert.equal(
+  omittedGridWalkForward.run.metrics.grid.maxDatesExplicit,
+  false,
+  "Omitted maxDates should be visible in the historical grid metadata",
+);
+assert.ok(
+  omittedGridWalkForward.run.metrics.grid.warning,
+  "Omitted maxDates should emit a prominent grid warning",
+);
 const missingBenchmarkWalkForward = runHistoricalWalkForwardFromRows({
   bars: historicalBacktestBars.filter((row) => !["SPY", "XLK"].includes(row.ticker)),
   regimes: [{ date: "2026-01-01", bucket: "宏观顺风", risk_score: 38 }],
@@ -1738,6 +1784,67 @@ assert.ok(
   Object.values(historicalWalkForward.run.factorAnalysis.factorStats).some((row) => Object.keys(row.horizons || {}).length > 0),
   "Historical factor stats should include per-horizon cells with n",
 );
+
+const historicalSqliteTmp = fs.mkdtempSync(path.join(os.tmpdir(), "market-pulse-historical-sqlite-"));
+try {
+  const sqlitePath = path.join(historicalSqliteTmp, "historical.sqlite");
+  const quote = (value) => `'${String(value ?? "").replace(/'/g, "''")}'`;
+  const barValues = historicalBacktestBars
+    .map((row) =>
+      `(${quote(row.ticker)},${quote(row.date)},${row.open},${row.high},${row.low},${row.close},${row.volume},${quote(row.source)})`,
+    )
+    .join(",");
+  execFileSync("sqlite3", [sqlitePath], {
+    input: `
+CREATE TABLE historical_bars(ticker TEXT,date TEXT,open REAL,high REAL,low REAL,close REAL,volume REAL,source TEXT,PRIMARY KEY(ticker,date,source));
+CREATE TABLE historical_regimes(date TEXT PRIMARY KEY,bucket TEXT,risk_score REAL,json TEXT NOT NULL);
+CREATE TABLE security_master_ext(ticker TEXT PRIMARY KEY,name TEXT,sector TEXT,industry_group TEXT,industry TEXT,country TEXT,market_cap_bucket TEXT,market_cap REAL,exchange TEXT,mic TEXT);
+INSERT INTO historical_bars(ticker,date,open,high,low,close,volume,source) VALUES ${barValues};
+INSERT INTO historical_regimes(date,bucket,risk_score,json) VALUES ('2026-01-01','宏观顺风',38,'{}');
+INSERT INTO security_master_ext(ticker,name,sector,industry_group,industry,country,market_cap_bucket,market_cap,exchange,mic)
+VALUES ('AAPL','Apple','Information Technology','Technology Hardware & Equipment','Technology Hardware','US','mega',0,'NASDAQ','XNAS'),
+       ('MSFT','Microsoft','Information Technology','Software & Services','Software','US','mega',0,'NASDAQ','XNAS');
+`,
+    encoding: "utf8",
+  });
+  const sqliteBacktest = await runHistoricalWalkForwardFromSqlite({
+    sqlitePath,
+    config: {
+      startDate: "2026-01-01",
+      endDate: "2026-03-31",
+      minLookback: 20,
+      maxDates: 4,
+      topN: 2,
+      horizons: [1, 3],
+      primaryHorizon: 1,
+      costBps: 1,
+      slippageBps: 1,
+      compactResponse: false,
+      bridgeTimeoutMs: 1000,
+      sqliteTimeoutMs: 30000,
+      barLoadChunkSize: 2,
+    },
+  });
+  assert.equal(sqliteBacktest.run.persistence.persisted, true, "Historical SQLite run should persist details");
+  assert.equal(
+    sqliteBacktest.run.persistence.inserted.outcomes,
+    sqliteBacktest.run.detailCounts?.outcomes || sqliteBacktest.run.outcomes.length,
+    "Chunked persistence should insert all historical outcome rows",
+  );
+  const outcomePage = await historicalBacktestDetailsFromSqlite({
+    sqlitePath,
+    runId: sqliteBacktest.run.id,
+    kind: "outcomes",
+    pageSize: 500,
+  });
+  assert.equal(
+    outcomePage.total,
+    sqliteBacktest.run.detailCounts?.outcomes || sqliteBacktest.run.outcomes.length,
+    "Persisted historical outcome row count should match detailCounts",
+  );
+} finally {
+  fs.rmSync(historicalSqliteTmp, { recursive: true, force: true });
+}
 assert.ok(
   Object.values(historicalWalkForward.run.factorAnalysis.factorStats).some((row) => Number(row.effectiveN) < Number(row.n || row.samples)),
   "Historical factor stats should include effectiveN below raw n when multiple horizons overlap",

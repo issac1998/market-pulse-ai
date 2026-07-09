@@ -2586,3 +2586,134 @@ Contradictions / deferred checks:
 
 - Partial implementation caveat: because `server.mjs` is an ES module with static imports, code inside `server.mjs` cannot run before Node resolves already-imported modules. The boot preflight still runs before the HTTP listener and catches unreadable first-party files that are not already fatal to module loading. A true "pre-import" detector would require launching through a separate bootstrap entrypoint.
 - Harness fail-fast was verified at the shared preflight layer; the scheduled debate/factor-researcher flows remain disabled by default and were not force-enabled against unreadable production harness files.
+
+---
+
+## First honest training run — PIT universe walk-forward — 2026-07-10 (overnight)
+
+**Corpus**: 642,775 daily bars / 641 tickers after the WP29 backfill (603 of 665 point-in-time S&P members have bars = 90.7% coverage; 62 delisted/renamed symbols honestly `bars_unavailable`). Run `hist-bt-1783626982204-07952cba`: `universeMode:"pit"`, topN 5, horizons 1/5/20, costs 5+10 bps, full date grid → **8,556 decisions, 25,519 outcomes, 1,830 trading days, T+20 sample n=8,411**. `missingBenchmark` 20/8,431 (0.2% — WP27 integrity holding).
+
+### Headline (T+20, cost-inclusive)
+
+| Metric | PIT universe (honest) | Old watchlist corpus (survivorship-biased) |
+|---|---|---|
+| avg excess vs SPY | **−0.139%** | +2.10% |
+| hit rate (>+0.5%) | **49.2%** | 55.7% |
+| pooled momentum rankIC | **−0.0155** (n=25,445) | −0.042 |
+| macroRegime rankIC | **+0.0456** | (n/a) |
+
+**Interpretation (read carefully — both anti-fooling directions):**
+1. The old positive excess was **survivorship artifact**, as suspected. On the honest universe the price-derived factor stack has ≈0 alpha after 15 bps costs.
+2. **This is NOT proof the live strategy is worthless**: the backtest can only reconstruct price-derived factors (momentum, liquidity proxy, macroRegime, partial quality); newsCatalyst/optionsFlow/social/earningsRevision default to neutral in history (provenance labels them not-reconstructable). What died is the idea that the *price sleeve alone* carries edge. The live stack's non-price factors are unmeasured, not disproven — and the agent trades gated top-3, not always-invested daily top-5.
+3. The equity-book metrics (maxDD −65%, Sharpe −0.89) reflect a daily-rebalanced always-invested top-5 implementation whose cost drag alone is ~38%/yr — per-decision metrics are the primary evidence, the equity book needs a cost-sensitivity row (→ WP34).
+4. **macroRegime is the only consistently positive IC** (+0.046) — regime awareness carries most of the reconstructable signal.
+5. Candidate weights barely moved (2%-step cap working); status `candidate-only`, correctly not adoptable from backtest evidence.
+
+### D17 (recorded in CAPABILITY_GAPS §9): momentum reversal CONFIRMED universe-independent (rankIC −0.0155 on PIT, n=25k, same sign as watchlist −0.042) → **the two-sleeve design decision stands**. The PIT rerun also confirms the priority shift: factor V2's non-price factors (PIT fundamentals, revisions) are where edge must come from.
+
+### Scale bugs found tonight (engine was never exercised at honest-universe scale) — all hotfixed or specced
+
+- **B-scale-1**: `build_universe_membership.py` deadlocked its own backfill children via an uncommitted parent transaction → 100% `database is locked`. ⚙ Hotfixed (`conn.commit()` after membership insert); Codex has since landed WP33d hardening (busy_timeout, retry, `--merge-into`) in parallel — merge used tonight (`rowsChanged: 591,935`).
+- **B-scale-2**: `sqliteJson` child `maxBuffer` 64 MB < 642k-bar payload. ⚙ Hotfixed to 1 GB; real fix = batched/streamed bar loading (WP34).
+- **B-scale-3**: full-run SQLite persistence fails with `Invalid string length` (single JSON.stringify of 25k outcomes) → **full-grid details are not persisted anywhere**; only aggregates survive. Fix = chunked inserts + per-section stringify (WP34). Until then, full-grid runs are aggregate-only evidence.
+- **B-scale-4** (behavioral): engine silently defaults to a ~30-date grid when `maxDates` is omitted — a "full training run" that quietly evaluates one month. Fix = require explicit `maxDates` or emit a loud `gridTruncated` flag (WP34).
+
+---
+
+## WP34 — Walk-forward engine at honest-universe scale — 2026-07-10
+
+What changed:
+
+- Replaced the single large historical-bars SQLite read with per-ticker chunked loads (`barLoadChunkSize`, default 80), removing the reviewer-only 1 GB `maxBuffer` band-aid.
+- Reworked historical backtest persistence so runs store compact run/report JSON while decisions, outcomes, and daily rows are inserted in chunks of 500 rows or fewer. Detail rows are stringified per row and paginated through the existing detail endpoint.
+- Added explicit grid metadata to metrics, report, scope, config, and provenance. Omitted `maxDates` now emits a visible warning; explicit full-grid runs show `gridTruncated:false`.
+- Added equity-book implementation labeling and cost sensitivity rows for 0/5/15 bps. These are diagnostic only; per-decision horizon metrics remain the primary evidence.
+- Added deterministic per-horizon summaries (`metrics.byHorizonDays`) so T+60 and other horizons are visible without reading raw outcomes.
+- Reduced the hot-path PIT loop by caching PIT fundamentals by ticker, caching macro regime by signal date, and using a binary K-line cutoff instead of repeatedly filtering full ticker histories.
+
+Files/functions:
+
+- `server/historical_backtest.mjs`: `sqliteJsonForTickerChunks`, `lastBarIndexAtOrBefore`, `horizonBreakdown`, `equityBookCostSensitivity`, chunked `persistHistoricalBacktestRun`, grid metadata, compact run persistence, per-horizon metrics.
+- `scripts/core_regression_tests.mjs`: regression coverage for grid metadata, cost-sensitivity rows, per-horizon summaries, and SQLite detail persistence row counts.
+- `docs/CODEX_EXECUTION_HANDOFF.md`: WP34 status marked complete.
+- `docs/CAPABILITY_GAPS_AND_HISTORICAL_LEARNING.md`: D17 addendum with full 1/5/20/60 PIT evidence.
+
+Verification output:
+
+```text
+$ node --check server/historical_backtest.mjs
+<no output>
+
+$ node --check scripts/core_regression_tests.mjs
+<no output>
+
+$ node --check server.mjs && node --check public/app.js && git diff --check
+<no output>
+
+$ rg -n "1024 \\* 1024 \\* 1024|Invalid string length|maxBuffer: 1024|rows\\.filter\\(\\(row\\) => row\\.date <= signalDate\\)" server/historical_backtest.mjs || true
+<no output>
+
+$ node scripts/core_regression_tests.mjs
+core_regression_tests: ok
+```
+
+120-date real SQLite PIT smoke:
+
+```json
+{
+  "runId": "hist-bt-1783631759902-9617035f",
+  "ms": 50504,
+  "detailCounts": { "decisions": 600, "outcomes": 1999, "daily": 121 },
+  "inserted": { "decisions": 600, "outcomes": 1999, "daily": 121 },
+  "detailTotals": { "decisions": 600, "outcomes": 1999, "daily": 121 },
+  "grid": { "maxDatesExplicit": true, "maxDates": 120, "selectedDates": 120, "gridTruncated": true },
+  "h20": { "n": 485, "avgExcessPct": 2.8244, "hitRate": 0.5093 },
+  "h60": { "n": 297, "avgExcessPct": 4.1245, "hitRate": 0.4175 }
+}
+```
+
+Full-grid PIT rerun:
+
+```json
+{
+  "runId": "hist-bt-1783632041459-f87d2d9d",
+  "ms": 270758,
+  "detailCounts": { "decisions": 8556, "outcomes": 33693, "daily": 1830 },
+  "inserted": { "decisions": 8556, "outcomes": 33693, "daily": 1830 },
+  "detailTotals": { "decisions": 8556, "outcomes": 33693, "daily": 1830 },
+  "grid": { "maxDatesExplicit": true, "maxDates": 2000, "availableDates": 1829, "selectedDates": 1829, "gridTruncated": false },
+  "coverage": { "pointInTimeMembers": 662, "membersWithBars": 601, "coveragePct": 90.79 },
+  "horizons": {
+    "1": { "n": 8536, "avgExcessPct": -0.0947, "hitRate": 0.3358 },
+    "5": { "n": 8498, "avgExcessPct": 0.0568, "hitRate": 0.4420 },
+    "20": { "n": 8411, "avgExcessPct": -0.1386, "hitRate": 0.4921 },
+    "60": { "n": 8157, "avgExcessPct": -0.2717, "hitRate": 0.5057 }
+  },
+  "rankIC": {
+    "momentum": { "value": -0.04045, "n": 33602, "effectiveN": 8536 },
+    "macroRegime": { "value": 0.06511, "n": 33602, "effectiveN": 8536 }
+  }
+}
+```
+
+Cost sensitivity from the full-grid run:
+
+| roundTripCostBps | totalReturnPct | excessReturnPct | maxDrawdownPct | Sharpe | n |
+|---:|---:|---:|---:|---:|---:|
+| 0 | 53.07 | -47.66 | -63.54 | -0.789 | 999 |
+| 5 | 46.12 | -48.96 | -64.17 | -0.823 | 999 |
+| 15 | 33.15 | -51.45 | -65.41 | -0.891 | 999 |
+
+Regime split from the full-grid run:
+
+| Regime | n | avgExcessPct | hitRate |
+|---|---:|---:|---:|
+| 宏观中性 | 24,406 | 0.484 | 45.9% |
+| 宏观谨慎 | 5,434 | -1.137 | 37.5% |
+| unknown | 2,624 | -2.571 | 47.4% |
+| 宏观顺风 | 1,020 | -2.565 | 34.2% |
+| 宏观风险收缩 | 118 | 0.278 | 51.7% |
+
+Contradictions / deferred checks:
+
+- None for WP34. The full-grid run persisted all details; row counts match the paginated detail tables. Runtime is still minutes-level (270.8 s for the 603-ticker PIT grid), but no HTTP-size or SQLite string-length failure remains.
