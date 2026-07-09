@@ -99,6 +99,11 @@ import { sendDownload, sendJson } from "./server/http_responses.mjs";
 import { appFetch, fetchJson, fetchText, proxySummary, requestJson } from "./server/network_fetch.mjs";
 import { installProcessErrorHandlers } from "./server/process_errors.mjs";
 import {
+  formatRepoPreflightIssue,
+  runRepoPreflight,
+  verifyRepoIntegrity,
+} from "./server/repo_integrity.mjs";
+import {
   normalizeCatchUpAttempts,
   registerCatchUpAttempt,
   scheduledCollectionRuntime,
@@ -1229,6 +1234,10 @@ let longBridgeActiveCount = 0;
 const longBridgeWaitQueue = [];
 let apeWisdomDetailsNextRequestAt = 0;
 let gdeltNextRequestAt = 0;
+let bootPreflightStatus = null;
+let harnessPreflightStatus = null;
+let repoIntegrityLastResult = null;
+let repoIntegrityLastCheckedAt = "";
 
 function isLoopbackHost(host = "") {
   const value = String(host || "").trim().toLowerCase();
@@ -25307,6 +25316,8 @@ function learningLoopStatusForClient(db = {}) {
       llmScorecard,
       switches: learningLoopSwitchesForClient(),
     }),
+    repoIntegrity: repoIntegrityStatusForClient(),
+    harnessPreflight: harnessPreflightStatus,
   };
 }
 
@@ -39101,6 +39112,66 @@ function runStatusForClient() {
   };
 }
 
+async function runBootRepositoryPreflight() {
+  const result = await runRepoPreflight(__dirname);
+  bootPreflightStatus = { ...result, checkedAt: nowIso() };
+  if (!result.ok) {
+    console.error(formatRepoPreflightIssue(result));
+    process.exit(1);
+  }
+  return result;
+}
+
+async function refreshRepoIntegrityStatus() {
+  try {
+    const result = await verifyRepoIntegrity(__dirname, { issueLimit: 50 });
+    repoIntegrityLastResult = { ...result, checkedAt: nowIso() };
+    repoIntegrityLastCheckedAt = repoIntegrityLastResult.checkedAt;
+  } catch (error) {
+    repoIntegrityLastResult = {
+      schemaVersion: "repo-integrity-v1",
+      ok: false,
+      status: "fail",
+      error: error.message,
+      checkedAt: nowIso(),
+    };
+    repoIntegrityLastCheckedAt = repoIntegrityLastResult.checkedAt;
+  }
+  return repoIntegrityLastResult;
+}
+
+function repoIntegrityStatusForClient() {
+  return {
+    bootPreflight: bootPreflightStatus,
+    integrity: repoIntegrityLastResult,
+    lastCheckedAt: repoIntegrityLastCheckedAt,
+    script: "scripts/verify_repo_integrity.mjs",
+  };
+}
+
+function harnessPreflightRequired() {
+  return Boolean(AGENT_DEBATE_DAILY_ENABLED || FACTOR_RESEARCHER_ENABLED || TRADER_MIRROR_LLM_ENABLED);
+}
+
+async function assertHarnessTreeReadable(context = "harness") {
+  if (!harnessPreflightRequired()) return null;
+  const result = await runRepoPreflight(__dirname, { includeHarness: true });
+  harnessPreflightStatus = { ...result, checkedAt: nowIso(), context };
+  if (!result.ok) {
+    const error = new Error(`harness_unreadable: ${formatRepoPreflightIssue(result)}`);
+    error.code = "harness_unreadable";
+    error.diagnostic = {
+      source: "harness_unreadable",
+      context,
+      issues: result.issues || [],
+      checked: result.checked,
+      durationMs: result.durationMs,
+    };
+    throw error;
+  }
+  return result;
+}
+
 function normalizeHarnessInvoker(value = "") {
   const raw = String(value || "").trim().toLowerCase();
   if (raw === "mock") return "mock";
@@ -39126,6 +39197,7 @@ function parseHarnessJson(stdout = "") {
 }
 
 async function runAgentHarnessDebate(ticker, invokerPreference = "") {
+  await assertHarnessTreeReadable("agent-debate");
   const invoker = normalizeHarnessInvoker(invokerPreference);
   const baseUrl = process.env.AGENT_HARNESS_BASE_URL || `http://127.0.0.1:${PORT}`;
   const args = [
@@ -39152,6 +39224,7 @@ async function runAgentHarnessDebate(ticker, invokerPreference = "") {
 }
 
 async function runAgentHarnessAgent(agentId = "", task = {}, invokerPreference = "") {
+  await assertHarnessTreeReadable(`agent:${agentId || "unknown"}`);
   const invoker = normalizeHarnessInvoker(invokerPreference);
   const baseUrl = process.env.AGENT_HARNESS_BASE_URL || `http://127.0.0.1:${PORT}`;
   const args = [
@@ -39249,7 +39322,14 @@ async function maybeRunDailyShadowDebates() {
         finalDecision: harness.debate.finalDecision || null,
       });
     } catch (error) {
-      results.push({ ticker, status: "failed", error: errorZh(error.message), invoker: normalizeHarnessInvoker(AGENT_DEBATE_DAILY_INVOKER) });
+      results.push({
+        ticker,
+        status: error.code === "harness_unreadable" ? "harness_unreadable" : "failed",
+        error: errorZh(error.message),
+        invoker: normalizeHarnessInvoker(AGENT_DEBATE_DAILY_INVOKER),
+        sourceStatus: error.code || "harness_failed",
+        diagnostic: error.diagnostic || null,
+      });
     }
   }
   const record = {
@@ -39355,6 +39435,8 @@ async function appendFactorPostmortemsForTransitions(db = {}, transitions = [], 
         factorId: transition.factorId,
         transition,
         error: errorZh(error.message),
+        sourceStatus: error.code || "harness_failed",
+        diagnostic: error.diagnostic || null,
       }, "warn");
     }
   }
@@ -41985,6 +42067,21 @@ const server = http.createServer(async (req, res) => {
     }
   }
 });
+
+await runBootRepositoryPreflight();
+await refreshRepoIntegrityStatus();
+setInterval(() => {
+  refreshRepoIntegrityStatus().catch((error) => {
+    repoIntegrityLastResult = {
+      schemaVersion: "repo-integrity-v1",
+      ok: false,
+      status: "fail",
+      error: error.message,
+      checkedAt: nowIso(),
+    };
+    repoIntegrityLastCheckedAt = repoIntegrityLastResult.checkedAt;
+  });
+}, 24 * 60 * 60 * 1000).unref?.();
 
 const bootDb = await ensureStore();
 await setupServerLock(bootDb);

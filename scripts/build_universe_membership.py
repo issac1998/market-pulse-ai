@@ -4,6 +4,9 @@
 The primary source is fja05680/sp500's MIT-licensed ticker start/end table. The
 script stores provenance per row and can optionally call the existing historical
 bar builder to backfill Longbridge daily bars for the PIT members.
+
+Long backfills should run against an isolated working DB and then use
+--merge-into to copy bars/coverage into the live DB in one short transaction.
 """
 
 from __future__ import annotations
@@ -26,6 +29,8 @@ BAR_BUILDER = REPO_ROOT / "scripts" / "build_historical_bars.py"
 FJA_START_END_URL = "https://raw.githubusercontent.com/fja05680/sp500/master/sp500_ticker_start_end.csv"
 FJA_LICENSE_URL = "https://raw.githubusercontent.com/fja05680/sp500/master/LICENSE"
 WIKIPEDIA_SP500_URL = "https://en.wikipedia.org/wiki/List_of_S%26P_500_companies"
+SQLITE_BUSY_TIMEOUT_MS = 30000
+SQLITE_RETRY_DELAYS = (0.25, 0.75, 1.5)
 
 
 def text(value: Any) -> str:
@@ -64,6 +69,27 @@ def fetch_text(url: str, timeout: int = 30) -> str:
         return response.read().decode("utf-8", errors="ignore")
 
 
+def connect_sqlite(path: str | Path) -> sqlite3.Connection:
+    conn = sqlite3.connect(path, timeout=max(30, SQLITE_BUSY_TIMEOUT_MS // 1000))
+    conn.execute(f"PRAGMA busy_timeout={SQLITE_BUSY_TIMEOUT_MS}")
+    return conn
+
+
+def commit_with_retry(conn: sqlite3.Connection) -> None:
+    last_error: Exception | None = None
+    for delay in (0, *SQLITE_RETRY_DELAYS):
+        if delay:
+            time.sleep(delay)
+        try:
+            conn.commit()
+            return
+        except sqlite3.OperationalError as exc:
+            if "locked" not in str(exc).lower() and "busy" not in str(exc).lower():
+                raise
+            last_error = exc
+    raise last_error or sqlite3.OperationalError("sqlite commit failed")
+
+
 def init_schema(conn: sqlite3.Connection) -> None:
     conn.executescript(
         """
@@ -86,6 +112,27 @@ def init_schema(conn: sqlite3.Connection) -> None:
           last_attempt_at TEXT NOT NULL,
           json TEXT NOT NULL
         );
+        """
+    )
+
+
+def init_historical_bars_schema(conn: sqlite3.Connection) -> None:
+    conn.executescript(
+        """
+        CREATE TABLE IF NOT EXISTS historical_bars (
+          ticker TEXT NOT NULL,
+          date TEXT NOT NULL,
+          open REAL,
+          high REAL,
+          low REAL,
+          close REAL,
+          volume REAL,
+          source TEXT NOT NULL,
+          PRIMARY KEY (ticker, date, source)
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_historical_bars_ticker_date
+          ON historical_bars(ticker, date);
         """
     )
 
@@ -331,6 +378,71 @@ def coverage_summary(conn: sqlite3.Connection) -> dict[str, Any]:
     return {row[0]: int(row[1] or 0) for row in rows}
 
 
+def source_table_exists(conn: sqlite3.Connection, table: str) -> bool:
+    return bool(
+        conn.execute(
+            "SELECT COUNT(*) FROM src.sqlite_master WHERE type='table' AND name=?",
+            (table,),
+        ).fetchone()[0]
+        or 0
+    )
+
+
+def merge_into_target(source_db: str, target_db: str) -> dict[str, Any]:
+    source_path = Path(source_db).resolve()
+    target_path = Path(target_db).resolve()
+    if source_path == target_path:
+        return {"status": "skipped", "reason": "source_equals_target"}
+    if not source_path.exists():
+        raise RuntimeError(f"source DB does not exist: {source_path}")
+    target_path.parent.mkdir(parents=True, exist_ok=True)
+    last_error: Exception | None = None
+    for delay in (0, *SQLITE_RETRY_DELAYS):
+        if delay:
+            time.sleep(delay)
+        conn = connect_sqlite(target_path)
+        try:
+            init_schema(conn)
+            init_historical_bars_schema(conn)
+            commit_with_retry(conn)
+            conn.execute("ATTACH DATABASE ? AS src", (str(source_path),))
+            conn.execute("BEGIN IMMEDIATE")
+            before = conn.total_changes
+            if source_table_exists(conn, "universe_membership"):
+                conn.execute(
+                    """
+                    INSERT OR REPLACE INTO universe_membership(ticker, added_at, removed_at, source, json)
+                    SELECT ticker, added_at, removed_at, source, json FROM src.universe_membership
+                    """
+                )
+            if source_table_exists(conn, "universe_coverage_status"):
+                conn.execute(
+                    """
+                    INSERT OR REPLACE INTO universe_coverage_status(ticker, status, source, last_attempt_at, json)
+                    SELECT ticker, status, source, last_attempt_at, json FROM src.universe_coverage_status
+                    """
+                )
+            if source_table_exists(conn, "historical_bars"):
+                conn.execute(
+                    """
+                    INSERT OR REPLACE INTO historical_bars(ticker, date, open, high, low, close, volume, source)
+                    SELECT ticker, date, open, high, low, close, volume, source FROM src.historical_bars
+                    """
+                )
+            commit_with_retry(conn)
+            changed = conn.total_changes - before
+            conn.execute("DETACH DATABASE src")
+            return {"status": "ok", "target": str(target_path), "rowsChanged": changed}
+        except sqlite3.OperationalError as exc:
+            conn.rollback()
+            last_error = exc
+            if "locked" not in str(exc).lower() and "busy" not in str(exc).lower():
+                raise
+        finally:
+            conn.close()
+    raise last_error or sqlite3.OperationalError("merge failed")
+
+
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument("--db", default=str(DEFAULT_DB))
@@ -347,6 +459,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--chunk-size", type=int, default=40)
     parser.add_argument("--sleep-ms", type=int, default=250)
     parser.add_argument("--backfill-timeout", type=int, default=900)
+    parser.add_argument("--merge-into", default="", help="Merge working DB results into this target DB in one short transaction.")
     args = parser.parse_args(argv)
     args.db = str(Path(args.db))
     args.start_ymd = ymd(args.start)
@@ -360,32 +473,41 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
     Path(args.db).parent.mkdir(parents=True, exist_ok=True)
-    conn = sqlite3.connect(args.db)
-    init_schema(conn)
-    rows, source_meta = membership_rows(args)
-    if args.limit_tickers > 0:
-        keep = set(sorted({row["ticker"] for row in rows})[: args.limit_tickers])
-        rows = [row for row in rows if row["ticker"] in keep]
-    inserted = insert_membership(conn, rows, source_meta)
-    tickers = sorted({row["ticker"] for row in rows})
-    backfill = {"status": "skipped"}
-    coverage_status = "not_checked"
-    if args.backfill_bars:
-        backfill = run_bar_backfill(args, tickers)
-        coverage_status = "bars_unavailable"
-    update_coverage_status(conn, tickers, coverage_status, source_meta.get("sourceUrl") or source_meta.get("repository") or args.source, backfill)
-    conn.commit()
-    payload = {
-        "status": "ok" if rows else "empty",
-        "source": source_meta,
-        "membershipRows": len(rows),
-        "uniqueTickers": len(tickers),
-        "insertedOrReplaced": inserted,
-        "start": args.start_ymd,
-        "end": args.end_ymd,
-        "backfill": {"status": backfill.get("status"), "chunks": backfill.get("chunks", 0)},
-        "coverage": coverage_summary(conn),
-    }
+    conn = connect_sqlite(args.db)
+    try:
+        init_schema(conn)
+        rows, source_meta = membership_rows(args)
+        if args.limit_tickers > 0:
+            keep = set(sorted({row["ticker"] for row in rows})[: args.limit_tickers])
+            rows = [row for row in rows if row["ticker"] in keep]
+        inserted = insert_membership(conn, rows, source_meta)
+        # Release the write lock before spawning bar-backfill subprocesses that
+        # open the same database; an uncommitted transaction here deadlocks them.
+        commit_with_retry(conn)
+        tickers = sorted({row["ticker"] for row in rows})
+        backfill = {"status": "skipped"}
+        coverage_status = "not_checked"
+        if args.backfill_bars:
+            backfill = run_bar_backfill(args, tickers)
+            coverage_status = "bars_unavailable"
+        update_coverage_status(conn, tickers, coverage_status, source_meta.get("sourceUrl") or source_meta.get("repository") or args.source, backfill)
+        commit_with_retry(conn)
+        payload = {
+            "status": "ok" if rows else "empty",
+            "source": source_meta,
+            "membershipRows": len(rows),
+            "uniqueTickers": len(tickers),
+            "insertedOrReplaced": inserted,
+            "start": args.start_ymd,
+            "end": args.end_ymd,
+            "backfill": {"status": backfill.get("status"), "chunks": backfill.get("chunks", 0)},
+            "coverage": coverage_summary(conn),
+            "mergeInto": {"status": "skipped"},
+        }
+    finally:
+        conn.close()
+    if args.merge_into:
+        payload["mergeInto"] = merge_into_target(args.db, args.merge_into)
     print(json.dumps(payload, ensure_ascii=False, allow_nan=False))
     return 0
 

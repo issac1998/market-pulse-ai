@@ -8,6 +8,14 @@ import sqlite3
 from pathlib import Path
 from typing import Any
 
+SQLITE_BUSY_TIMEOUT_MS = 30000
+
+
+def connect_sqlite(path: str | Path) -> sqlite3.Connection:
+    conn = sqlite3.connect(path, timeout=max(30, SQLITE_BUSY_TIMEOUT_MS // 1000))
+    conn.execute(f"PRAGMA busy_timeout={SQLITE_BUSY_TIMEOUT_MS}")
+    return conn
+
 
 def text(value: Any) -> str:
     if value is None:
@@ -1464,7 +1472,7 @@ def main() -> None:
     args = parser.parse_args()
     db_path = Path(args.db)
     db_path.parent.mkdir(parents=True, exist_ok=True)
-    conn = sqlite3.connect(db_path)
+    conn = connect_sqlite(db_path)
     try:
         if args.status:
             payload = {"status": "ok", "db": str(db_path), **status(conn)}

@@ -426,6 +426,8 @@ Every save rewrites one ~50 MB `store.json`. Beyond the F12/F15 heap+latency cos
 
 ## WP33 — Repo/runtime integrity self-check (P2)
 
+**Status: [x] Completed 2026-07-10.** See `docs/INVESTMENT_ASSISTANT_ROADMAP_FINAL_EXECUTION.md` WP33 section for implementation details and verification output.
+
 F18 went undetected until the process died mid-import. Two cheap detectors:
 - **33a — boot preflight**: before starting the HTTP listener, stat+open-read 1 byte from every first-party module in the import graph (`server/**/*.mjs`, `lib/*.mjs`) and the critical data files (`strategies/*.json`); on failure, print ONE clear line naming the unreadable file (and hint: iCloud eviction / permissions) and exit non-zero. Budget <200 ms.
 - **33b — `scripts/verify_repo_integrity.mjs`**: compares working-tree files against `.git/index` blob SHAs (pure Node, no git binary needed — the reviewer's recovery used exactly this technique) and reports missing/dataless/modified files. Run it in the go-live status card (WP30c) as a daily "repo integrity" row.
@@ -434,8 +436,12 @@ F18 went undetected until the process died mid-import. Two cheap detectors:
 
 ## WP33 addendum — 33d: SQLite writer contention in bridge scripts (found live 2026-07-09)
 
+**Status: [x] Completed as part of WP33 on 2026-07-10.**
+
 First `--backfill-bars` run against the production `data/market_pulse.sqlite` failed wholesale with `sqlite3.OperationalError: database is locked` — the server's mirror sync held the writer lock through the pre-market collection window, and `build_historical_bars.py` (and its callers) neither sets `PRAGMA busy_timeout` nor retries. All 646 members were marked `bars_unavailable` with zero rows written (the coverage labels were honest, which is how it was caught). Fix: (1) every bridge script that writes SQLite sets `busy_timeout >= 30000` on connect and retries the final metadata/coverage transaction; (2) `build_universe_membership.py` gains a `--merge-into <db>` mode formalizing the reviewer's workaround — backfill into an isolated working DB, then merge `historical_bars`/`universe_coverage_status` into the target in one short `ATTACH` transaction; (3) document in the script header that long backfills must not share a writer with a live server. **Verify**: backfill completes with the server running and mirror-sync active; zero `database is locked` in output; merge is atomic.
 
 ## WP33d addendum 2 — actual root cause of the backfill lock (hotfixed in review, absorb the diff)
+
+**Status: [x] Completed as part of WP33 on 2026-07-10.**
 
 The `database is locked` failures were **not** (primarily) server contention: `build_universe_membership.py` held an **uncommitted write transaction** (from `insert_membership`) while spawning `build_historical_bars.py` subprocesses against the same DB file — the parent deadlocked its own children, 100% failure both times, including against an isolated DB. Reviewer hotfix (in working tree): `conn.commit()` immediately after `insert_membership` with a comment. Codex: absorb the diff; keep the WP33d busy_timeout + `--merge-into` items (they are still correct hardening); add a regression-style smoke that runs `--limit-tickers 2 --backfill-bars` against a temp DB and asserts `coverage.bars_available == 2` — the original WP29 verification never exercised `--backfill-bars` end-to-end, which is how this shipped. `update_coverage_status` itself was correct (per-ticker bar-count check) — no change needed there.

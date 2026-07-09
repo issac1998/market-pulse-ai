@@ -31,6 +31,8 @@ DEFAULT_STORE = REPO_ROOT / "data" / "store.json"
 DEFAULT_BRIDGE = REPO_ROOT / "scripts" / "akshare_bridge.py"
 DEFAULT_IBKR_BRIDGE = REPO_ROOT / "scripts" / "ibkr_gateway_bridge.py"
 FRED_SERIES = ("DGS10", "DGS2", "T10Y2Y", "BAMLC0A0CM", "T10YIE", "VIXCLS")
+SQLITE_BUSY_TIMEOUT_MS = 30000
+SQLITE_RETRY_DELAYS = (0.25, 0.75, 1.5)
 
 
 def text(value: Any) -> str:
@@ -92,6 +94,27 @@ def load_env_file(path: Path) -> None:
         key = key.strip()
         if key and key not in os.environ:
             os.environ[key] = value.strip().strip('"').strip("'")
+
+
+def connect_sqlite(path: str | Path) -> sqlite3.Connection:
+    conn = sqlite3.connect(path, timeout=max(30, SQLITE_BUSY_TIMEOUT_MS // 1000))
+    conn.execute(f"PRAGMA busy_timeout={SQLITE_BUSY_TIMEOUT_MS}")
+    return conn
+
+
+def commit_with_retry(conn: sqlite3.Connection) -> None:
+    last_error: Exception | None = None
+    for delay in (0, *SQLITE_RETRY_DELAYS):
+        if delay:
+            time.sleep(delay)
+        try:
+            conn.commit()
+            return
+        except sqlite3.OperationalError as exc:
+            if "locked" not in str(exc).lower() and "busy" not in str(exc).lower():
+                raise
+            last_error = exc
+    raise last_error or sqlite3.OperationalError("sqlite commit failed")
 
 
 def init_schema(conn: sqlite3.Connection) -> None:
@@ -796,7 +819,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 def main(argv: list[str] | None = None) -> int:
     load_env_file(REPO_ROOT / ".env")
     args = parse_args(argv)
-    conn = sqlite3.connect(args.db)
+    conn = connect_sqlite(args.db)
     conn.row_factory = sqlite3.Row
     init_schema(conn)
     tickers, universe_meta = build_universe(args)
@@ -815,7 +838,7 @@ def main(argv: list[str] | None = None) -> int:
             source = meta.get("source") or (rows[0]["source"] if rows else "unknown")
             source_counts[source] = source_counts.get(source, 0) + len(rows)
             processed += 1
-            conn.commit()
+            commit_with_retry(conn)
             print(json.dumps({"ticker": ticker, "rows": len(rows), "insertedOrReplaced": inserted, "source": source}, ensure_ascii=False), flush=True)
         except Exception as exc:
             errors.append({"ticker": ticker, "error": f"{type(exc).__name__}: {exc}"})
@@ -824,7 +847,7 @@ def main(argv: list[str] | None = None) -> int:
             time.sleep(args.sleep_ms / 1000)
     regime_meta = build_historical_regimes(conn, args)
     write_metadata(conn, tickers, universe_meta, source_counts, regime_meta)
-    conn.commit()
+    commit_with_retry(conn)
     spot_checks = sample_spot_checks(conn, tickers)
     payload = {
         "status": "ok" if processed or skipped else "empty",

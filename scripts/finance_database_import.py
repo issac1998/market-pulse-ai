@@ -19,6 +19,13 @@ BENCHMARK_OR_ETF_TICKERS = {
     "XLK", "XLE", "XLF", "XLV", "XLY", "XLP", "XLI", "XLB", "XLU", "XLRE", "XLC", "SMH", "SOXX",
     "SPCX",
 }
+SQLITE_BUSY_TIMEOUT_MS = 30000
+
+
+def connect_sqlite(path: str | Path) -> sqlite3.Connection:
+    conn = sqlite3.connect(path, timeout=max(30, SQLITE_BUSY_TIMEOUT_MS // 1000))
+    conn.execute(f"PRAGMA busy_timeout={SQLITE_BUSY_TIMEOUT_MS}")
+    return conn
 
 
 def text(value: Any) -> str:
@@ -210,7 +217,7 @@ def main() -> int:
         except Exception as exc:
             errors.append(f"{exchange}: {type(exc).__name__}: {exc}")
 
-    conn = sqlite3.connect(args.db)
+    conn = connect_sqlite(args.db)
     ensure_schema(conn)
     rows = sorted(all_rows.values(), key=lambda item: item["ticker"])
     conn.executemany(

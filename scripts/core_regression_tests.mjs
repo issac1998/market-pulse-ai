@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import crypto from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -48,6 +49,11 @@ import {
 import { runIntradayWatcherOnce } from "../server/intraday_watcher.mjs";
 import { historicalMaxDrawdownFromReturns, runHistoricalWalkForwardFromRows } from "../server/historical_backtest.mjs";
 import { proxyFetchResponse } from "../server/network_fetch.mjs";
+import {
+  gitBlobSha1,
+  preflightReadablePaths,
+  verifyRepoIntegrity,
+} from "../server/repo_integrity.mjs";
 import { readSectionedStore, writeSectionedStore } from "../server/sectioned_store.mjs";
 import { evaluateFactorSpec, parseFactorSpec } from "../lib/factor_spec.mjs";
 import {
@@ -144,6 +150,49 @@ try {
   assert.deepEqual(partial.store, { alerts: [{ id: "a1" }] }, "Partial section writes should still leave a loadable store");
 } finally {
   fs.rmSync(sectionedStoreTmp, { recursive: true, force: true });
+}
+
+function buildTestGitIndex(entries) {
+  const header = Buffer.alloc(12);
+  header.write("DIRC", 0, "utf8");
+  header.writeUInt32BE(2, 4);
+  header.writeUInt32BE(entries.length, 8);
+  const chunks = [header];
+  for (const entry of entries) {
+    const pathBytes = Buffer.from(entry.path, "utf8");
+    const fixed = Buffer.alloc(62);
+    fixed.writeUInt32BE(0o100644, 24);
+    fixed.writeUInt32BE(entry.size, 36);
+    Buffer.from(entry.oid, "hex").copy(fixed, 40);
+    fixed.writeUInt16BE(Math.min(pathBytes.length, 0x0fff), 60);
+    const body = Buffer.concat([fixed, pathBytes, Buffer.from([0])]);
+    const padding = Buffer.alloc((8 - (body.length % 8)) % 8);
+    chunks.push(body, padding);
+  }
+  const withoutChecksum = Buffer.concat(chunks);
+  return Buffer.concat([withoutChecksum, crypto.createHash("sha1").update(withoutChecksum).digest()]);
+}
+
+const integrityTmp = fs.mkdtempSync(path.join(os.tmpdir(), "market-pulse-repo-integrity-"));
+try {
+  fs.mkdirSync(path.join(integrityTmp, ".git"), { recursive: true });
+  const trackedPath = path.join(integrityTmp, "tracked.txt");
+  fs.writeFileSync(trackedPath, "ok", "utf8");
+  fs.writeFileSync(
+    path.join(integrityTmp, ".git", "index"),
+    buildTestGitIndex([{ path: "tracked.txt", oid: gitBlobSha1(Buffer.from("ok")), size: 2 }]),
+  );
+  const cleanIntegrity = await verifyRepoIntegrity(integrityTmp);
+  assert.equal(cleanIntegrity.ok, true, "Repo integrity checker should accept a matching working file");
+  fs.writeFileSync(trackedPath, "", "utf8");
+  const truncatedIntegrity = await verifyRepoIntegrity(integrityTmp);
+  assert.equal(truncatedIntegrity.ok, false, "Repo integrity checker should flag a truncated tracked file");
+  assert.equal(truncatedIntegrity.issues[0].reason, "dataless_or_truncated", "Truncated tracked files should be labeled clearly");
+  const preflight = await preflightReadablePaths([trackedPath], { repoRoot: integrityTmp });
+  assert.equal(preflight.ok, false, "Preflight should fail empty critical files");
+  assert.equal(preflight.issues[0].reason, "empty", "Preflight should label empty files");
+} finally {
+  fs.rmSync(integrityTmp, { recursive: true, force: true });
 }
 
 assert.equal(isNyseTradingDay("2026-07-03"), false, "Independence Day observed should be closed in 2026");

@@ -2492,3 +2492,97 @@ Contradictions / deferred checks:
 - No implementation contradiction.
 - The WP32 watcher-only p95 save timing was not run against the production watcher loop in this session; the regression fixture verifies the underlying dirty-section behavior by changing only `intradayWatcher` and asserting only `intradayWatcher.json` is written.
 - WP33 remains open and is the next Round 8 item.
+
+---
+
+## WP33 — Repo/Runtime Integrity And SQLite Writer Hardening — 2026-07-10
+
+What changed:
+
+- Added `server/repo_integrity.mjs` with:
+  - first-party preflight path discovery for `server/**/*.mjs`, top-level `lib/*.mjs`, `strategies/*.json`, and optionally `harness/**`;
+  - readable-file preflight that stats and reads one byte from every critical file;
+  - pure Node `.git/index` parser and working-tree blob comparison.
+- Added `scripts/verify_repo_integrity.mjs`, a pure Node CLI that reports missing/unreadable/modified/truncated tracked files without invoking `git`.
+- Server boot now runs repo preflight before `server.listen`; failure prints one clear line naming the unreadable file and exits non-zero.
+- Go-live learning status now includes boot preflight, latest repo integrity check, and harness preflight status.
+- Harness entry points now fail fast with `harness_unreadable` diagnostics when LLM harness features are enabled and required files are unreadable.
+- SQLite writer hardening:
+  - `scripts/build_historical_bars.py`, `scripts/build_universe_membership.py`, `scripts/finance_database_import.py`, `scripts/edgar_pit_bridge.py`, and `scripts/sqlite_store_sync.py` now set `PRAGMA busy_timeout=30000`.
+  - `build_universe_membership.py` keeps the reviewer hotfix that commits membership rows before spawning bar-backfill subprocesses.
+  - `build_universe_membership.py` now supports `--merge-into <db>` to backfill into an isolated working DB and merge `universe_membership`, `universe_coverage_status`, and `historical_bars` into the target in one short `ATTACH` transaction.
+  - Final commits in the universe/historical backfill path use retry-on-lock.
+
+Files/functions:
+
+- `server/repo_integrity.mjs`: `runRepoPreflight`, `preflightReadablePaths`, `verifyRepoIntegrity`, `parseGitIndex`, `gitBlobSha1`.
+- `scripts/verify_repo_integrity.mjs`: CLI wrapper for the pure Node checker.
+- `server.mjs`: `runBootRepositoryPreflight`, `refreshRepoIntegrityStatus`, `assertHarnessTreeReadable`, go-live repo integrity status wiring.
+- `scripts/build_universe_membership.py`: `connect_sqlite`, `commit_with_retry`, `merge_into_target`, `--merge-into`.
+- `scripts/build_historical_bars.py`, `scripts/finance_database_import.py`, `scripts/edgar_pit_bridge.py`, `scripts/sqlite_store_sync.py`: SQLite busy timeout setup.
+- `scripts/core_regression_tests.mjs`: git-index integrity fixture and preflight fixture.
+
+Verification output:
+
+```text
+$ node --check server.mjs
+<no output>
+
+$ node --check public/app.js
+<no output>
+
+$ node --check server/repo_integrity.mjs
+<no output>
+
+$ node --check scripts/verify_repo_integrity.mjs
+<no output>
+
+$ node --check scripts/core_regression_tests.mjs
+<no output>
+
+$ python3 -m py_compile scripts/build_universe_membership.py scripts/build_historical_bars.py scripts/finance_database_import.py scripts/edgar_pit_bridge.py scripts/sqlite_store_sync.py
+<no output>
+
+$ node scripts/core_regression_tests.mjs
+core_regression_tests: ok
+
+$ git diff --check
+<no output>
+```
+
+Integrity CLI truncated-file fixture:
+
+```json
+{"status":1,"stdout":["repo-integrity: fail checked=1 issues=1 durationMs=2","dataless_or_truncated\ttracked.txt"],"stderr":""}
+```
+
+Boot preflight unreadable-module fixture:
+
+```json
+{"ok":false,"issue":{"file":"server/bad.mjs","reason":"unreadable","detail":"EACCES: permission denied, open '/var/folders/96/c5h3q34n73s1ss_1tlvcyp1m0000gn/T/market-pulse-preflight-h2zysj/server/bad.mjs'"}}
+```
+
+Universe backfill smoke:
+
+```json
+{"status":"ok","membershipRows":2,"uniqueTickers":2,"backfill":{"status":"ok","chunks":2},"coverage":{"bars_available":2},"mergeInto":{"status":"skipped"}}
+```
+
+Universe backfill with `--merge-into`:
+
+```json
+{"status":"ok","membershipRows":2,"uniqueTickers":2,"backfill":{"status":"ok","chunks":2},"coverage":{"bars_available":2},"mergeInto":{"status":"ok","target":"/private/tmp/market_pulse_wp33_target.sqlite","rowsChanged":48}}
+```
+
+Server boot smoke:
+
+```json
+{"ok":true,"repoIntegrityOk":false}
+```
+
+`repoIntegrityOk:false` is expected in this run because the working tree still has unrelated uncommitted user changes; the preflight itself passed and the status row was present in `/api/state`.
+
+Contradictions / deferred checks:
+
+- Partial implementation caveat: because `server.mjs` is an ES module with static imports, code inside `server.mjs` cannot run before Node resolves already-imported modules. The boot preflight still runs before the HTTP listener and catches unreadable first-party files that are not already fatal to module loading. A true "pre-import" detector would require launching through a separate bootstrap entrypoint.
+- Harness fail-fast was verified at the shared preflight layer; the scheduled debate/factor-researcher flows remain disabled by default and were not force-enabled against unreadable production harness files.

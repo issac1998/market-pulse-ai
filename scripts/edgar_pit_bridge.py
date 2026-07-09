@@ -14,6 +14,13 @@ from typing import Any
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_DB = REPO_ROOT / "data" / "market_pulse.sqlite"
+SQLITE_BUSY_TIMEOUT_MS = 30000
+
+
+def connect_sqlite(path: str | Path) -> sqlite3.Connection:
+    conn = sqlite3.connect(path, timeout=max(30, SQLITE_BUSY_TIMEOUT_MS // 1000))
+    conn.execute(f"PRAGMA busy_timeout={SQLITE_BUSY_TIMEOUT_MS}")
+    return conn
 
 
 def text(value: Any) -> str:
@@ -199,7 +206,7 @@ def command_pit_fundamentals(args: argparse.Namespace) -> dict[str, Any]:
     for filing in filings:
         for fact in extract_facts_from_filing(filing):
             rows.append({"ticker": ticker, **fact})
-    conn = sqlite3.connect(args.db)
+    conn = connect_sqlite(args.db)
     init_schema(conn)
     conn.executemany(
         """
@@ -273,7 +280,7 @@ def command_current_filings(args: argparse.Namespace) -> dict[str, Any]:
                 "severity": severity_for_current_filing(meta.get("form") or "", item),
                 "meta": meta,
             })
-    conn = sqlite3.connect(args.db)
+    conn = connect_sqlite(args.db)
     init_schema(conn)
     conn.executemany(
         """
@@ -308,7 +315,7 @@ def command_13f(args: argparse.Namespace) -> dict[str, Any]:
             })
     except Exception as exc:
         raise RuntimeError(f"13F fetch failed: {type(exc).__name__}: {exc}")
-    conn = sqlite3.connect(args.db)
+    conn = connect_sqlite(args.db)
     init_schema(conn)
     conn.executemany(
         """
@@ -340,7 +347,7 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     try:
-        conn = sqlite3.connect(args.db)
+        conn = connect_sqlite(args.db)
         init_schema(conn)
         conn.commit()
         if args.command == "init-schema":
