@@ -1,5 +1,22 @@
 # Changelog
 
+## 2026-07-10
+
+### Highlights
+
+- Completed Round 6 crash resilience, benchmark integrity, PIT universe, strategy-version invariant, and trust-loop closure work.
+- Added Trader Mirror so the owner's operations can be profiled with deterministic metrics and optional narrative-only LLM coaching.
+- Replaced giant store writes with sectioned persistence and added repo/runtime integrity checks for first-party modules, data files, and harness paths.
+- Scaled the honest-universe historical walk-forward path: chunked bar loading, chunked SQLite detail persistence, explicit grid metadata, cost-sensitivity rows, and a full PIT rerun with T+60 evidence.
+- Recorded the updated D17 PIT evidence: full detail rows persisted for the 1/5/20/60 run, with regime split and per-horizon sample counts.
+
+### Key Links
+
+- PR links: no PR identifiers are present in local git history for this work.
+- WP26-WP30 crash resilience, evidence integrity, and trust closure: [a875a6c](https://github.com/issac1998/market-pulse-ai/commit/a875a6c) → [8eb6d4a](https://github.com/issac1998/market-pulse-ai/commit/8eb6d4a)
+- WP31 Trader Mirror: [3c0f567](https://github.com/issac1998/market-pulse-ai/commit/3c0f567)
+- WP32-WP34 durability, integrity checks, and walk-forward scale: [3ce34fe](https://github.com/issac1998/market-pulse-ai/commit/3ce34fe) → [b046d0c](https://github.com/issac1998/market-pulse-ai/commit/b046d0c)
+
 ## 2026-07-05
 
 ### Highlights
