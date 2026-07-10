@@ -19,6 +19,7 @@ import {
   nyseSessionForYmd,
   scoreFredMacroRegime,
   semanticNewsOwnership,
+  numberOrNull as marketNumberOrNull,
 } from "../lib/market_core.mjs";
 import {
   buildBenchmarkBasket,
@@ -1424,6 +1425,19 @@ if (fs.existsSync(nyseReferencePath)) {
 }
 
 assert.equal(outcomeFromExcess(1.2, 0.5), "win", "Excess return above deadband should be win");
+assert.equal(marketNumberOrNull(null), null, "null must not be coerced into a numeric zero");
+assert.equal(marketNumberOrNull(""), null, "empty strings must not be coerced into a numeric zero");
+assert.equal(marketNumberOrNull("12.5%"), 12.5, "formatted percentages should still parse");
+const ambiguousSpyOwnership = semanticNewsOwnership(
+  {
+    ticker: "SPY",
+    companyName: "SPDR S&P 500 ETF Trust",
+    title: "AI Is Turbocharging Bosses' Efforts to Spy on Their Workers",
+    article: { text: "Employers increasingly spy on workers using monitoring software." },
+  },
+  { ticker: "SPY", companyName: "SPDR S&P 500 ETF Trust" },
+);
+assert.notEqual(ambiguousSpyOwnership.category, "direct_company", "The common verb 'spy' must not be treated as an SPY ticker mention");
 assert.equal(outcomeFromExcess(-1.2, 0.5), "loss", "Excess return below negative deadband should be loss");
 assert.equal(outcomeFromExcess(0.2, 0.5), "flat", "Excess return inside deadband should be flat");
 const normalOutcomeQuality = classifyOutcomeQuality({
@@ -1452,6 +1466,21 @@ assert.equal(
   outcomeIsUsable({ entryPrice: 0.0137, exitPrice: 2.625, rawReturnPct: 19059, excessPct: 19058 }),
   false,
   "Legacy rows without explicit quality status should still be quarantined when returns are extreme",
+);
+assert.equal(
+  outcomeIsUsable(
+    {
+      entryPrice: 100,
+      exitPrice: 170,
+      rawReturnPct: 70,
+      excessPct: 69,
+      horizonDays: 3,
+      outcomeQualityStatus: "ok",
+    },
+    { suspectReturnPct: 50 },
+  ),
+  false,
+  "A previously-ok row must be rechecked against a stricter current quarantine policy",
 );
 
 const pricePath = stockHistoryPricePath(

@@ -2,6 +2,7 @@
 import fs from "node:fs";
 import path from "node:path";
 import { semanticNewsOwnership } from "../lib/market_core.mjs";
+import { readSectionedStore } from "../server/sectioned_store.mjs";
 
 const rawArgs = process.argv.slice(2);
 const args = new Set(rawArgs);
@@ -127,9 +128,17 @@ async function loadRun() {
     const payload = await res.json();
     return { source: apiUrl, run: payload.latest || payload.run || null };
   }
-  const raw = fs.readFileSync(storePath, "utf8");
-  const db = JSON.parse(raw);
-  return { source: storePath, run: latestRun(db) };
+  if (fs.existsSync(storePath)) {
+    const raw = fs.readFileSync(storePath, "utf8");
+    const db = JSON.parse(raw);
+    return { source: storePath, run: latestRun(db) };
+  }
+  const sectionedStoreDir = path.join(path.dirname(storePath), "store");
+  if (fs.existsSync(sectionedStoreDir)) {
+    const result = await readSectionedStore(sectionedStoreDir);
+    return { source: sectionedStoreDir, run: latestRun(result.store) };
+  }
+  throw new Error(`No store found at ${storePath} or ${sectionedStoreDir}`);
 }
 
 function pct(count, total) {

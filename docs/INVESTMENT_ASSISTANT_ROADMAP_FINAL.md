@@ -37,6 +37,8 @@
 
 Sequencing note: Phase 2 is **calendar-gated, not effort-gated** — factor/regime statistics need samples that accrue at ~10 decisions/trading day, so its start date depends on when Phase 0's tagging lands, which is another reason Phase 0 comes first.
 
+> **Amendment 2026-07-05**: the historical backtest corpus (see [CAPABILITY_GAPS_AND_HISTORICAL_LEARNING.md](CAPABILITY_GAPS_AND_HISTORICAL_LEARNING.md) §10, decisions D11–D15) converts most of Phase 2 to effort-gated: the validation gate and regime dashboards build on historical evidence right after the corpus lands, a historically-calibrated strategy version may be human-adopted with a 4–6 week live parity window, and Phase 2 arrives ~a quarter earlier than shown below. Phase 3.1 (debate promotion) and 3.4 (order drafts) keep live-only evidence clocks; 3.2/3.3 were always effort-gated.
+
 ```
 Phase 0  Foundation & Accrual        Weeks 1–6      "Can I trust it?"
 Phase 1  Daily Assistant Core        Weeks 7–16     "Is it useful every morning?"

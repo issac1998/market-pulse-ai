@@ -161,6 +161,9 @@ let recommendationReconciliation = null;
 let strategyVersionsPayload = null;
 let strategyValidationPayload = null;
 let supplementalDataError = "";
+let runDetailWarning = "";
+let runHistoryLoading = false;
+let runHistoryPagination = { loaded: false, nextOffset: 0, hasMore: false, total: 0 };
 const runDetailCache = new Map();
 const runDetailLoading = new Set();
 const optionFetchInFlight = new Set();
@@ -168,6 +171,8 @@ const stockSnapshotCache = new Map();
 const stockSnapshotLoading = new Set();
 const stockDeepDiveCache = new Map();
 const stockDeepDiveLoading = new Set();
+const uziAnalysisCache = new Map();
+const uziAnalysisLoading = new Set();
 
 async function api(path, options = {}) {
   const res = await fetch(path, {
@@ -175,7 +180,12 @@ async function api(path, options = {}) {
     ...options,
   });
   const data = await res.json();
-  if (!res.ok) throw new Error(data.error || "请求失败");
+  if (!res.ok) {
+    const error = new Error(data.error || "请求失败");
+    error.status = res.status;
+    error.details = data;
+    throw error;
+  }
   return data;
 }
 
@@ -948,6 +958,7 @@ async function pollCollectionStatus() {
 
 async function loadState() {
   appState = await api("/api/state");
+  runHistoryPagination = { loaded: false, nextOffset: 0, hasMore: false, total: appState.runs?.length || 0 };
   await loadSupplementalData();
   if (!sourceDiagnosticsBusy) sourceDiagnostics = appState.sourceDiagnostics || null;
   collectionStatus = appState.runStatus || collectionStatus;
@@ -966,27 +977,83 @@ async function loadState() {
 
 function render() {
   const selectedRun = selectedReportRun();
+  const page = currentPage();
   renderPageShell();
   els.watchlistInput.value = appState.watchlist.join(", ");
   els.portfolioInput.value = (appState.portfolio || [])
     .map((item) => `${item.ticker} ${item.shares} ${item.costBasis}`)
     .join("\n");
   renderLlmPicker();
+  if (page === "ops") {
     renderRunHistory(appState.runs || [], selectedRun);
+    ensureRunHistoryLoaded();
+  }
   if (selectedRun?.summaryOnly) {
     renderRunSummaryLoading(selectedRun);
+    if (page === "actions") {
+      renderActionSuggestions(selectedRun);
+      renderAllStockAgent(appState.allStockAgent);
+      renderTodayDesk(todayRecommendations);
+    } else if (page === "stocks") {
+      renderStockDeepDive(stockDetailTickerFromHash() || els.stockReportInput?.value || "");
+    } else if (page === "portfolio") {
+      renderPortfolio(selectedRun);
+      renderRecommendationReconciliation(recommendationReconciliation);
+      renderTradeJournal(appState.tradeJournal, appState.tradeReviews || [], appState.config?.ibkr);
+    } else if (page === "research") {
+      renderCapabilityRadar(selectedRun, appState.config || {});
+    } else if (page === "ops") {
+      renderChat(appState.chat || []);
+      renderSchedule(appState.config.schedule, appState.config.email, appState.emailLog || []);
+      renderIbkrPortal(appState.config?.ibkr?.portal);
+      renderStrategyGovernance(strategyVersionsPayload, strategyValidationPayload);
+      renderProviders(
+        appState.config.providers,
+        selectedRun?.dataQuality,
+        appState.config.providerDetails,
+        appState.config.sourceControls,
+        appState.config.customSocialFeeds,
+        appState.config.llmRouting,
+        appState.config,
+      );
+    }
+    return;
+  }
+  if (page === "home") {
+    renderMarketOverview(selectedRun);
+    renderMoversWithReasons(selectedRun);
+    renderHotNews(selectedRun);
+    renderEventCalendar(selectedRun);
+  } else if (page === "actions") {
     renderActionSuggestions(selectedRun);
     renderAllStockAgent(appState.allStockAgent);
     renderTodayDesk(todayRecommendations);
+  } else if (page === "stocks") {
+    renderStockReport(selectedRun);
     renderStockDeepDive(stockDetailTickerFromHash() || els.stockReportInput?.value || "");
+    renderDiscovery(selectedRun);
+    renderTickers(selectedRun);
+    renderTechnicals(selectedRun);
+    renderFundamentals(selectedRun);
+  } else if (page === "social") {
+    renderSocial(selectedRun);
+  } else if (page === "research") {
+    renderAnalysis(selectedRun);
+    renderOpenBB(selectedRun, appState.config?.openbb);
+    renderCapabilityRadar(selectedRun, appState.config || {});
+    renderBacktest(selectedRun);
+    renderFeeds(selectedRun);
+  } else if (page === "portfolio") {
     renderPortfolio(selectedRun);
     renderRecommendationReconciliation(recommendationReconciliation);
     renderTradeJournal(appState.tradeJournal, appState.tradeReviews || [], appState.config?.ibkr);
+    renderAlerts(selectedRun);
+  } else if (page === "ops") {
+    renderStatus(selectedRun);
     renderChat(appState.chat || []);
     renderSchedule(appState.config.schedule, appState.config.email, appState.emailLog || []);
     renderIbkrPortal(appState.config?.ibkr?.portal);
     renderStrategyGovernance(strategyVersionsPayload, strategyValidationPayload);
-    renderCapabilityRadar(selectedRun, appState.config || {});
     renderProviders(
       appState.config.providers,
       selectedRun?.dataQuality,
@@ -996,45 +1063,7 @@ function render() {
       appState.config.llmRouting,
       appState.config,
     );
-    return;
   }
-  renderStatus(selectedRun);
-  renderMarketOverview(selectedRun);
-  renderMoversWithReasons(selectedRun);
-  renderHotNews(selectedRun);
-  renderEventCalendar(selectedRun);
-  renderActionSuggestions(selectedRun);
-  renderAllStockAgent(appState.allStockAgent);
-  renderTodayDesk(todayRecommendations);
-  renderStockReport(selectedRun);
-  renderStockDeepDive(stockDetailTickerFromHash() || els.stockReportInput?.value || "");
-  renderDiscovery(selectedRun);
-  renderSocial(selectedRun);
-  renderAnalysis(selectedRun);
-  renderTickers(selectedRun);
-  renderTechnicals(selectedRun);
-  renderFundamentals(selectedRun);
-  renderOpenBB(selectedRun, appState.config?.openbb);
-  renderCapabilityRadar(selectedRun, appState.config || {});
-  renderPortfolio(selectedRun);
-  renderRecommendationReconciliation(recommendationReconciliation);
-  renderTradeJournal(appState.tradeJournal, appState.tradeReviews || [], appState.config?.ibkr);
-  renderBacktest(selectedRun);
-  renderAlerts(selectedRun);
-  renderFeeds(selectedRun);
-  renderChat(appState.chat || []);
-  renderSchedule(appState.config.schedule, appState.config.email, appState.emailLog || []);
-  renderIbkrPortal(appState.config?.ibkr?.portal);
-  renderStrategyGovernance(strategyVersionsPayload, strategyValidationPayload);
-  renderProviders(
-    appState.config.providers,
-    selectedRun?.dataQuality,
-    appState.config.providerDetails,
-    appState.config.sourceControls,
-    appState.config.customSocialFeeds,
-    appState.config.llmRouting,
-    appState.config,
-  );
 }
 
 function renderRunSummaryLoading(run) {
@@ -1149,7 +1178,10 @@ function selectedReportRun() {
   const stored = localStorage.getItem(RUN_SELECTION_STORAGE_KEY);
   if (stored && appState.latest?.id === stored) return appState.latest;
   if (stored && runDetailCache.has(stored)) return runDetailCache.get(stored);
-  const selected = runs.find((run) => run.id === stored) || runs[0];
+  let selected = runs.find((run) => run.id === stored) || runs[0];
+  if (selected?.summaryOnly && selected.archiveAvailable === false) {
+    selected = appState.latest || runs.find((run) => run.archiveAvailable !== false) || runs[0];
+  }
   if (selected?.id && selected.id !== stored) {
     localStorage.setItem(RUN_SELECTION_STORAGE_KEY, selected.id);
   }
@@ -1439,6 +1471,40 @@ async function requestStockDeepDive(ticker, options = {}) {
   }
 }
 
+async function requestUziAnalysis(ticker, options = {}) {
+  const normalized = normalizeTickerInput(ticker);
+  if (!normalized) return;
+  if (uziAnalysisLoading.has(normalized)) return;
+  uziAnalysisLoading.add(normalized);
+  renderStockReport(selectedReportRun());
+  try {
+    const result = await api("/api/uzi/analyze", {
+      method: "POST",
+      body: JSON.stringify({
+        ticker: normalized,
+        depth: options.depth || "lite",
+      }),
+    });
+    if (result.uziAnalysis?.ticker) {
+      uziAnalysisCache.set(result.uziAnalysis.ticker, result.uziAnalysis);
+    }
+  } catch (error) {
+    uziAnalysisCache.set(normalized, {
+      ticker: normalized,
+      provider: "UZI-Skill",
+      status: "error",
+      generatedAt: new Date().toISOString(),
+      summary: `UZI 分析失败：${error.message}`,
+      error: error.message,
+      capabilities: ["22 维数据采集", "66 位投资者评审", "机构方法报告"],
+      sourceRisk: "UZI 运行失败不会影响本系统的行情、新闻、因子评分和投资建议 Agent。",
+    });
+  } finally {
+    uziAnalysisLoading.delete(normalized);
+    renderStockReport(selectedReportRun());
+  }
+}
+
 function countForRun(run, field, fallbackField = `${field}Count`) {
   if (Number.isFinite(run?.[fallbackField])) return run[fallbackField];
   if (Array.isArray(run?.[field])) return run[field].length;
@@ -1455,7 +1521,14 @@ async function loadRunDetail(runId) {
       if (localStorage.getItem(RUN_SELECTION_STORAGE_KEY) === result.run.id) render();
     }
   } catch (error) {
-    alert(`历史报告加载失败：${error.message}`);
+    const fallbackRunId = error.details?.fallbackRunId || (error.status === 404 ? appState.latest?.id || "" : "");
+    if (localStorage.getItem(RUN_SELECTION_STORAGE_KEY) === runId && fallbackRunId) {
+      localStorage.setItem(RUN_SELECTION_STORAGE_KEY, fallbackRunId);
+    }
+    runDetailWarning = error.status === 404
+      ? "这份旧报告的归档文件已丢失，已自动切回最新报告。"
+      : `历史报告仍安全保存在 Google Drive，当前下载失败，可稍后重试：${error.message}`;
+    render();
   } finally {
     runDetailLoading.delete(runId);
   }
@@ -1466,21 +1539,55 @@ function ensureSelectedRunDetail() {
   if (selected?.summaryOnly) loadRunDetail(selected.id);
 }
 
+async function loadRunHistoryPage({ reset = false } = {}) {
+  if (runHistoryLoading) return;
+  runHistoryLoading = true;
+  const offset = reset ? 0 : Number(runHistoryPagination.nextOffset || 0);
+  try {
+    const result = await api(`/api/runs?offset=${encodeURIComponent(offset)}&limit=50`);
+    const incoming = result.runs || [];
+    const existing = reset ? [] : (appState.runs || []);
+    const byId = new Map(existing.map((run) => [run.id, run]));
+    incoming.forEach((run) => byId.set(run.id, run));
+    appState.runs = [...byId.values()].sort(
+      (a, b) => new Date(b.completedAt || b.startedAt || 0) - new Date(a.completedAt || a.startedAt || 0),
+    );
+    runHistoryPagination = {
+      loaded: true,
+      nextOffset: Number(result.pagination?.nextOffset || appState.runs.length),
+      hasMore: Boolean(result.pagination?.hasMore),
+      total: Number(result.pagination?.total || appState.runs.length),
+    };
+  } catch (error) {
+    runDetailWarning = `历史报告索引加载失败：${error.message}`;
+    runHistoryPagination = { ...runHistoryPagination, loaded: true };
+  } finally {
+    runHistoryLoading = false;
+    if (currentPage() === "ops") render();
+  }
+}
+
+function ensureRunHistoryLoaded() {
+  if (!runHistoryPagination.loaded && !runHistoryLoading) loadRunHistoryPage({ reset: true });
+}
+
 function renderRunHistory(runs, selectedRun) {
-  const rows = (runs || []).slice(0, 12);
+  const rows = runs || [];
   if (!rows.length) {
     els.runHistoryBox.innerHTML = empty("暂无历史报告。运行采集后会保留最近报告。");
     return;
   }
-  els.runHistoryBox.innerHTML = `<div class="run-history-list">
+  els.runHistoryBox.innerHTML = `${runDetailWarning ? `<p class="quality-warning">${escapeHtml(runDetailWarning)}</p>` : ""}<div class="run-history-list">
     ${rows
       .map((run, index) => {
         const isActive = run.id === selectedRun?.id;
+        const archiveMissing = Boolean(run.summaryOnly && run.archiveAvailable === false);
+        const driveArchived = run.archiveLocation === "google-drive";
         const readiness = run.dataQuality?.readiness;
         const coreErrors = Number.isFinite(run.dataQuality?.coreErrorCount)
           ? run.dataQuality.coreErrorCount
           : countForRun(run, "errors", "errorCount");
-        return `<button class="run-history-row ${isActive ? "active" : ""}" type="button" data-run-id="${escapeHtml(run.id)}">
+        return `<button class="run-history-row ${isActive ? "active" : ""} ${archiveMissing ? "disabled" : ""}" type="button" data-run-id="${escapeHtml(run.id)}" ${archiveMissing ? "disabled" : ""}>
           <div>
             <strong>${escapeHtml(sessionLabel(run.session))}${index === 0 ? " · 最新" : ""}</strong>
             <p class="muted">${escapeHtml(fmtTime(run.completedAt))}</p>
@@ -1492,11 +1599,15 @@ function renderRunHistory(runs, selectedRun) {
               readiness ? `${readiness.label} ${readiness.score}` : "未评估",
             )}</span>
             <span class="${coreErrors ? "loss" : "muted"}">${escapeHtml(coreErrors)} 核心异常</span>
+            ${driveArchived ? `<span class="tag green">Drive 冷归档</span>` : ""}
+            ${archiveMissing ? `<span class="loss">归档缺失</span>` : ""}
           </div>
         </button>`;
       })
       .join("")}
-  </div>`;
+  </div>${runHistoryPagination.hasMore
+    ? `<button class="btn compact ghost" type="button" data-run-history-more ${runHistoryLoading ? "disabled" : ""}>${runHistoryLoading ? "加载中..." : `加载更多（${escapeHtml(rows.length)}/${escapeHtml(runHistoryPagination.total)}）`}</button>`
+    : ""}`;
 }
 
 function renderStatus(run) {
@@ -2625,6 +2736,7 @@ function renderStockReport(run) {
       <span class="tag ${reportToneClass(report.score)}">评分 ${escapeHtml(report.score)}</span>
       <button class="btn compact" type="button" data-refresh-stock-report="${escapeHtml(report.ticker)}">刷新 Longbridge</button>
       <button class="btn compact" type="button" data-run-agent-debate="${escapeHtml(report.ticker)}">运行 LLM 辩论</button>
+      <button class="btn compact" type="button" data-run-uzi-analysis="${escapeHtml(report.ticker)}">运行 UZI</button>
       <button class="btn compact ghost" type="button" data-back-stock-overview>返回总览</button>
     </div>
   </div>
@@ -2652,6 +2764,10 @@ function renderStockReport(run) {
     <section class="report-block wide">
       <h3>投资流派评分卡</h3>
       ${styleScorecardBlock(report.narrative?.investmentStyleScorecard || report.narrative?.styleScorecard)}
+    </section>
+    <section class="report-block wide">
+      <h3>UZI 游资深度分析</h3>
+      ${uziAnalysisBlock(report.ticker)}
     </section>
     <section class="report-block wide">
       <h3>因子决策层</h3>
@@ -2803,6 +2919,56 @@ function advisorActionClass(action = "") {
   if (action === "买入") return "green";
   if (action === "卖出") return "red";
   return "amber";
+}
+
+function uziAnalysisBlock(ticker = "") {
+  const symbol = normalizeTickerInput(ticker);
+  const loading = symbol && uziAnalysisLoading.has(symbol);
+  const analysis = symbol ? uziAnalysisCache.get(symbol) : null;
+  if (loading) {
+    return `<div class="uzi-analysis-card loading">
+      <div class="stock-fetch-status"><span class="spinner-dot"></span> UZI-Skill 正在分析 ${escapeHtml(symbol)}，默认 lite 档可能需要 1-2 分钟...</div>
+      <p class="muted">UZI 是外部专项报告，不会写入本系统因子分、买卖闸门或策略权重。</p>
+    </div>`;
+  }
+  if (!analysis) {
+    return `<div class="uzi-analysis-card">
+      <p>调用 UZI-Skill 生成外部专项报告：22 维数据、66 位投资者评审、DCF/Comps/LBO/IC Memo 和杀猪盘检查。</p>
+      <div class="decision-actions">
+        <button class="btn compact" type="button" data-run-uzi-analysis="${escapeHtml(symbol)}">运行 UZI lite</button>
+      </div>
+      <p class="muted">默认 lite 档用于前端交互；medium/deep 更适合后台队列运行。</p>
+    </div>`;
+  }
+  if (analysis.status === "error") {
+    return `<div class="uzi-analysis-card error">
+      <p class="quality-error">${escapeHtml(analysis.summary || analysis.error || "UZI 分析失败。")}</p>
+      <div class="decision-actions">
+        <button class="btn compact" type="button" data-run-uzi-analysis="${escapeHtml(symbol)}">重试 UZI</button>
+      </div>
+      <p class="muted">${escapeHtml(analysis.sourceRisk || "")}</p>
+    </div>`;
+  }
+  const caps = analysis.capabilities || [];
+  const stdout = analysis.stdoutTail || [];
+  return `<div class="uzi-analysis-card">
+    <div class="context-pack-head">
+      <span class="tag green">${escapeHtml(analysis.provider || "UZI-Skill")}</span>
+      <span class="tag">深度 ${escapeHtml(analysis.depth || "-")}</span>
+      ${Number.isFinite(Number(analysis.sizeKb)) ? `<span class="tag">${escapeHtml(analysis.sizeKb)} KB</span>` : ""}
+      ${Number.isFinite(Number(analysis.durationMs)) ? `<span class="tag">${escapeHtml(fmtNumber(Number(analysis.durationMs) / 1000, 1))}s</span>` : ""}
+      <span class="muted">${escapeHtml(fmtTime(analysis.generatedAt))}</span>
+    </div>
+    <p class="social-lede">${escapeHtml(analysis.summary || "UZI 报告已生成。")}</p>
+    ${caps.length ? `<div class="feed-meta">${caps.map((item) => `<span class="tag">${escapeHtml(item)}</span>`).join("")}</div>` : ""}
+    <div class="decision-actions">
+      ${analysis.reportUrl ? `<a class="btn compact" href="${escapeHtml(analysis.reportUrl)}" target="_blank" rel="noopener">打开 UZI HTML 报告</a>` : ""}
+      ${analysis.metaUrl ? `<a class="btn compact ghost" href="${escapeHtml(analysis.metaUrl)}" target="_blank" rel="noopener">查看元数据</a>` : ""}
+      <button class="btn compact ghost" type="button" data-run-uzi-analysis="${escapeHtml(symbol)}">重新运行</button>
+    </div>
+    ${stdout.length ? `<details><summary>运行日志</summary><pre class="compact-pre">${escapeHtml(stdout.join("\n"))}</pre></details>` : ""}
+    <p class="muted">${escapeHtml(analysis.sourceRisk || "UZI 输出仅作为外部研究材料。")}</p>
+  </div>`;
 }
 
 function investmentAdvisorBlock(advisor) {
@@ -4933,17 +5099,17 @@ function renderActionSuggestionCard(item = {}, run = null) {
   </article>`;
 }
 
-function renderActionSuggestionSection(title, subtitle, rows = [], run = null) {
-  return `<section class="action-suggestion-section">
-    <div class="social-source-head">
+function renderActionSuggestionSection(title, subtitle, rows = [], run = null, options = {}) {
+  return `<details class="action-suggestion-section agent-disclosure" ${options.open === false ? "" : "open"}>
+    <summary class="social-source-head">
       <div>
         <p class="section-label">${escapeHtml(subtitle)}</p>
         <h3>${escapeHtml(title)}</h3>
       </div>
       <span class="tag">${escapeHtml(rows.length)} 个</span>
-    </div>
+    </summary>
     <div class="action-suggestion-grid">${rows.length ? rows.map((item) => renderActionSuggestionCard(item, run)).join("") : empty("暂无。")}</div>
-  </section>`;
+  </details>`;
 }
 
 function renderActionSuggestions(run) {
@@ -4980,10 +5146,10 @@ function renderActionSuggestions(run) {
         ${actionSuggestionMetric(summary.risk, "风险处理")}
       </div>
     </div>
-    ${renderActionSuggestionSection("优先操作", "候选买入", groups.buy || [], run)}
-    ${renderActionSuggestionSection("等待触发", "持有但接近条件", groups.wait || [], run)}
-    ${renderActionSuggestionSection("风险处理", "卖出/回避", groups.risk || [], run)}
-    ${renderActionSuggestionSection("暂不操作", "低优先级", groups.idle || [], run)}
+    ${renderActionSuggestionSection("优先操作", "候选买入", groups.buy || [], run, { open: Boolean(groups.buy?.length) })}
+    ${renderActionSuggestionSection("等待触发", "持有但接近条件", groups.wait || [], run, { open: false })}
+    ${renderActionSuggestionSection("风险处理", "卖出/回避", groups.risk || [], run, { open: Boolean(groups.risk?.length) })}
+    ${renderActionSuggestionSection("暂不操作", "低优先级", groups.idle || [], run, { open: false })}
     <p class="muted">${escapeHtml(suggestions.disclaimer || "")}</p>`;
 }
 
@@ -5104,9 +5270,10 @@ function renderAllStockAgentHold(item = {}, run = null) {
 
 function renderAllStockAgentReview(review = {}, run = null) {
   const perf = Number.isFinite(review.performancePct) ? `${fmtNumber(review.performancePct, 1)}%` : "-";
+  const reviewTone = review.outcome === "命中" ? "green" : review.outcome === "待核验" ? "amber" : "red";
   return `<div class="all-stock-agent-review-row">
     <button class="link-button" type="button" data-open-stock-report="${escapeHtml(review.ticker)}">${escapeHtml(tickerLabel(review.ticker, { ...review, run }))}</button>
-    <span class="tag ${review.outcome === "命中" ? "green" : "red"}">${escapeHtml(review.outcome || "")}</span>
+    <span class="tag ${reviewTone}">${escapeHtml(review.outcome || "")}</span>
     <span>${escapeHtml(review.action || "")}</span>
     <span>${escapeHtml(perf)}</span>
     <span class="muted">${escapeHtml(fmtNumber(review.ageDays || 0, 1))} 天</span>
@@ -5114,7 +5281,14 @@ function renderAllStockAgentReview(review = {}, run = null) {
 }
 
 function renderAllStockAgentTrackRecord(latest = {}) {
-  const snapshots = (latest.outcomeSnapshots || []).filter((item) => item.outcome && item.outcome !== "pending");
+  const allSnapshots = (latest.outcomeSnapshots || []).filter((item) => item.outcome && item.outcome !== "pending");
+  const snapshots = allSnapshots.filter((item) => {
+    if (item.outcomeQualityStatus === "suspect_price" || item.outcomeUsable === false) return false;
+    const horizon = Number(item.horizonDays);
+    const rawReturn = Number(item.performancePct ?? item.rawReturnPct);
+    return !(Number.isFinite(horizon) && horizon <= 10 && Number.isFinite(rawReturn) && Math.abs(rawReturn) > 50);
+  });
+  const quarantinedCount = allSnapshots.length - snapshots.length;
   const paper = latest.paperBook || {};
   const paperSummary = paper.summary || {};
   const byHorizon = new Map();
@@ -5156,7 +5330,8 @@ function renderAllStockAgentTrackRecord(latest = {}) {
         <p class="section-label">Track Record</p>
         <h3>可追责复盘</h3>
       </div>
-      <span class="tag">${escapeHtml(snapshots.length)} 个冻结 outcome</span>
+      <span class="tag">${escapeHtml(snapshots.length)} 个可用 outcome</span>
+      ${quarantinedCount ? `<span class="tag amber">${escapeHtml(quarantinedCount)} 个异常样本已隔离</span>` : ""}
     </div>
     <div class="all-stock-agent-track">
       ${allStockAgentMetric(snapshots.length, "冻结样本")}
@@ -5175,7 +5350,9 @@ function renderAllStockAgentTrackRecord(latest = {}) {
         </div>`;
       }).join("") : empty("暂无到期 outcome。需要至少经过 T+1/T+3/T+5/T+10 后才会冻结结果。")}
     </div>
-    <div class="all-stock-agent-paper-grid">
+    <details class="agent-disclosure">
+      <summary>查看纸面组合与因子统计</summary>
+      <div class="all-stock-agent-paper-grid">
       <article class="all-stock-agent-paper-card">
         <h4>纸面组合</h4>
         <div class="mini-kv">
@@ -5231,7 +5408,8 @@ function renderAllStockAgentTrackRecord(latest = {}) {
           </div>`).join("") : `<p class="muted">暂无 |ρ| > 0.6 的因子对。矩阵样本 n=${escapeHtml(correlation.n || 0)}。</p>`}
         </div>
       </article>
-    </div>
+      </div>
+    </details>
   </section>`;
 }
 
@@ -5284,14 +5462,14 @@ function renderFactorLifecycleBoard(registry = {}) {
       </details>
     </article>`;
   };
-  return `<section class="all-stock-agent-section factor-lifecycle-board">
-    <div class="social-source-head">
+  return `<details class="all-stock-agent-section factor-lifecycle-board agent-disclosure">
+    <summary class="social-source-head">
       <div>
         <p class="section-label">Factor Registry</p>
         <h3>因子生命周期看板</h3>
       </div>
       <span class="tag">${escapeHtml(factors.length)} 个因子 · trial ${escapeHtml(registry.trialLedger?.count || 0)}</span>
-    </div>
+    </summary>
     <div class="factor-lifecycle-grid">
       ${states.map(([state, label]) => {
         const rows = factors.filter((factor) => factor.state === state).slice(0, 12);
@@ -5301,7 +5479,7 @@ function renderFactorLifecycleBoard(registry = {}) {
         </div>`;
       }).join("")}
     </div>
-  </section>`;
+  </details>`;
 }
 
 function metricWithN(item = {}, digits = 1, suffix = "") {
@@ -5376,7 +5554,7 @@ function renderTodayDesk(today = null) {
     <div class="social-source-head"><h3>今日可执行</h3><span class="tag">${escapeHtml(actionable.length)} 个</span></div>
     <div class="daily-card-grid">${actionable.length ? actionable.map((item) => todayCallCard(item, "actionable")).join("") : empty("暂无可执行买入；请看研究列表和缺失数据。")}</div>
   </section>
-  <details class="daily-subsection" open>
+  <details class="daily-subsection agent-disclosure">
     <summary>研究跟踪 / 降级原因</summary>
     <div class="daily-card-grid">${research.length ? research.slice(0, 12).map((item) => todayCallCard(item, "research")).join("") : empty("暂无研究跟踪。")}</div>
   </details>
@@ -5582,17 +5760,17 @@ function renderAllStockAgentBacktestBlock(backtest = null) {
   </section>`;
 }
 
-function renderAllStockAgentSection(title, subtitle, rows, renderer) {
-  return `<section class="all-stock-agent-section">
-    <div class="social-source-head">
+function renderAllStockAgentSection(title, subtitle, rows, renderer, options = {}) {
+  return `<details class="all-stock-agent-section agent-disclosure" ${options.open === false ? "" : "open"}>
+    <summary class="social-source-head">
       <div>
         <p class="section-label">${escapeHtml(subtitle)}</p>
         <h3>${escapeHtml(title)}</h3>
       </div>
       <span class="tag">${escapeHtml(rows.length)} 个</span>
-    </div>
+    </summary>
     <div class="all-stock-agent-grid">${rows.length ? rows.map(renderer).join("") : empty("暂无。")}</div>
-  </section>`;
+  </details>`;
 }
 
 function renderAllStockAgentRoadmapBlock(latest = {}) {
@@ -5634,9 +5812,14 @@ function renderAllStockAgent(agentState) {
     return;
   }
   const summary = latest.summary || {};
+  const sourceReadinessBlocked = appState?.latest?.dataQuality?.readiness?.status === "blocked";
   const allBuyRows = latest.buyCandidates || [];
-  const buyRows = allBuyRows.filter((item) => item.actionable !== false && item.actionability?.status !== "research");
-  const downgradedBuyRows = allBuyRows.filter((item) => item.actionable === false || item.actionability?.status === "research");
+  const buyRows = sourceReadinessBlocked
+    ? []
+    : allBuyRows.filter((item) => item.actionable !== false && item.actionability?.status !== "research");
+  const downgradedBuyRows = sourceReadinessBlocked
+    ? allBuyRows
+    : allBuyRows.filter((item) => item.actionable === false || item.actionability?.status === "research");
   const downgradedTickers = new Set(downgradedBuyRows.map((item) => normalizeTickerSymbol(item.ticker)).filter(Boolean));
   const watchBuyRows = [
     ...downgradedBuyRows,
@@ -5662,7 +5845,7 @@ function renderAllStockAgent(agentState) {
       <div class="all-stock-agent-metrics">
         ${allStockAgentMetric(summary.universe, "候选池")}
         ${allStockAgentMetric(summary.evaluated, "已评分")}
-        ${allStockAgentMetric(summary.buy, "买入")}
+        ${allStockAgentMetric(buyRows.length, "正式买入")}
         ${allStockAgentMetric(summary.watchBuy, "观察")}
         ${allStockAgentMetric(summary.sell, "卖出")}
         ${allStockAgentMetric(summary.reviewed, "复盘")}
@@ -5672,26 +5855,27 @@ function renderAllStockAgent(agentState) {
       <strong>覆盖边界</strong>
       <span>${escapeHtml(latest.universeCoverage?.note || "当前扫描可获取候选池。")}</span>
     </div>
+    ${sourceReadinessBlocked ? `<div class="all-stock-agent-note warning"><strong>当前报告不可用于操作</strong><span>${escapeHtml(appState.latest?.dataQuality?.readiness?.summary || "核心数据源未达到可用门槛")}；旧 Agent 买入结果已全部降级到观察区。</span></div>` : ""}
     ${revision?.changes?.length ? `<div class="all-stock-agent-note success"><strong>Skill 已自更新</strong><span>${escapeHtml(revision.summary || "")}</span></div>` : ""}
     ${renderAllStockAgentRoadmapBlock(latest)}
     ${renderAllStockAgentTrackRecord(latest)}
     ${renderFactorLifecycleBoard(appState?.factorRegistry)}
     ${renderAllStockAgentBacktestBlock(allStockAgentBacktest)}
     ${renderAllStockAgentSection("正式买入", "Buy List", buyRows, (item) => renderAllStockAgentDecision(item, "buy", run))}
-    ${renderAllStockAgentSection("待触发买入候选", "Watch Buy", watchBuyRows, (item) => renderAllStockAgentDecision(item, "watch", run))}
+    ${renderAllStockAgentSection("待触发买入候选", "Watch Buy", watchBuyRows, (item) => renderAllStockAgentDecision(item, "watch", run), { open: false })}
     ${renderAllStockAgentSection("持仓卖出检查", "Sell Check", sellRows, (item) => renderAllStockAgentDecision(item, "sell", run))}
-    ${renderAllStockAgentSection("持仓继续观察", "Hold Review", holdRows, (item) => renderAllStockAgentHold(item, run))}
-    <section class="all-stock-agent-section">
-      <div class="social-source-head">
+    ${renderAllStockAgentSection("持仓继续观察", "Hold Review", holdRows, (item) => renderAllStockAgentHold(item, run), { open: false })}
+    <details class="all-stock-agent-section agent-disclosure">
+      <summary class="social-source-head">
         <div>
           <p class="section-label">Review</p>
           <h3>历史建议复盘</h3>
         </div>
         <span class="tag">${escapeHtml(reviewRows.length)} 条</span>
-      </div>
+      </summary>
       <div class="all-stock-agent-review-list">${reviewRows.slice(0, 12).length ? reviewRows.slice(0, 12).map(renderAllStockAgentReview).join("") : empty("暂无可复盘价格。")}</div>
-    </section>
-    ${(latest.missingData || []).length ? `<section class="all-stock-agent-section"><h3>缺失数据 / 覆盖限制</h3><ul class="compact-list">${latest.missingData.map((item) => `<li>${escapeHtml(item)}</li>`).join("")}</ul></section>` : ""}
+    </details>
+    ${(latest.missingData || []).length ? `<details class="all-stock-agent-section agent-disclosure"><summary><strong>缺失数据 / 覆盖限制</strong><span class="tag amber">${escapeHtml(latest.missingData.length)} 条</span></summary><ul class="compact-list">${latest.missingData.map((item) => `<li>${escapeHtml(item)}</li>`).join("")}</ul></details>` : ""}
     <p class="muted">${escapeHtml(latest.disclaimer || "")}</p>`;
 }
 
@@ -7892,6 +8076,11 @@ function renderStorageHealth(storage = {}) {
   const mb = bytes ? `${fmtNumber(bytes / 1024 / 1024, 1)}MB` : "-";
   const sqlite = storage.sqliteMirror || {};
   const sqliteStatus = sqlite.lastResult?.status || (sqlite.enabled ? "等待同步" : "未启用");
+  const drive = storage.driveArchive || {};
+  const driveStatus = drive.status || {};
+  const driveReady = Boolean(drive.enabled && driveStatus.commandAvailable && driveStatus.remoteConfigured);
+  const driveLabel = driveReady ? "已就绪" : drive.enabled ? "待配置" : "未启用";
+  const driveCounts = driveStatus.counts || {};
   const statusClass = status.warning ? "amber" : status.status === "saved" || status.status === "skipped-clean" || status.status === "loaded" ? "green" : "amber";
   return `<div class="quality-section storage-health">
     <div class="quality-row">
@@ -7915,6 +8104,18 @@ function renderStorageHealth(storage = {}) {
         <p class="muted">${escapeHtml(sqlite.dbFile || "-")} · autoSync=${escapeHtml(sqlite.autoSync ? "true" : "false")}</p>
       </div>
       <span class="tag ${sqliteStatus === "ok" ? "green" : sqlite.enabled ? "amber" : ""}">${escapeHtml(sqliteStatus)}</span>
+    </div>
+    <div class="diagnostic-row">
+      <div>
+        <strong>Google Drive 冷归档</strong>
+        <p class="muted">${escapeHtml(drive.remote || "market-pulse-drive")}:${escapeHtml(drive.basePath || "MarketPulseAI")} · 本地保留 ${escapeHtml(drive.afterDays || 30)} 天</p>
+        <p class="muted">远端独占 ${escapeHtml(driveCounts.remoteOnly || 0)} 份 · 待归档 ${escapeHtml(driveCounts.pending || 0)} 份 · 下载缓存 ${escapeHtml(drive.cacheTtlHours || 24)} 小时</p>
+        ${driveStatus.lastFailure ? `<p class="quality-error">${escapeHtml(driveStatus.lastFailure)}</p>` : ""}
+      </div>
+      <div class="row">
+        <span class="tag ${driveReady ? "green" : drive.enabled ? "amber" : ""}">${escapeHtml(driveLabel)}</span>
+        <button class="btn compact ghost" type="button" data-run-drive-archive data-drive-dry-run="${drive.enabled ? "false" : "true"}">${drive.enabled ? "立即归档" : "检查配置"}</button>
+      </div>
     </div>
   </div>`;
 }
@@ -8087,7 +8288,7 @@ function renderProviders(providers, dataQuality, providerDetails = {}, sourceCon
   const setupLinksBlock = setupLinkCards(fullConfig, sourceDiagnostics);
   const setupChecklistBlock = renderSetupChecklist(fullConfig, dataQuality, sourceDiagnostics);
   const storageHealthBlock = renderStorageHealth(fullConfig.storage);
-  els.providerBox.innerHTML = `${integrationReadinessBlock}${learningLoopBlock}${setupLinksBlock}${setupChecklistBlock}${storageHealthBlock}${providerRows}${readinessBlock}${llmRoutingBlock}${sourceControlsBlock}${customFeedsBlock}${
+  const providerDetailsBlock = `${learningLoopBlock}${setupLinksBlock}${setupChecklistBlock}${storageHealthBlock}${providerRows}${llmRoutingBlock}${sourceControlsBlock}${customFeedsBlock}${
     diagnostics
   }${
     actions ? `<div class="quality-section"><h3>需要处理</h3>${actions}</div>` : ""
@@ -8098,6 +8299,7 @@ function renderProviders(providers, dataQuality, providerDetails = {}, sourceCon
   }${
     optionalWarnings ? `<div class="quality-section"><h3>可选源警告</h3>${optionalWarnings}</div>` : ""
   }`;
+  els.providerBox.innerHTML = `${integrationReadinessBlock}${readinessBlock}<details class="quality-section agent-disclosure"><summary><strong>配置、诊断与采集明细</strong><span class="tag">按需展开</span></summary>${providerDetailsBlock}</details>`;
 }
 
 async function run(session) {
@@ -8172,6 +8374,30 @@ els.providerBox?.addEventListener("change", async (event) => {
 });
 
 els.providerBox?.addEventListener("click", async (event) => {
+  const driveArchiveButton = event.target.closest("[data-run-drive-archive]");
+  if (driveArchiveButton) {
+    driveArchiveButton.disabled = true;
+    const dryRun = driveArchiveButton.dataset.driveDryRun === "true";
+    driveArchiveButton.textContent = dryRun ? "检查中..." : "归档中...";
+    try {
+      const response = await api("/api/drive-archive/run", {
+        method: "POST",
+        body: JSON.stringify({ dryRun }),
+      });
+      const result = response.result || {};
+      alert(
+        dryRun
+          ? `Drive 配置检查完成：${result.status || "unknown"}，符合 30 天规则 ${result.candidates || 0} 份。`
+          : `Drive 归档完成：验证 ${result.verified || 0} 份，清理 ${result.pruned || 0} 份，失败 ${result.failed || 0} 份。`,
+      );
+      await loadState();
+    } catch (error) {
+      alert(`Google Drive 冷归档失败：${error.message}`);
+    } finally {
+      driveArchiveButton.disabled = false;
+    }
+    return;
+  }
   const externalSmokeButton = event.target.closest("[data-external-api-smoke]");
   if (externalSmokeButton) {
     externalSmokeButton.disabled = true;
@@ -8286,6 +8512,11 @@ els.providerBox?.addEventListener("submit", async (event) => {
 });
 
 els.runHistoryBox.addEventListener("click", (event) => {
+  const moreButton = event.target.closest("[data-run-history-more]");
+  if (moreButton) {
+    loadRunHistoryPage();
+    return;
+  }
   const button = event.target.closest("[data-run-id]");
   if (!button) return;
   localStorage.setItem(RUN_SELECTION_STORAGE_KEY, button.dataset.runId);
@@ -8302,6 +8533,21 @@ els.stockReportBox.addEventListener("click", async (event) => {
   const refreshButton = event.target.closest("[data-refresh-stock-report]");
   if (refreshButton) {
     requestStockSnapshot(refreshButton.dataset.refreshStockReport, { force: true });
+    return;
+  }
+  const uziButton = event.target.closest("[data-run-uzi-analysis]");
+  if (uziButton) {
+    const ticker = uziButton.dataset.runUziAnalysis;
+    uziButton.disabled = true;
+    uziButton.textContent = "UZI 分析中...";
+    try {
+      await requestUziAnalysis(ticker, { depth: "lite" });
+    } catch (error) {
+      alert(`UZI 分析失败：${error.message}`);
+    } finally {
+      uziButton.disabled = false;
+      uziButton.textContent = "运行 UZI";
+    }
     return;
   }
   const debateButton = event.target.closest("[data-run-agent-debate]");
@@ -8914,5 +9160,18 @@ loadState().catch((error) => {
 });
 
 setInterval(() => {
-  if (!busy) loadState().catch(() => {});
+  if (busy) return;
+  api("/api/run/status")
+    .then(async (result) => {
+      collectionStatus = result.runStatus || null;
+      if (collectionStatus?.state === "running") {
+        setBusy(true);
+        if (!collectionPollTimer) collectionPollTimer = setTimeout(pollCollectionStatus, 1000);
+        return;
+      }
+      if (collectionStatus?.state === "completed" && collectionStatus.runId && collectionStatus.runId !== appState?.latest?.id) {
+        await loadState();
+      }
+    })
+    .catch(() => {});
 }, 30000);

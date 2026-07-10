@@ -3,7 +3,7 @@ import net from "node:net";
 import crypto from "node:crypto";
 import v8 from "node:v8";
 import { spawn } from "node:child_process";
-import { mkdir, readFile, rename, stat, unlink, writeFile } from "node:fs/promises";
+import { mkdir, readFile, readdir, rename, stat, unlink, writeFile } from "node:fs/promises";
 import { existsSync, mkdirSync, readFileSync, unlinkSync, writeFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -21,6 +21,7 @@ import {
   addNyseTradingDays,
   calculateOptionFifoLots,
   isNyseTradingDay,
+  numberOrNull as marketNumberOrNull,
   nyseSessionForYmd,
   scoreFredMacroRegime,
   semanticNewsOwnership,
@@ -118,6 +119,14 @@ import {
   timeboxedTask,
   withExternalRetries,
 } from "./server/runtime_utils.mjs";
+import {
+  archiveOldRunsToDrive,
+  cleanupDriveArchiveCache,
+  driveArchiveConfigFromEnv,
+  driveArchiveMetadataIsVerified,
+  driveArchiveStatus,
+  loadDriveArchivedRun,
+} from "./server/drive_archive.mjs";
 import { serveStatic } from "./server/static_files.mjs";
 import { errorZh } from "./server/text_utils.mjs";
 import { evaluateFactorSpec } from "./lib/factor_spec.mjs";
@@ -163,9 +172,15 @@ const ALL_STOCK_AGENT_SKILL_FILE = path.join(
 const PORT = Number(process.env.PORT || 5173);
 const HOST = process.env.HOST || "127.0.0.1";
 const MAX_REQUEST_BODY_BYTES = maxRequestBodyBytes();
-const RUN_HISTORY_LIMIT = Math.max(1, Number(process.env.RUN_HISTORY_LIMIT || 20));
+const RUN_HISTORY_LIMIT = Math.max(1, Number(process.env.RUN_HISTORY_LIMIT || 730));
 const RUN_ARCHIVE_ENABLED = parseBoolean(process.env.RUN_ARCHIVE_ENABLED, true);
 const RUN_ARCHIVE_DIR = path.join(DATA_DIR, process.env.RUN_ARCHIVE_DIR || "runs");
+const RUN_ARCHIVE_INDEX_BACKFILL_ENABLED = parseBoolean(process.env.RUN_ARCHIVE_INDEX_BACKFILL_ENABLED, true);
+const DRIVE_ARCHIVE_CONFIG = driveArchiveConfigFromEnv({
+  env: process.env,
+  dataDir: DATA_DIR,
+  localRunDir: RUN_ARCHIVE_DIR,
+});
 const RUN_INLINE_FULL_LIMIT = Math.max(1, Number(process.env.RUN_INLINE_FULL_LIMIT || 6));
 const STORE_SIZE_WARN_BYTES = Math.max(1024 * 1024, Number(process.env.STORE_SIZE_WARN_BYTES || 80 * 1024 * 1024));
 const STORE_PRETTY_JSON = parseBoolean(process.env.STORE_PRETTY_JSON, false);
@@ -1167,7 +1182,7 @@ const ALL_STOCK_AGENT_RUN_LIMIT = Math.max(10, Number(process.env.ALL_STOCK_AGEN
 const ALL_STOCK_AGENT_OUTCOME_LIMIT = Math.max(200, Number(process.env.ALL_STOCK_AGENT_OUTCOME_LIMIT || 6000));
 const ALL_STOCK_AGENT_PAPER_TRADE_LIMIT = Math.max(100, Number(process.env.ALL_STOCK_AGENT_PAPER_TRADE_LIMIT || 1500));
 const ALL_STOCK_AGENT_OUTCOME_DEADBAND_PCT = Math.max(0, Number(process.env.ALL_STOCK_AGENT_OUTCOME_DEADBAND_PCT || 0.5));
-const ALL_STOCK_AGENT_SUSPECT_PRICE_RETURN_PCT = Math.max(20, Number(process.env.ALL_STOCK_AGENT_SUSPECT_PRICE_RETURN_PCT || 100));
+const ALL_STOCK_AGENT_SUSPECT_PRICE_RETURN_PCT = Math.max(20, Number(process.env.ALL_STOCK_AGENT_SUSPECT_PRICE_RETURN_PCT || 50));
 const ALL_STOCK_AGENT_PAPER_POSITION_SIZE = Math.max(100, Number(process.env.ALL_STOCK_AGENT_PAPER_POSITION_SIZE || 10000));
 const ALL_STOCK_AGENT_BACKTEST_DAYS = Math.max(3, Number(process.env.ALL_STOCK_AGENT_BACKTEST_DAYS || 30));
 const ALL_STOCK_AGENT_BACKTEST_MAX_DATES = Math.max(3, Number(process.env.ALL_STOCK_AGENT_BACKTEST_MAX_DATES || 20));
@@ -1209,6 +1224,9 @@ let saveQueue = Promise.resolve();
 let sqliteMirrorQueue = Promise.resolve();
 let sqliteMirrorTimer = null;
 let sqliteMirrorLastResult = null;
+let driveArchiveLastResult = null;
+let driveArchiveLastStatus = null;
+let driveArchiveMaintenancePromise = null;
 let storeCache = null;
 let storeCacheMtimeMs = 0;
 let storeLastSavedHash = "";
@@ -1510,6 +1528,69 @@ const ENV_CONFIG_FIELDS = Object.freeze([
     group: "稳定性",
     live: false,
     placeholder: "runs",
+  },
+  {
+    key: "RUN_HISTORY_LIMIT",
+    label: "历史报告摘要保留数",
+    group: "稳定性",
+    live: false,
+    placeholder: "730",
+  },
+  {
+    key: "RUN_ARCHIVE_INDEX_BACKFILL_ENABLED",
+    label: "启动时回填历史归档索引",
+    group: "稳定性",
+    live: false,
+    placeholder: "true",
+  },
+  {
+    key: "DRIVE_ARCHIVE_ENABLED",
+    label: "启用 Google Drive 冷归档",
+    group: "稳定性",
+    live: false,
+    placeholder: "false",
+  },
+  {
+    key: "DRIVE_ARCHIVE_REMOTE",
+    label: "rclone Drive remote",
+    group: "稳定性",
+    live: false,
+    placeholder: "market-pulse-drive",
+  },
+  {
+    key: "DRIVE_ARCHIVE_BASE_PATH",
+    label: "Drive 归档目录",
+    group: "稳定性",
+    live: false,
+    placeholder: "MarketPulseAI",
+  },
+  {
+    key: "DRIVE_ARCHIVE_AFTER_DAYS",
+    label: "本地报告保留天数",
+    group: "稳定性",
+    live: false,
+    placeholder: "30",
+  },
+  {
+    key: "DRIVE_ARCHIVE_BATCH_LIMIT",
+    label: "每轮 Drive 归档上限",
+    group: "稳定性",
+    live: false,
+    placeholder: "3",
+  },
+  {
+    key: "DRIVE_ARCHIVE_CACHE_TTL_HOURS",
+    label: "Drive 下载缓存小时",
+    group: "稳定性",
+    live: false,
+    placeholder: "24",
+  },
+  {
+    key: "DRIVE_ARCHIVE_DELETE_LOCAL_AFTER_VERIFY",
+    label: "校验后删除本地归档",
+    group: "稳定性",
+    live: false,
+    placeholder: "true",
   },
   {
     key: "FRED_MACRO_ENABLED",
@@ -3579,13 +3660,51 @@ function compactRunSummaryForStore(run = {}) {
     errorCount: (run.errors || []).length,
     alertCount: (run.alerts || []).length,
     archiveFile: runArchivePath(run.id),
+    driveArchive: run.driveArchive || null,
     summaryOnly: true,
+  };
+}
+
+async function backfillRunArchiveIndex(db = {}) {
+  if (!RUN_ARCHIVE_ENABLED || !RUN_ARCHIVE_INDEX_BACKFILL_ENABLED || !existsSync(RUN_ARCHIVE_DIR)) {
+    return { status: "disabled", added: 0, errors: [] };
+  }
+  const knownIds = new Set((db.runs || []).map((run) => String(run?.id || "")).filter(Boolean));
+  const files = (await readdir(RUN_ARCHIVE_DIR)).filter((file) => file.endsWith(".json"));
+  const recovered = [];
+  const errors = [];
+  for (const file of files) {
+    const fallbackId = file.replace(/\.json$/i, "");
+    if (knownIds.has(fallbackId)) continue;
+    const archiveFile = path.join(RUN_ARCHIVE_DIR, file);
+    try {
+      const run = JSON.parse(await readFile(archiveFile, "utf8"));
+      if (!run?.id || knownIds.has(String(run.id))) continue;
+      recovered.push({
+        ...compactRunSummaryForStore(run),
+        archiveFile,
+      });
+      knownIds.add(String(run.id));
+    } catch (error) {
+      errors.push({ file, error: error.message });
+    }
+  }
+  if (recovered.length) {
+    db.runs = runsByRecency([...(db.runs || []), ...recovered]).slice(0, RUN_HISTORY_LIMIT);
+  }
+  return {
+    status: errors.length ? "partial" : "ok",
+    added: recovered.length,
+    scanned: files.length,
+    errors: errors.slice(0, 10),
   };
 }
 
 async function archiveRuns(runs = []) {
   if (!RUN_ARCHIVE_ENABLED) return;
-  const fullRuns = (runs || []).filter((run) => run?.id && !run.summaryOnly);
+  const fullRuns = (runs || []).filter(
+    (run) => run?.id && !run.summaryOnly && !driveArchiveMetadataIsVerified(run.driveArchive),
+  );
   if (!fullRuns.length) return;
   await mkdir(RUN_ARCHIVE_DIR, { recursive: true });
   await Promise.all(
@@ -3625,13 +3744,121 @@ async function archiveRuns(runs = []) {
 async function loadArchivedRun(run = {}) {
   if (!run?.summaryOnly) return run || null;
   const file = run.archiveFile || runArchivePath(run.id);
-  if (!file) return null;
-  try {
-    const raw = await readFile(file, "utf8");
-    return JSON.parse(raw);
-  } catch {
-    return null;
+  if (file && existsSync(file)) {
+    try {
+      const raw = await readFile(file, "utf8");
+      return JSON.parse(raw);
+    } catch (error) {
+      console.warn(`Local run archive ${run.id || "unknown"} is unreadable: ${error.message}`);
+    }
   }
+  const remote = await loadDriveArchivedRun(DRIVE_ARCHIVE_CONFIG, run);
+  return remote?.run || null;
+}
+
+function driveArchiveResultForClient(result = null) {
+  if (!result) return null;
+  return {
+    schemaVersion: result.schemaVersion,
+    status: result.status,
+    startedAt: result.startedAt,
+    completedAt: result.completedAt,
+    remote: result.remote,
+    basePath: result.basePath,
+    candidates: Number(result.candidates || 0),
+    verified: Number(result.verified || 0),
+    pruned: Number(result.pruned || 0),
+    failed: Number(result.failed || 0),
+    cacheCleanup: result.cacheCleanup || null,
+    error: result.error || "",
+    rows: (result.rows || []).map((row) => ({
+      runId: row.runId,
+      status: row.status,
+      error: row.error || "",
+    })),
+  };
+}
+
+function driveArchiveForClient() {
+  return {
+    enabled: DRIVE_ARCHIVE_CONFIG.enabled,
+    provider: "google-drive-rclone",
+    remote: DRIVE_ARCHIVE_CONFIG.remote,
+    basePath: DRIVE_ARCHIVE_CONFIG.basePath,
+    afterDays: DRIVE_ARCHIVE_CONFIG.afterDays,
+    batchLimit: DRIVE_ARCHIVE_CONFIG.batchLimit,
+    cacheTtlHours: DRIVE_ARCHIVE_CONFIG.cacheTtlHours,
+    deleteLocalAfterVerify: DRIVE_ARCHIVE_CONFIG.deleteLocalAfterVerify,
+    status: driveArchiveLastStatus,
+    lastResult: driveArchiveResultForClient(driveArchiveLastResult),
+  };
+}
+
+async function refreshDriveArchiveStatus(db = null) {
+  const target = db || (await ensureStore());
+  driveArchiveLastStatus = await driveArchiveStatus(DRIVE_ARCHIVE_CONFIG, target.runs || []);
+  return driveArchiveLastStatus;
+}
+
+async function runDriveArchiveMaintenance(options = {}) {
+  if (driveArchiveMaintenancePromise) return driveArchiveMaintenancePromise;
+  const task = (async () => {
+    const db = await ensureStore();
+    const dryRun = Boolean(options.dryRun);
+    const result = await archiveOldRunsToDrive(DRIVE_ARCHIVE_CONFIG, db.runs || [], {
+      dryRun,
+      ignoreDisabled: dryRun,
+      batchLimit: options.batchLimit,
+      deleteLocalAfterVerify: false,
+    });
+    const uploadChanged = !dryRun && (result.rows || []).some((row) =>
+      ["verified", "failed"].includes(row.status),
+    );
+    if (uploadChanged) {
+      await saveStore(db);
+    }
+    const verifiedRunIds = dryRun
+      ? []
+      : (result.rows || [])
+          .filter((row) => ["verified", "already_verified"].includes(row.status))
+          .map((row) => row.runId);
+    let pruneResult = null;
+    if (verifiedRunIds.length && DRIVE_ARCHIVE_CONFIG.deleteLocalAfterVerify) {
+      pruneResult = await archiveOldRunsToDrive(DRIVE_ARCHIVE_CONFIG, db.runs || [], {
+        runIds: verifiedRunIds,
+        batchLimit: verifiedRunIds.length,
+        deleteLocalAfterVerify: true,
+      });
+      result.rows = [...(result.rows || []), ...(pruneResult.rows || [])];
+      result.pruned = Number(pruneResult.pruned || 0);
+      result.failed = Number(result.failed || 0) + Number(pruneResult.failed || 0);
+      result.status = result.failed ? "partial" : "ok";
+    }
+    const changed = uploadChanged || Number(result.pruned || 0) > 0;
+    if (changed) {
+      appendAuditEvent(
+        db,
+        "drive_archive.maintenance",
+        {
+          status: result.status,
+          candidates: result.candidates || 0,
+          verified: result.verified || 0,
+          pruned: result.pruned || 0,
+          failed: result.failed || 0,
+        },
+        result.failed ? "warn" : "ok",
+      );
+      await saveStore(db);
+    }
+    const cacheCleanup = await cleanupDriveArchiveCache(DRIVE_ARCHIVE_CONFIG);
+    driveArchiveLastResult = { ...result, cacheCleanup };
+    await refreshDriveArchiveStatus(db);
+    return driveArchiveLastResult;
+  })();
+  driveArchiveMaintenancePromise = task.finally(() => {
+    driveArchiveMaintenancePromise = null;
+  });
+  return driveArchiveMaintenancePromise;
 }
 
 function compactStoreForSave(db = {}) {
@@ -5193,8 +5420,7 @@ function compactId(prefix) {
 }
 
 function numberOrNull(value) {
-  const n = Number(value);
-  return Number.isFinite(n) ? n : null;
+  return marketNumberOrNull(value);
 }
 
 function normalizeTradeSide(value) {
@@ -10827,11 +11053,15 @@ function buildReportEmail(run) {
     .sort((a, b) => (severityRank[b.severity] || 0) - (severityRank[a.severity] || 0));
   const marketOverview = run.marketOverview;
   const readiness = run.dataQuality?.readiness || null;
-  const headline =
-    short(run.analysis?.headline, 180) ||
-    short(run.analysis?.summary?.[0], 180) ||
-    short(run.analysis?.llmText, 220) ||
-    "本轮报告已生成，建议先看大盘、提醒、重点个股和社交异动。";
+  const readinessBlocked = readiness?.status === "blocked";
+  const headline = readinessBlocked
+    ? `数据质量未通过操作门槛：${short(readiness?.summary || "核心数据源不可用", 220)}；本邮件仅作故障与研究材料提示，不提供买入建议。`
+    : (
+        short(run.analysis?.headline, 180) ||
+        short(run.analysis?.summary?.[0], 180) ||
+        short(run.analysis?.llmText, 220) ||
+        "本轮报告已生成，建议先看大盘、提醒、重点个股和社交异动。"
+      );
   const topSocialTickers = [
     ...new Set(
       [...(run.socialHotStocks?.rising || []), ...(run.socialHotStocks?.candidates || [])]
@@ -10842,6 +11072,7 @@ function buildReportEmail(run) {
   const subject = [
     `Market Pulse AI ${label}`,
     ny.ymd,
+    readinessBlocked ? "数据不可用" : "",
     marketOverview?.regime,
     sortedAlerts.length ? `提醒${sortedAlerts.length}` : "",
     topSocialTickers.length ? `热议 ${topSocialTickers.join("/")}` : "",
@@ -10857,23 +11088,29 @@ function buildReportEmail(run) {
     (item) => `[${severityZh(item.severity)}] ${item.ticker || "市场"} ${short(item.title, 80)}：${short(item.detail, 160)}`,
     6,
   );
-  const stockIdeas = reportList(
-    run.stockNarratives?.items,
-    (item) => `${item.ticker}: ${short(item.oneLine || item.decisionMemo?.baseCase || item.newsCatalyst || item.socialReason, 220)}`,
-    6,
-  );
-  const discoveries = reportList(
-    (run.discovery?.candidates || []).filter((item) => !stockIdeas.some((line) => line.startsWith(`${item.ticker}:`))),
-    (item) => `${item.ticker}: 评分 ${item.score}，${short(item.reasons?.slice(0, 2).join("；") || item.investmentView || "暂无理由", 180)}`,
-    4,
-  );
-  const socialHot = reportList(
-    [...(run.socialHotStocks?.rising || []), ...(run.socialHotStocks?.candidates || [])].filter(
-      (item, index, rows) => rows.findIndex((row) => row.ticker === item.ticker) === index,
-    ),
-    (item) => `${item.ticker}: ${short(item.twoSentenceReason || item.hotReason || item.investmentView || item.reasons?.join("；"), 240)}`,
-    6,
-  );
+  const stockIdeas = readinessBlocked
+    ? []
+    : reportList(
+        run.stockNarratives?.items,
+        (item) => `${item.ticker}: ${short(item.oneLine || item.decisionMemo?.baseCase || item.newsCatalyst || item.socialReason, 220)}`,
+        6,
+      );
+  const discoveries = readinessBlocked
+    ? []
+    : reportList(
+        (run.discovery?.candidates || []).filter((item) => !stockIdeas.some((line) => line.startsWith(`${item.ticker}:`))),
+        (item) => `${item.ticker}: 评分 ${item.score}，${short(item.reasons?.slice(0, 2).join("；") || item.investmentView || "暂无理由", 180)}`,
+        4,
+      );
+  const socialHot = readinessBlocked
+    ? []
+    : reportList(
+        [...(run.socialHotStocks?.rising || []), ...(run.socialHotStocks?.candidates || [])].filter(
+          (item, index, rows) => rows.findIndex((row) => row.ticker === item.ticker) === index,
+        ),
+        (item) => `${item.ticker}: ${short(item.twoSentenceReason || item.hotReason || item.investmentView || item.reasons?.join("；"), 240)}`,
+        6,
+      );
   const calendarLines = reportList(
     [
       ...(run.eventCalendar?.earnings || []).slice(0, 6),
@@ -18370,6 +18607,14 @@ function firstFiniteNumber(...values) {
   return null;
 }
 
+function firstPositiveFiniteNumber(...values) {
+  for (const value of values) {
+    const parsed = numberOrNull(value);
+    if (Number.isFinite(parsed) && parsed > 0) return parsed;
+  }
+  return null;
+}
+
 function normalizeLongBridgeCompareRow(row = {}) {
   const ticker =
     longBridgeTickerFromCounterId(row.counter_id) ||
@@ -20828,24 +21073,25 @@ function actionSuggestionPriority(advisor = {}, position = null, socialHot = nul
 }
 
 function actionSuggestionTechnicalLine(technical = {}, quote = {}) {
-  const price = numberOrNull(technical.latestClose || quote.price);
-  const sma10 = numberOrNull(technical.sma10);
-  const sma20 = numberOrNull(technical.sma20);
+  const price = firstPositiveFiniteNumber(technical.latestClose, quote.price);
+  const sma10 = firstPositiveFiniteNumber(technical.sma10);
+  const sma20 = firstPositiveFiniteNumber(technical.sma20);
+  const rsi14 = firstPositiveFiniteNumber(technical.rsi14);
   const rows = [
     Number.isFinite(price) ? `现价 ${formatReportNumber(price, 2)}` : "",
     Number.isFinite(sma10) ? `10日线 ${formatReportNumber(sma10, 2)}` : "",
     Number.isFinite(sma20) ? `20日线 ${formatReportNumber(sma20, 2)}` : "",
-    Number.isFinite(technical.rsi14) ? `RSI14 ${formatReportNumber(technical.rsi14, 1)}` : "",
+    Number.isFinite(rsi14) && rsi14 <= 100 ? `RSI14 ${formatReportNumber(rsi14, 1)}` : "",
   ].filter(Boolean);
   return rows.length ? rows.join("，") : "技术数据不足。";
 }
 
 function actionSuggestionExitLevels(technical = {}, advisor = {}) {
   const exits = [...(advisor.tradePlan?.exitTriggers || [])];
-  if (Number.isFinite(technical?.sma20)) {
+  if (Number.isFinite(technical?.sma20) && technical.sma20 > 0) {
     exits.unshift(`跌破 20日线 ${formatReportNumber(technical.sma20, 2)} 后降低短线权重。`);
   }
-  if (Number.isFinite(technical?.sma10)) {
+  if (Number.isFinite(technical?.sma10) && technical.sma10 > 0) {
     exits.unshift(`若冲高后失守 10日线 ${formatReportNumber(technical.sma10, 2)}，先复核动量是否衰减。`);
   }
   return [...new Set(exits.map(normalizeDisplayText).filter(Boolean))].slice(0, 4);
@@ -20990,7 +21236,8 @@ function buildActionSuggestions(run = {}) {
     seen.add(ticker);
     return true;
   }).slice(0, 40);
-  const candidates = tickers
+  const readinessBlocked = run.dataQuality?.readiness?.status === "blocked";
+  const rawCandidates = tickers
     .map((ticker) => buildActionSuggestionRow(run, ticker))
     .filter(Boolean)
     .sort((a, b) => {
@@ -20999,6 +21246,22 @@ function buildActionSuggestions(run = {}) {
       if (watchDiff) return watchDiff;
       return (b.priority || 0) - (a.priority || 0) || (b.score || 0) - (a.score || 0);
     });
+  const candidates = readinessBlocked
+    ? rawCandidates.map((item) => ({
+        ...item,
+        operationType: "暂不操作",
+        action: "观察",
+        gateAdjusted: true,
+        riskGates: [
+          {
+            id: "source_readiness_blocked",
+            label: "本轮数据不可用于操作",
+            reason: run.dataQuality?.readiness?.summary || "核心数据源未达到可用标准。",
+          },
+          ...(item.riskGates || []),
+        ].slice(0, 5),
+      }))
+    : rawCandidates;
   const groups = {
     buy: candidates.filter((item) => item.operationType === "候选买入").slice(0, 8),
     wait: candidates.filter((item) => item.operationType === "等待触发").slice(0, 8),
@@ -21023,6 +21286,12 @@ function buildActionSuggestions(run = {}) {
       watchlist: run.watchlist || [],
       note: "范围来自自选股、重点股票池、因子候选和社交/异动池；排序优先自选股。",
     },
+    readinessGate: readinessBlocked
+      ? {
+          status: "blocked",
+          message: run.dataQuality?.readiness?.summary || "核心数据源未达到可用标准，本轮只展示研究材料。",
+        }
+      : { status: "usable", message: "本轮数据通过操作建议最低可用门槛。" },
     candidates,
     groups,
     disclaimer: "这是基于当前采集数据的系统化操作建议，不是个性化财务顾问意见；执行前需结合你的仓位、风险预算和交易纪律。",
@@ -21443,6 +21712,59 @@ function allStockAgentDecisionTracksOutcome(decision = {}) {
   return decision?.action === "卖出";
 }
 
+function semanticOwnershipForMaterial(item = {}, ticker = "", fundamental = {}) {
+  const symbol = safeTicker(ticker);
+  const companyName = fundamental.name || knownEquityProfile(symbol)?.name || "";
+  const rawArticleText = normalizeDisplayText(
+    item.article?.text || item.article?.content || item.content || item.description || item.body || "",
+  );
+  const ownership = semanticNewsOwnership(
+    {
+      ticker: symbol,
+      companyName,
+      title: item.title,
+      titleZh: item.titleZh,
+      summary: rawArticleText,
+      source: item.source,
+      publisher: item.publisher,
+      relatedTickers: item.relatedTickers,
+      article: {
+        title: item.article?.title || "",
+        text: rawArticleText,
+      },
+    },
+    { ticker: symbol, companyName, fundamental },
+  );
+  const ambiguousTickerTerms = new Set(["AI", "ALL", "ARM", "CAT", "COST", "FAST", "FOR", "IT", "LOVE", "NOW", "ON", "OPEN", "PATH", "SHOP", "SO", "SPY"]);
+  if (ownership.category === "direct_company" && ambiguousTickerTerms.has(symbol)) {
+    const originalText = [item.title, item.article?.title, rawArticleText].filter(Boolean).join(" ");
+    const explicitTicker = new RegExp(`(^|[^A-Z0-9])\\$?${symbol.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}([^A-Z0-9]|$)`).test(originalText);
+    const explicitCompany = symbol === "SPY" && /SPDR|S&P 500|Standard & Poor/i.test(originalText);
+    if (!explicitTicker && !explicitCompany) {
+      return {
+        ...ownership,
+        category: "ambiguous",
+        mismatch: true,
+        confidence: Math.min(ownership.confidence, 45),
+        reasons: [...(ownership.reasons || []), "ticker 同时是常见英文词，正文没有大写 ticker 或公司名佐证。"],
+      };
+    }
+  }
+  return ownership;
+}
+
+function allStockAgentMaterialBelongsToTicker(item = {}, ticker = "", fundamental = {}) {
+  const symbol = safeTicker(ticker);
+  if (!symbol || !item) return false;
+  const itemTicker = safeTicker(item.ticker);
+  const sourceText = `${item.source || ""} ${item.provider || ""} ${item.form || ""}`;
+  if (itemTicker === symbol && /SEC|EDGAR|filing|10-K|10-Q|8-K|Form 4|公告|财报/i.test(sourceText)) {
+    return true;
+  }
+  const ownership = semanticOwnershipForMaterial(item, symbol, fundamental);
+  return ownership.category === "direct_company" && ownership.confidence >= 70;
+}
+
 function allStockAgentTickerContext(run = {}, ticker = "", state = {}) {
   const symbol = safeTicker(ticker);
   const quote = (run.quotes || []).find((item) => safeTicker(item.ticker) === symbol) || null;
@@ -21464,7 +21786,7 @@ function allStockAgentTickerContext(run = {}, ticker = "", state = {}) {
     ...(narrative?.catalystPack?.items || []),
     ...(run.news || []).filter((item) => itemMatchesRunTicker(item, symbol)).slice(0, 20),
     ...(run.filings || []).filter((item) => itemMatchesRunTicker(item, symbol)).slice(0, 8),
-  ];
+  ].filter((item) => allStockAgentMaterialBelongsToTicker(item, symbol, fundamental || {}));
   const activePosition = allStockAgentActivePositions(state).get(symbol) || null;
   const agentDebate = deterministicAgentDebateForGate(narrative?.agentDebate || narrative?.decisionDashboard?.agentDebate || null);
   const agentDebateLLM = narrative?.agentDebateLLM || narrative?.decisionDashboard?.agentDebateLLM || null;
@@ -21654,7 +21976,7 @@ function normalizeFactorValue(factorId, rawValue, peerGroup = {}) {
 function factorQuality(raw = {}, source = []) {
   const values = Object.values(raw || {});
   if (!values.length) return 0;
-  const present = values.filter(factorMetricPresent).length;
+  const present = values.filter((value) => factorMetricPresent(value) && value !== 0).length;
   return clampScore(Math.round((present / values.length) * 82 + Math.min(18, (source || []).length * 6)));
 }
 
@@ -21725,8 +22047,14 @@ function buildFactorSubSignals(id = "", raw = {}) {
   if (id === "earningsRevision") {
     const buyRatio = numberOrNull(raw.buyRatio);
     const sellRatio = numberOrNull(raw.sellRatio);
+    const hasRating = Number.isFinite(buyRatio) || Number.isFinite(sellRatio);
     return [
-      subSignal("ratingLevel", "评级分布", Number.isFinite(buyRatio) || Number.isFinite(sellRatio) ? `${buyRatio ?? "-"}:${sellRatio ?? "-"}` : null, 50 + (Number.isFinite(buyRatio) ? buyRatio * 22 : 0) - (Number.isFinite(sellRatio) ? sellRatio * 26 : 0)),
+      subSignal(
+        "ratingLevel",
+        "评级分布",
+        hasRating ? `${buyRatio ?? "-"}:${sellRatio ?? "-"}` : null,
+        hasRating ? 50 + (Number.isFinite(buyRatio) ? buyRatio * 22 : 0) - (Number.isFinite(sellRatio) ? sellRatio * 26 : 0) : null,
+      ),
     ];
   }
   if (id === "newsCatalyst") {
@@ -21781,7 +22109,7 @@ function factorRow(id, label, raw = {}, score = 50, source = [], missingReason =
     quality,
     subSignals,
     source: sources,
-    missingReason: quality ? "" : missingReason || "缺少该因子所需字段。",
+    missingReason: quality >= 35 ? "" : missingReason || "缺少该因子所需字段。",
   };
 }
 
@@ -21835,10 +22163,11 @@ function scoreMomentumFactor(ctx = {}) {
   const technical = ctx.technical || {};
   const quote = ctx.quote || {};
   const row = ctx.row || {};
-  const price = firstFiniteNumber(quote.price, technical.latestClose, row.quote?.price);
-  const sma10 = firstFiniteNumber(technical.sma10, row.sma10);
-  const sma20 = firstFiniteNumber(technical.sma20, row.sma20);
-  const rsi14 = firstFiniteNumber(technical.rsi14, row.rsi14);
+  const price = firstPositiveFiniteNumber(quote.price, technical.latestClose, row.quote?.price);
+  const sma10 = firstPositiveFiniteNumber(technical.sma10, row.sma10);
+  const sma20 = firstPositiveFiniteNumber(technical.sma20, row.sma20);
+  const rsiCandidate = firstPositiveFiniteNumber(technical.rsi14, row.rsi14);
+  const rsi14 = Number.isFinite(rsiCandidate) && rsiCandidate <= 100 ? rsiCandidate : null;
   const return5d = firstFiniteNumber(technical.keyLevels?.return5d, latestChartReturn(technical.chart, 5));
   const priceVsSma10Pct = safePctDiff(price, sma10);
   const priceVsSma20Pct = safePctDiff(price, sma20);
@@ -22872,10 +23201,11 @@ function evaluateAllStockAgentCondition(condition, ctx = {}, skill = {}) {
   const symbol = safeTicker(ctx.ticker || row.ticker || fundamental.ticker);
   const knownProfile = knownEquityProfile(symbol);
   const socialHot = ctx.socialHot || {};
-  const price = numberOrNull(quote.price ?? technical.latestClose ?? row.quote?.price);
-  const sma10 = numberOrNull(technical.sma10 ?? row.sma10);
-  const sma20 = numberOrNull(technical.sma20 ?? row.sma20);
-  const rsi14 = numberOrNull(technical.rsi14 ?? row.rsi14);
+  const price = firstPositiveFiniteNumber(quote.price, technical.latestClose, row.quote?.price);
+  const sma10 = firstPositiveFiniteNumber(technical.sma10, row.sma10);
+  const sma20 = firstPositiveFiniteNumber(technical.sma20, row.sma20);
+  const rsiCandidate = firstPositiveFiniteNumber(technical.rsi14, row.rsi14);
+  const rsi14 = Number.isFinite(rsiCandidate) && rsiCandidate <= 100 ? rsiCandidate : null;
   const score = numberOrNull(row.score) ?? 50;
   const dataCoverage = numberOrNull(row.dataCoverage) ?? numberOrNull(row.confidenceScore) ?? 0;
   const minDataQuality = numberOrNull(skill.settings?.minDataQuality) ?? 42;
@@ -22914,7 +23244,7 @@ function evaluateAllStockAgentCondition(condition, ctx = {}, skill = {}) {
     case "price_above_sma10_sma20":
       return {
         passed: Number.isFinite(price) && Number.isFinite(sma10) && Number.isFinite(sma20) && price >= sma10 && price >= sma20,
-        evidence: Number.isFinite(price)
+        evidence: Number.isFinite(price) && Number.isFinite(sma10) && Number.isFinite(sma20)
           ? `现价 ${formatReportNumber(price, 2)}，10日线 ${formatReportNumber(sma10, 2)}，20日线 ${formatReportNumber(sma20, 2)}。`
           : "缺少现价或均线。",
       };
@@ -23039,7 +23369,9 @@ function evaluateAllStockAgentCondition(condition, ctx = {}, skill = {}) {
     case "missing_buy_technical":
       return {
         passed: !Number.isFinite(sma10) || !Number.isFinite(sma20),
-        evidence: `10日线 ${formatReportNumber(sma10, 2)}，20日线 ${formatReportNumber(sma20, 2)}；缺少均线时不进入买入候选。`,
+        evidence: Number.isFinite(sma10) && Number.isFinite(sma20)
+          ? `10日线 ${formatReportNumber(sma10, 2)}，20日线 ${formatReportNumber(sma20, 2)}。`
+          : "10日线或20日线缺失；缺少均线时不进入买入候选。",
       };
     case "missing_buy_fundamental":
       return {
@@ -23893,6 +24225,13 @@ function buildAllStockAgentReviews(state = {}, run = {}) {
         ? Math.max(0, (Date.now() - new Date(decision.generatedAt).getTime()) / (24 * 60 * 60 * 1000))
         : 0;
       if (!Number.isFinite(returnPct)) return null;
+      const quality = classifyAllStockAgentOutcomeQuality({
+        entryPrice: numberOrNull(decision.price),
+        exitPrice: currentPrice,
+        rawReturnPct: returnPct,
+        performancePct: returnPct,
+        horizonDays: ageDays,
+      });
       return {
         schemaVersion: "all-stock-agent-review-v1",
         decisionId: decision.id,
@@ -23903,7 +24242,10 @@ function buildAllStockAgentReviews(state = {}, run = {}) {
         decisionPrice: numberOrNull(decision.price),
         currentPrice,
         performancePct: returnPct,
-        outcome: returnPct >= 0 ? "命中" : "未命中",
+        outcome: quality.usable ? (returnPct >= 0 ? "命中" : "未命中") : "待核验",
+        outcomeQualityStatus: quality.status,
+        outcomeQualityReasons: quality.reasons,
+        outcomeUsable: quality.usable,
         matchedRules: decision.matchedRules || [],
       };
     })
@@ -23973,6 +24315,7 @@ function buildAllStockAgentRuleStats(reviews = [], outcomeSnapshots = []) {
   }
   for (const review of reviews) {
     if ((review.ageDays || 0) < 1) continue;
+    if (review.outcomeUsable === false || review.outcomeQualityStatus === "suspect_price") continue;
     for (const rule of review.matchedRules || []) {
       const id = rule.id;
       if (!id) continue;
@@ -24294,7 +24637,11 @@ function allStockAgentUsefulTechnical(row = {}) {
   return Boolean(
     row &&
       safeTicker(row.ticker) &&
-      (Number.isFinite(row.sma10) || Number.isFinite(row.sma20) || Number.isFinite(row.latestClose)),
+      (
+        (Number.isFinite(row.sma10) && row.sma10 > 0) ||
+        (Number.isFinite(row.sma20) && row.sma20 > 0) ||
+        (Number.isFinite(row.latestClose) && row.latestClose > 0)
+      ),
   );
 }
 
@@ -24435,6 +24782,8 @@ async function runAllStockAgentForRun(db, sourceRun, trigger = "manual", options
   const universe = allStockAgentTickerPool(source, db, state, skill, securityMaster);
   const prefetch = await enrichAllStockAgentSourceData(source, universe);
   source = prefetch.source;
+  const sourceReadiness = source.dataQuality?.readiness || null;
+  const sourceReadinessBlocked = sourceReadiness?.status === "blocked";
   persistAllStockAgentPrefetchToRun(db, sourceRun, source, prefetch);
   const outcomeUpdate = buildAllStockAgentOutcomeSnapshots(state, source, db, skillBundle.skill);
   const stateWithOutcomes = normalizeAllStockAgentState({
@@ -24524,9 +24873,9 @@ async function runAllStockAgentForRun(db, sourceRun, trigger = "manual", options
     Number(skill.settings?.actionableBuyLimit) || ALL_STOCK_AGENT_ACTIONABLE_BUY_LIMIT,
     buyLimit,
   );
-  const primaryBuyPool = evaluations.filter(
-    (item) => item.buyEligible && !allStockAgentDecisionLogSuppressed(item),
-  );
+  const primaryBuyPool = sourceReadinessBlocked
+    ? []
+    : evaluations.filter((item) => item.buyEligible && !allStockAgentDecisionLogSuppressed(item));
   let actionableCount = 0;
   let buyDecisions = primaryBuyPool
     .slice(0, buyLimit)
@@ -24559,7 +24908,9 @@ async function runAllStockAgentForRun(db, sourceRun, trigger = "manual", options
       return allStockAgentDecisionFromEvaluation(capped, "买入", agentRunId, trigger);
     });
   const trackedBeforeBackfill = allStockAgentTrackedBuyDecisionCount(buyDecisions);
-  const backfillNeeded = Math.max(0, MIN_TRACKED_DECISIONS_PER_RUN - trackedBeforeBackfill);
+  const backfillNeeded = sourceReadinessBlocked
+    ? 0
+    : Math.max(0, MIN_TRACKED_DECISIONS_PER_RUN - trackedBeforeBackfill);
   const starvationBackfillEvaluations = selectStarvationBackfillEvaluations(evaluations, {
     minNeeded: backfillNeeded,
     minDataQuality: numberOrNull(skill.settings?.minDataQuality) ?? 42,
@@ -24650,6 +25001,8 @@ async function runAllStockAgentForRun(db, sourceRun, trigger = "manual", options
       staleSourceGate: buyDecisions.filter((item) =>
         (item.actionability?.gates || []).some((gate) => gate.id === "stale_source_run"),
       ).length,
+      sourceReadinessStatus: sourceReadiness?.status || "unknown",
+      sourceReadinessBlocked,
     },
     roadmap: {
       schemaVersion: "investment-assistant-roadmap-status-v1",
@@ -24724,6 +25077,9 @@ async function runAllStockAgentForRun(db, sourceRun, trigger = "manual", options
     ),
     skillRevision: skillUpdate.revision,
     missingData: [
+      ...(sourceReadinessBlocked
+        ? [`源报告数据质量为 blocked：${sourceReadiness?.summary || "核心数据源未达到可用标准"}；本轮不生成买入决策或样本补位。`]
+        : []),
       ...allStockAgentMissingData(source, universe, evaluations),
       ...prefetch.errors.slice(0, 8).map((item) => `${item.source} ${item.ticker || ""}：${item.error}`.trim()),
       ...securityMasterErrors.map((item) => `${item.source} 暂不可用：${item.error}`),
@@ -24805,8 +25161,102 @@ async function runAllStockAgentForRun(db, sourceRun, trigger = "manual", options
   return agentRun;
 }
 
-function allStockAgentForClient(state = {}) {
+function compactAllStockAgentCardForClient(row = {}) {
+  if (!row || typeof row !== "object") return row;
+  const compact = { ...row };
+  delete compact.factorSnapshot;
+  delete compact.analysisContextPack;
+  delete compact.peerGroup;
+  return compact;
+}
+
+function compactTodayRecommendationCard(row = {}) {
+  return {
+    id: row.id,
+    ticker: row.ticker,
+    name: row.name,
+    action: row.action,
+    status: row.status,
+    generatedAt: row.generatedAt,
+    price: row.price,
+    buyScore: row.buyScore,
+    sellScore: row.sellScore,
+    actionScore: row.actionScore,
+    alphaScore: row.alphaScore,
+    dataQualityScore: row.dataQualityScore,
+    confidence: row.confidence,
+    actionable: row.actionable,
+    thesis: row.thesis,
+    oneLine: row.oneLine,
+    pools: (row.pools || []).slice(0, 4),
+    actionability: row.actionability
+      ? {
+          status: row.actionability.status,
+          eligible: row.actionability.eligible,
+          gates: (row.actionability.gates || []).slice(0, 4),
+        }
+      : null,
+    gates: (row.gates || []).slice(0, 4),
+    strategyVersion: row.strategyVersion,
+  };
+}
+
+function compactAllStockAgentRunForClient(run = {}) {
+  if (!run || typeof run !== "object") return run;
+  const compactOutcome = (item = {}) => ({
+    id: item.id,
+    decisionId: item.decisionId,
+    ticker: item.ticker,
+    action: item.action,
+    horizonDays: item.horizonDays,
+    outcome: item.outcome,
+    excessPct: item.excessPct,
+    performancePct: item.performancePct,
+    rawReturnPct: item.rawReturnPct,
+    outcomeQualityStatus: item.outcomeQualityStatus,
+    outcomeUsable: item.outcomeUsable,
+    evaluatedAt: item.evaluatedAt,
+  });
+  const paperBook = run.paperBook
+    ? {
+        ...run.paperBook,
+        openPositions: (run.paperBook.openPositions || []).slice(0, 30),
+        closedTrades: (run.paperBook.closedTrades || []).slice(0, 30),
+      }
+    : null;
+  return {
+    ...run,
+    evaluations: [],
+    evaluationCount: Array.isArray(run.evaluations) ? run.evaluations.length : run.evaluationCount || 0,
+    buyCandidates: (run.buyCandidates || []).map(compactAllStockAgentCardForClient),
+    watchBuyCandidates: (run.watchBuyCandidates || []).map(compactAllStockAgentCardForClient),
+    sellCandidates: (run.sellCandidates || []).map(compactAllStockAgentCardForClient),
+    holdReviews: (run.holdReviews || []).map(compactAllStockAgentCardForClient),
+    reviews: (run.reviews || []).slice(0, 20),
+    outcomeSnapshots: (run.outcomeSnapshots || []).slice(0, 160).map(compactOutcome),
+    paperBook,
+    persistentMemory: null,
+    shadowPromotionPlan: run.shadowPromotionPlan
+      ? {
+          schemaVersion: run.shadowPromotionPlan.schemaVersion,
+          generatedAt: run.shadowPromotionPlan.generatedAt,
+          candidates: (run.shadowPromotionPlan.candidates || []).slice(0, 12),
+          skipped: (run.shadowPromotionPlan.skipped || []).slice(0, 12),
+        }
+      : null,
+  };
+}
+
+function allStockAgentForClient(state = {}, options = {}) {
   const normalized = normalizeAllStockAgentState(state);
+  if (options.compact) {
+    const latest = compactAllStockAgentRunForClient(normalized.runs[0] || null);
+    return {
+      lastRunAt: normalized.lastRunAt,
+      latest,
+      runs: latest ? [latest] : [],
+    };
+  }
   return {
     ...normalized,
     runs: normalized.runs.slice(0, 12),
@@ -24825,8 +25275,24 @@ function recommendationStoryRows(run = {}, limit = 8) {
     ...rows(run.news).map((item) => ({ ...item, sourceBlock: "news" })),
   ].filter((item) => item && (item.title || item.titleZh || item.summaryZh || item.summary || item.ticker));
   const seen = new Set();
+  const referenceMs = new Date(run.completedAt || Date.now()).getTime();
+  const maxAgeMs = GLOBAL_MARKET_NEWS_MAX_AGE_HOURS * 60 * 60 * 1000;
   return candidates
     .filter((item) => {
+      const publishedMs = newsPublishedTimeValue(item);
+      if (!publishedMs || !Number.isFinite(referenceMs)) return false;
+      const ageMs = referenceMs - publishedMs;
+      if (ageMs > maxAgeMs || ageMs < -6 * 60 * 60 * 1000) return false;
+      const ticker = safeTicker(item.ticker);
+      if (ticker) {
+        if (ticker === "MARKET") {
+          const rawTitle = `${item.title || ""} ${item.titleZh || ""} ${item.article?.title || ""}`;
+          if (!/stock market|market today|wall street|nasdaq|s&p|dow jones|nikkei|kospi|hang seng|fed|fomc|inflation|treasury|yield|股市|大盘|纳斯达克|标普|道琼斯|日经|恒生|美联储|通胀|收益率/i.test(rawTitle)) return false;
+        } else {
+        const fundamental = (run.fundamentals || []).find((row) => safeTicker(row.ticker) === ticker) || {};
+        if (!allStockAgentMaterialBelongsToTicker(item, ticker, fundamental)) return false;
+        }
+      }
       const key = newsDedupeKey(item);
       if (!key || seen.has(key)) return false;
       seen.add(key);
@@ -24944,9 +25410,13 @@ function buildTodayRecommendationsPayload(db = {}) {
   const state = normalizeAllStockAgentState(db.allStockAgent);
   const latestAgent = state.runs[0] || null;
   const run = latestRun(db) || {};
-  const actionable = (latestAgent?.buyCandidates || [])
-    .filter((item) => item.actionable !== false && item.actionability?.status !== "research")
-    .slice(0, 3);
+  const readinessBlocked = run.dataQuality?.readiness?.status === "blocked";
+  const actionable = (readinessBlocked
+    ? []
+    : (latestAgent?.buyCandidates || [])
+        .filter((item) => item.actionable !== false && item.actionability?.status !== "research")
+        .slice(0, 3))
+    .map(compactTodayRecommendationCard);
   const downgradedTracked = (latestAgent?.buyCandidates || [])
     .filter((item) => item.actionable === false || item.actionability?.status === "research");
   const researchSeen = new Set(downgradedTracked.map((item) => safeTicker(item.ticker)).filter(Boolean));
@@ -24961,7 +25431,7 @@ function buildTodayRecommendationsPayload(db = {}) {
     ...downgradedTracked,
     ...appendResearch(latestAgent?.watchBuyCandidates || []),
     ...appendResearch((latestAgent?.evaluations || []).filter((item) => item.buyEligible && !item.actionableEligible)),
-  ].slice(0, 20);
+  ].slice(0, 20).map(compactTodayRecommendationCard);
   return {
     schemaVersion: "recommendations-today-v1",
     generatedAt: nowIso(),
@@ -24987,6 +25457,10 @@ function buildTodayRecommendationsPayload(db = {}) {
       dataQuality: run.dataQuality || null,
       sourceDiagnostics: normalizeSourceDiagnostics(db.sourceDiagnostics),
       missingData: latestAgent?.missingData || [],
+      actionabilityStatus: readinessBlocked ? "blocked" : "usable",
+      actionabilityMessage: readinessBlocked
+        ? run.dataQuality?.readiness?.summary || "核心数据源未达到可用标准，本轮不提供可执行建议。"
+        : "核心数据通过最低可用门槛。",
     },
   };
 }
@@ -38474,9 +38948,27 @@ function newsItemForClient(item) {
   };
 }
 
-function hotNewsForClient(hotNews) {
+function hotNewsForClient(hotNews, run = {}) {
   if (!hotNews?.items) return hotNews;
-  const displayItems = hotNews.items.map((item) => {
+  const referenceMs = new Date(run.completedAt || Date.now()).getTime();
+  const maxAgeMs = GLOBAL_MARKET_NEWS_MAX_AGE_HOURS * 60 * 60 * 1000;
+  const eligibleItems = hotNews.items.filter((item) => {
+    const publishedMs = newsPublishedTimeValue(item);
+    if (!publishedMs || !Number.isFinite(referenceMs)) return false;
+    const ageMs = referenceMs - publishedMs;
+    if (ageMs > maxAgeMs || ageMs < -6 * 60 * 60 * 1000) return false;
+    const ticker = safeTicker(item.ticker);
+    if (!ticker || ticker === "MARKET") {
+      const rawTitle = `${item.title || ""} ${item.titleZh || ""} ${item.article?.title || ""}`;
+      return /stock market|market today|wall street|nasdaq|s&p|dow jones|nikkei|kospi|hang seng|fed|fomc|inflation|treasury|yield|股市|大盘|纳斯达克|标普|道琼斯|日经|恒生|美联储|通胀|收益率/i.test(rawTitle);
+    }
+    const fundamental = (run.fundamentals || []).find((row) => safeTicker(row.ticker) === ticker) || {};
+    const ownership = semanticOwnershipForMaterial(item, ticker, fundamental);
+    const profile = knownEquityProfile(ticker) || fundamental;
+    const isMarketInstrument = /ETF|指数|基金/i.test(`${profile?.industry || ""} ${profile?.mainBusiness || ""}`);
+    return ownership.category === "direct_company" || (isMarketInstrument && ownership.category === "macro_market");
+  });
+  const displayItems = eligibleItems.map((item) => {
     const normalized = newsItemForClient(item);
     const rawText = `${normalized.title || ""} ${normalized.article?.title || ""}`;
     const rawHasHardAiSignal = textHasAnySignal(rawText, [
@@ -38762,7 +39254,7 @@ function runForClient(run, alertState = {}, sourceControls = null) {
     dataQuality: dataQualityForClient(derivedRun.dataQuality, derivedRun.providerStatus, derivedRun.errors || [], controls),
     alerts: sortAlertsForDisplay(alerts),
     options: (derivedRun.options || []).map(optionChainForClient),
-    hotNews: hotNewsForClient(derivedRun.hotNews),
+    hotNews: hotNewsForClient(derivedRun.hotNews, derivedRun),
     eventCalendar: eventCalendarForClient(derivedRun.eventCalendar),
     actionSuggestions: buildActionSuggestions(derivedRun),
     news: (derivedRun.news || []).map(newsItemForClient),
@@ -38774,6 +39266,11 @@ function runSummaryForClient(run, alertState = {}, sourceControls = null) {
   if (!run) return null;
   const alerts = dedupeAlerts(applyAlertState(run.alerts || [], alertState));
   const controls = run.sourceControls || sourceControls;
+  const archiveFile = run.archiveFile || runArchivePath(run.id);
+  const localArchiveAvailable = !run.summaryOnly || Boolean(archiveFile && existsSync(archiveFile));
+  const remoteArchiveAvailable = driveArchiveMetadataIsVerified(run.driveArchive);
+  const archiveAvailable = localArchiveAvailable || remoteArchiveAvailable;
+  const quality = dataQualityForClient(run.dataQuality, run.providerStatus, run.errors || [], controls);
   return {
     id: run.id,
     session: run.session,
@@ -38792,10 +39289,24 @@ function runSummaryForClient(run, alertState = {}, sourceControls = null) {
     alertCount: activeAlerts(alerts).length,
     dismissedAlertCount: alerts.length - activeAlerts(alerts).length,
     errorCount: Number.isFinite(run.errorCount) ? run.errorCount : (run.errors || []).length,
-    dataQuality: dataQualityForClient(run.dataQuality, run.providerStatus, run.errors || [], controls),
+    dataQuality: {
+      readiness: quality?.readiness || null,
+      coreErrorCount: Number(quality?.coreErrorCount || 0),
+    },
     providerStatus: run.providerStatus || null,
     summaryOnly: true,
-    archiveAvailable: Boolean(run.archiveFile || run.summaryOnly),
+    archiveAvailable,
+    archiveLocation: localArchiveAvailable ? "local" : remoteArchiveAvailable ? "google-drive" : "missing",
+    driveArchive: remoteArchiveAvailable
+      ? {
+          status: run.driveArchive.status,
+          provider: run.driveArchive.provider,
+          sizeBytes: run.driveArchive.sizeBytes,
+          uploadedAt: run.driveArchive.uploadedAt,
+          verifiedAt: run.driveArchive.verifiedAt,
+          localDeleted: Boolean(run.driveArchive.localDeleted),
+        }
+      : null,
   };
 }
 
@@ -38847,6 +39358,7 @@ function configForClient(db) {
         saveDebounceMs: SQLITE_MIRROR_SAVE_DEBOUNCE_MS,
         lastResult: sqliteMirrorLastResult,
       },
+      driveArchive: driveArchiveForClient(),
     },
     transport: transportConfigForClient(),
     secFilings: {
@@ -39106,9 +39618,12 @@ function configForClient(db) {
 
 function runStatusForClient() {
   if (!runStatus) return { state: "idle" };
+  const endAt = runStatus.completedAt || runStatus.failedAt || null;
   return {
     ...runStatus,
-    elapsedMs: runStatus.startedAt ? Date.now() - new Date(runStatus.startedAt).getTime() : null,
+    elapsedMs: runStatus.startedAt
+      ? new Date(endAt || Date.now()).getTime() - new Date(runStatus.startedAt).getTime()
+      : null,
   };
 }
 
@@ -39514,6 +40029,18 @@ async function maybeRunWeeklyTraderProfileRefresh() {
 }
 
 async function handleApi(req, res, url) {
+  if (req.method === "GET" && url.pathname === "/api/health") {
+    const db = await ensureStore();
+    const latest = latestRun(db);
+    return sendJson(res, {
+      status: "ok",
+      serverTime: nowIso(),
+      latestRunId: latest?.id || "",
+      latestRunCompletedAt: latest?.completedAt || "",
+      runStatus: runStatusForClient(),
+    });
+  }
+
   if (req.method === "GET" && url.pathname === "/api/state") {
     const db = await ensureStore();
     const recentRuns = runsByRecency(db.runs || []);
@@ -39530,12 +40057,61 @@ async function handleApi(req, res, url) {
       tradeReviews: (db.tradeReviews || []).slice(0, 10),
       emailLog: (db.emailLog || []).slice(0, 20),
       sourceDiagnostics: normalizeSourceDiagnostics(db.sourceDiagnostics),
-      allStockAgent: allStockAgentForClient(db.allStockAgent),
+      allStockAgent: allStockAgentForClient(db.allStockAgent, { compact: true }),
       factorRegistry: normalizeFactorRegistry(db.factorRegistry),
       latest: runForClient(latestRun(db), db.alertState, db.sourceControls),
       runStatus: runStatusForClient(),
       config: configForClient(db),
       serverTime: nowIso(),
+    });
+  }
+
+  if (req.method === "GET" && url.pathname === "/api/drive-archive/status") {
+    const db = await ensureStore();
+    const status = await refreshDriveArchiveStatus(db);
+    return sendJson(res, {
+      driveArchive: {
+        ...driveArchiveForClient(),
+        status,
+      },
+    });
+  }
+
+  if (req.method === "POST" && url.pathname === "/api/drive-archive/run") {
+    const body = await readBody(req);
+    const dryRun = Boolean(body?.dryRun);
+    if (!DRIVE_ARCHIVE_CONFIG.enabled && !dryRun) {
+      return sendJson(
+        res,
+        { error: "Google Drive 冷归档尚未启用；可先运行 dryRun 检查 rclone 配置。" },
+        409,
+      );
+    }
+    const result = await runDriveArchiveMaintenance({
+      dryRun,
+      batchLimit: Number(body?.batchLimit || DRIVE_ARCHIVE_CONFIG.batchLimit),
+    });
+    return sendJson(res, {
+      result: driveArchiveResultForClient(result),
+      driveArchive: driveArchiveForClient(),
+    });
+  }
+
+  if (req.method === "GET" && url.pathname === "/api/runs") {
+    const db = await ensureStore();
+    const offset = Math.max(0, Number(url.searchParams.get("offset") || 0));
+    const limit = Math.max(1, Math.min(100, Number(url.searchParams.get("limit") || 50)));
+    const rows = runsByRecency(db.runs || []);
+    const page = rows.slice(offset, offset + limit);
+    return sendJson(res, {
+      runs: page.map((run) => runSummaryForClient(run, db.alertState, db.sourceControls)),
+      pagination: {
+        offset,
+        limit,
+        total: rows.length,
+        hasMore: offset + page.length < rows.length,
+        nextOffset: offset + page.length,
+      },
     });
   }
 
@@ -40495,8 +41071,33 @@ async function handleApi(req, res, url) {
     if (!id) return sendJson(res, { error: "缺少报告 id。" }, 400);
     const db = await ensureStore();
     const storedRun = db.runs.find((item) => item.id === id);
-    const run = await loadArchivedRun(storedRun);
-    if (!run) return sendJson(res, { error: "没有找到这份历史报告。" }, 404);
+    let run;
+    try {
+      run = await loadArchivedRun(storedRun);
+    } catch (error) {
+      return sendJson(
+        res,
+        {
+          error: `这份历史报告保存在 Google Drive，但当前下载失败：${error.message}`,
+          runId: id,
+          archiveAvailable: true,
+          archiveLocation: "google-drive",
+        },
+        error.statusCode || 503,
+      );
+    }
+    if (!run) {
+      return sendJson(
+        res,
+        {
+          error: "没有找到这份历史报告。",
+          runId: id,
+          archiveAvailable: false,
+          fallbackRunId: latestRun(db)?.id || "",
+        },
+        404,
+      );
+    }
     return sendJson(res, { run: runForClient(run, db.alertState, db.sourceControls) });
   }
 
@@ -42084,6 +42685,24 @@ setInterval(() => {
 }, 24 * 60 * 60 * 1000).unref?.();
 
 const bootDb = await ensureStore();
+const archiveIndexBackfill = await backfillRunArchiveIndex(bootDb);
+if (archiveIndexBackfill.added || archiveIndexBackfill.errors.length) {
+  appendAuditEvent(
+    bootDb,
+    "run_archive.index_backfill",
+    archiveIndexBackfill,
+    archiveIndexBackfill.errors.length ? "warn" : "ok",
+  );
+  await saveStore(bootDb);
+}
+await refreshDriveArchiveStatus(bootDb).catch((error) => {
+  driveArchiveLastStatus = {
+    enabled: DRIVE_ARCHIVE_CONFIG.enabled,
+    status: "unavailable",
+    error: error.message,
+    generatedAt: nowIso(),
+  };
+});
 await setupServerLock(bootDb);
 server.listen(PORT, HOST, () => {
   const url = `http://${HOST === "0.0.0.0" ? "localhost" : HOST}:${PORT}`;
@@ -42094,6 +42713,19 @@ server.listen(PORT, HOST, () => {
     );
   }
 });
+
+if (DRIVE_ARCHIVE_CONFIG.enabled) {
+  setTimeout(() => {
+    runDriveArchiveMaintenance().catch((error) => {
+      console.error("Google Drive archive initial maintenance failed:", error);
+    });
+  }, 15_000).unref?.();
+  setInterval(() => {
+    runDriveArchiveMaintenance().catch((error) => {
+      console.error("Google Drive archive scheduled maintenance failed:", error);
+    });
+  }, DRIVE_ARCHIVE_CONFIG.intervalMs).unref?.();
+}
 
 if (INTRADAY_WATCHER_CONFIG.enabled) {
   runIntradayWatcherAndSave({ config: INTRADAY_WATCHER_CONFIG }).catch((error) => {
