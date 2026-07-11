@@ -1,9 +1,8 @@
 import json
-import os
 import subprocess
 import tempfile
 
-from .base import InvokerError, LlmResult
+from .base import InvokerError, LlmResult, safe_subprocess_env
 from ..config import DEFAULT_AGY_COMMAND, DEFAULT_MODELS, DEFAULT_TIMEOUTS_MS, agy_args_template
 
 
@@ -42,8 +41,7 @@ class AgyCliInvoker:
             item.replace("{prompt}", prompt).replace("{model}", model)
             for item in self.args_template
         ]
-        env = dict(os.environ)
-        env["NO_COLOR"] = "1"
+        env = safe_subprocess_env()
         configured_timeout = self.timeouts_ms.get(tier) or self.timeouts_ms["standard"]
         effective_timeout = min(int(timeout_ms), int(configured_timeout)) if timeout_ms else int(configured_timeout)
         timeout_s = effective_timeout / 1000.0

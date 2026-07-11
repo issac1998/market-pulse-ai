@@ -3,7 +3,7 @@ import os
 import subprocess
 import tempfile
 
-from .base import InvokerError, LlmResult
+from .base import InvokerError, LlmResult, safe_subprocess_env
 from ..config import CODEX_MODELS, CODEX_TIMEOUTS_MS, DEFAULT_CODEX_COMMAND, codex_args_template
 
 
@@ -83,8 +83,7 @@ class CodexCliInvoker:
         output_file = tempfile.NamedTemporaryFile(prefix="market-pulse-codex-", suffix=".txt", delete=False)
         output_path = output_file.name
         output_file.close()
-        env = dict(os.environ)
-        env["NO_COLOR"] = "1"
+        env = safe_subprocess_env()
         try:
             proc = subprocess.run(
                 [self.command] + self._args(prompt, model, output_path),

@@ -20,8 +20,10 @@ import {
 import {
   addNyseTradingDays,
   calculateOptionFifoLots,
+  inferHeadlineSubjectTicker,
   isNyseTradingDay,
   numberOrNull as marketNumberOrNull,
+  nyseSessionCloseAt,
   nyseSessionForYmd,
   scoreFredMacroRegime,
   semanticNewsOwnership,
@@ -114,6 +116,7 @@ import {
   isCliCommandAvailable,
   longBridgeDefaultCommand,
   parseCollectorTimeouts,
+  retryOperation,
   retryableExternalError,
   sleepMs,
   timeboxedTask,
@@ -171,6 +174,7 @@ const ALL_STOCK_AGENT_SKILL_FILE = path.join(
 );
 const PORT = Number(process.env.PORT || 5173);
 const HOST = process.env.HOST || "127.0.0.1";
+const ADMIN_API_TOKEN = String(process.env.ADMIN_API_TOKEN || "").trim();
 const MAX_REQUEST_BODY_BYTES = maxRequestBodyBytes();
 const RUN_HISTORY_LIMIT = Math.max(1, Number(process.env.RUN_HISTORY_LIMIT || 730));
 const RUN_ARCHIVE_ENABLED = parseBoolean(process.env.RUN_ARCHIVE_ENABLED, true);
@@ -380,6 +384,7 @@ const LLM_FULL_REPORT_FALLBACK_TIMEOUT_MS = Number(process.env.LLM_FULL_REPORT_F
 const LLM_FAILURE_COOLDOWN_MS = Number(process.env.LLM_FAILURE_COOLDOWN_MS || 300000);
 const LLM_DIAGNOSTIC_TIMEOUT_MS = Number(process.env.LLM_DIAGNOSTIC_TIMEOUT_MS || 180000);
 const STOCK_NARRATIVE_LLM_TIMEOUT_MS = Number(process.env.STOCK_NARRATIVE_LLM_TIMEOUT_MS || 300000);
+const STOCK_NARRATIVE_BATCH_SIZE = Math.max(1, Number(process.env.STOCK_NARRATIVE_BATCH_SIZE || 6));
 const LLM_PROVIDER = normalizeLlmProvider(process.env.LLM_PROVIDER);
 const SCHEDULE_LLM_PROVIDER = normalizeLlmProvider(process.env.SCHEDULE_LLM_PROVIDER || "local");
 const REPORT_EMAIL_TO = process.env.REPORT_EMAIL_TO || "panzf98@gmail.com";
@@ -481,6 +486,7 @@ const FINNHUB_NEWS_CONCURRENCY = Number(process.env.FINNHUB_NEWS_CONCURRENCY || 
 const HOT_NEWS_ENABLED = parseBoolean(process.env.HOT_NEWS_ENABLED, true);
 const HOT_NEWS_LIMIT = Number(process.env.HOT_NEWS_LIMIT || 50);
 const HOT_NEWS_DISPLAY_LIMIT = Number(process.env.HOT_NEWS_DISPLAY_LIMIT || 10);
+const HOT_NEWS_LLM_TIMEOUT_MS = Number(process.env.HOT_NEWS_LLM_TIMEOUT_MS || 300000);
 const HOT_NEWS_MIN_EFFECTIVE_SCORE = Number(process.env.HOT_NEWS_MIN_EFFECTIVE_SCORE || 64);
 const HOT_NEWS_YAHOO_QUERIES = splitList(
   process.env.HOT_NEWS_YAHOO_QUERIES ||
@@ -666,7 +672,9 @@ const ARTICLE_LLM_FAILURE_COOLDOWN_MS = Number(process.env.ARTICLE_LLM_FAILURE_C
 const ARTICLE_CACHE_TTL_DAYS = Number(process.env.ARTICLE_CACHE_TTL_DAYS || 7);
 const ARTICLE_CACHE_TTL_MS = Math.max(1, ARTICLE_CACHE_TTL_DAYS) * 24 * 60 * 60 * 1000;
 const ARTICLE_CACHE_LIMIT = Number(process.env.ARTICLE_CACHE_LIMIT || 300);
-const ARTICLE_LOCAL_ANALYSIS_VERSION = 5;
+const ARTICLE_LOCAL_ANALYSIS_VERSION = 10;
+const articleExtractionInFlight = new Map();
+const articleLlmSummaryInFlight = new Map();
 const MARKET_OVERVIEW_ENABLED = parseBoolean(process.env.MARKET_OVERVIEW_ENABLED, true);
 const MARKET_OVERVIEW_LLM_ENABLED = parseBoolean(process.env.MARKET_OVERVIEW_LLM_ENABLED, true);
 const MARKET_OVERVIEW_LLM_TIMEOUT_MS = Number(process.env.MARKET_OVERVIEW_LLM_TIMEOUT_MS || 300000);
@@ -1188,6 +1196,10 @@ const ALL_STOCK_AGENT_BACKTEST_DAYS = Math.max(3, Number(process.env.ALL_STOCK_A
 const ALL_STOCK_AGENT_BACKTEST_MAX_DATES = Math.max(3, Number(process.env.ALL_STOCK_AGENT_BACKTEST_MAX_DATES || 20));
 const RECOMMENDER_FACTOR_WEIGHTS = Object.freeze({ ...DEFAULT_RECOMMENDER_FACTOR_WEIGHTS });
 const ALL_STOCK_AGENT_APPLY_LEARNED_WEIGHTS = parseBoolean(process.env.ALL_STOCK_AGENT_APPLY_LEARNED_WEIGHTS, false);
+const ALL_STOCK_AGENT_SKILL_AUTO_WRITE_ENABLED = parseBoolean(
+  process.env.ALL_STOCK_AGENT_SKILL_AUTO_WRITE_ENABLED,
+  false,
+);
 const AGENT_DEBATE_DAILY_ENABLED = parseBoolean(process.env.AGENT_DEBATE_DAILY_ENABLED, false);
 const AGENT_DEBATE_DAILY_NEW_YORK_TIME = process.env.AGENT_DEBATE_DAILY_NEW_YORK_TIME || "18:15";
 const AGENT_DEBATE_DAILY_TOP_N = Math.max(1, Math.min(10, Number(process.env.AGENT_DEBATE_DAILY_TOP_N || 5)));
@@ -1219,6 +1231,7 @@ const AGENT_HARNESS_TIMEOUT_MS = Number(process.env.AGENT_HARNESS_TIMEOUT_MS || 
 const FORCED_BENCHMARK_TICKERS = splitList(process.env.FORCED_BENCHMARK_TICKERS || "SPY,QQQ,VTI,VOO,SMH,IWM,XLK,XLV,XLE,XLF,XLY,XLC,XLI,XLP,XLU");
 
 let runInProgress = null;
+let allStockAgentRunInProgress = null;
 let runStatus = null;
 let saveQueue = Promise.resolve();
 let sqliteMirrorQueue = Promise.resolve();
@@ -1260,6 +1273,39 @@ let repoIntegrityLastCheckedAt = "";
 function isLoopbackHost(host = "") {
   const value = String(host || "").trim().toLowerCase();
   return value === "localhost" || value === "127.0.0.1" || value === "::1";
+}
+
+function requestOriginIsAllowed(req) {
+  const origin = String(req.headers.origin || "").trim();
+  if (!origin) return true;
+  try {
+    const originUrl = new URL(origin);
+    const requestHost = String(req.headers.host || "").trim().toLowerCase();
+    if (originUrl.host.toLowerCase() === requestHost) return true;
+    const requestHostname = new URL(`http://${requestHost}`).hostname;
+    return isLoopbackHost(originUrl.hostname) && isLoopbackHost(requestHostname);
+  } catch {
+    return false;
+  }
+}
+
+function requestHostIsAllowed(req) {
+  const requestHost = String(req.headers.host || "").trim();
+  if (!requestHost) return false;
+  try {
+    const hostname = new URL(`http://${requestHost}`).hostname;
+    return isLoopbackHost(HOST) ? isLoopbackHost(hostname) : hostname === HOST;
+  } catch {
+    return false;
+  }
+}
+
+function requestAdminTokenIsValid(req) {
+  if (!ADMIN_API_TOKEN) return false;
+  const authorization = String(req.headers.authorization || "");
+  const candidate = authorization.startsWith("Bearer ") ? authorization.slice(7).trim() : "";
+  if (!candidate || candidate.length !== ADMIN_API_TOKEN.length) return false;
+  return crypto.timingSafeEqual(Buffer.from(candidate), Buffer.from(ADMIN_API_TOKEN));
 }
 
 function transportConfigForClient() {
@@ -3103,6 +3149,22 @@ function isUnusableArticleUrl(value) {
 const SITE_SHELL_TITLE_RE =
   /^(?:yahoo(?:\s*\|\s*mail|\s*finance)?|google news|sign in|consent|are you a robot|access denied|just a moment|enable javascript|privacy dashboard)\b/i;
 
+function articleOriginalPublisherUrl(article = {}) {
+  const text = String(article.text || "");
+  const matches = [
+    text.match(/\[(?:view original|查看原文|阅读原文|原文)\]\((https?:\/\/[^)\s]+)\)/i),
+    text.match(/(?:source|来源)\s*:\s*\[[^\]]+\]\((https?:\/\/[^)\s]+)\)/i),
+  ];
+  for (const match of matches) {
+    const candidate = decodeHtmlEntities(match?.[1] || "");
+    if (!isHttpUrl(candidate) || isUnusableArticleUrl(candidate)) continue;
+    const sourceHost = articleUrlParts(article.finalUrl || article.resolvedUrl || article.url)?.host || "";
+    const targetHost = articleUrlParts(candidate)?.host || "";
+    if (targetHost && targetHost !== sourceHost) return candidate;
+  }
+  return "";
+}
+
 function articleLooksLikeSiteShell(article = {}) {
   const urls = [article.finalUrl, article.resolvedUrl, article.url].filter(Boolean);
   const hasUsableUrl = urls.some((url) => Boolean(normalizeArticleUrlForCache(url)));
@@ -3111,6 +3173,12 @@ function articleLooksLikeSiteShell(article = {}) {
   const title = normalizeDisplayText(article.title || "");
   if (title && SITE_SHELL_TITLE_RE.test(title)) return true;
   const text = normalizeDisplayText(article.text || article.rawText || article.error || "");
+  if (
+    text.length < 1200 &&
+    /page maybe not yet fully loaded|shadow dom|continue reading|more for you|blob:http:\/\/localhost/i.test(text)
+  ) {
+    return true;
+  }
   if (
     text.length < 2200 &&
     /\byahoo\b/i.test(`${title} ${text}`) &&
@@ -3166,7 +3234,10 @@ function articleCacheKeys(item = {}, article = null) {
 
 function articleCacheEntryFresh(entry) {
   if (!entry?.article || entry.article.status !== "ok") return false;
+  if (Number(entry.article.analysisVersion || 0) !== ARTICLE_LOCAL_ANALYSIS_VERSION) return false;
+  if (articleOriginalPublisherUrl(entry.article)) return false;
   if (articleLooksLikeSiteShell(entry.article)) return false;
+  if (articleTextLooksBlocked(entry.article)) return false;
   const cachedAt = new Date(entry.cachedAt || 0).getTime();
   return Number.isFinite(cachedAt) && Date.now() - cachedAt <= ARTICLE_CACHE_TTL_MS;
 }
@@ -4406,6 +4477,7 @@ function removeServerLockSync() {
 function installServerLockCleanup() {
   for (const signal of ["SIGINT", "SIGTERM"]) {
     process.once(signal, () => {
+      terminateActiveCliChildren();
       removeServerLockSync();
       process.exit(signal === "SIGINT" ? 130 : 143);
     });
@@ -7406,7 +7478,7 @@ function getProviderDetails(customFeeds = []) {
       ? `新闻正文抽取已启用；单轮预算 ${ARTICLE_EXTRACT_RUN_BUDGET_MS}ms，单篇上限 ${ARTICLE_EXTRACT_ITEM_TIMEOUT_MS}ms，网络/超时类失败会最多重试 ${Math.max(0, EXTERNAL_RETRY_ATTEMPTS - 1)} 次；Reader fallback ${ARTICLE_READER_FALLBACK_ENABLED ? `已启用（${ARTICLE_READER_BASE_URL}）` : "未启用"}；付费墙/反爬会记录到数据质量。`
       : "ARTICLE_EXTRACT_ENABLED=false。",
     articleLlmSummary: ARTICLE_LLM_SUMMARY_ENABLED
-      ? `原文抽取成功后会对最多 ${ARTICLE_LLM_SUMMARY_LIMIT} 篇材料性新闻做 LLM 中文正文摘要；单篇 ${ARTICLE_LLM_SUMMARY_TIMEOUT_MS}ms，总预算 ${ARTICLE_LLM_SUMMARY_RUN_BUDGET_MS}ms；网络/超时类失败会最多重试 ${Math.max(0, EXTERNAL_RETRY_ATTEMPTS - 1)} 次，连续失败 ${ARTICLE_LLM_FAILURE_LIMIT} 次后熔断 ${ARTICLE_LLM_FAILURE_COOLDOWN_MS}ms 并保留本地摘要；provider ${activeLlmProvider(articleLlmSummaryProvider(LLM_PROVIDER)) || "不可用"}。`
+      ? `原文抽取成功后会对最多 ${ARTICLE_LLM_SUMMARY_LIMIT} 篇材料性新闻做 LLM 中文正文摘要；单篇 ${ARTICLE_LLM_SUMMARY_TIMEOUT_MS}ms，总预算 ${ARTICLE_LLM_SUMMARY_RUN_BUDGET_MS}ms；网络/超时类失败会最多重试 ${Math.max(0, EXTERNAL_RETRY_ATTEMPTS - 1)} 次，连续失败 ${ARTICLE_LLM_FAILURE_LIMIT} 次后熔断 ${ARTICLE_LLM_FAILURE_COOLDOWN_MS}ms；失败不会保留本地摘要；provider ${activeLlmProvider(articleLlmSummaryProvider(LLM_PROVIDER)) || "不可用"}。`
       : "ARTICLE_LLM_SUMMARY_ENABLED=false。",
     marketOverview: MARKET_OVERVIEW_ENABLED ? "大盘代理已启用：QQQ/SPY/VIXY/TLT/UUP/GLD 等。" : "MARKET_OVERVIEW_ENABLED=false。",
     optionsChain: OPTIONS_ENABLED ? `期权链已启用，provider 顺序：${OPTIONS_PROVIDER_ORDER.join(" -> ")}。Longbridge 不参与期权链，避免 no quote access 噪音。` : "OPTIONS_ENABLED=false。",
@@ -7436,7 +7508,6 @@ function diagnosticStatusZh(status) {
 
 function readinessStatusLabel(status) {
   if (status === "ok") return "已接入";
-  if (status === "fallback") return "可兜底";
   if (status === "manual") return "需人工动作";
   return "需关注";
 }
@@ -7455,11 +7526,11 @@ function buildIntegrationReadiness(db, providers = getProviderStatus()) {
     {
       key: "ibkr-socket",
       title: "IBKR Socket 行情/期权",
-      status: ibkrFullyReady ? "ok" : ibkrPartlyReady ? "fallback" : "manual",
+      status: ibkrFullyReady ? "ok" : ibkrPartlyReady ? "warn" : "manual",
       label: ibkrFullyReady ? "已接入" : ibkrPartlyReady ? "部分接入" : "需人工登录",
       configured: Boolean(providers.ibkrGateway && providers.ibkrMarketData),
       evidence: diagnosticEvidence(map, ["ibkr-gateway", "ibkr-marketdata", "ibkr-options"]) || "IBKR Socket 尚未确认连通。",
-      fallback: "Nasdaq 期权链、Nasdaq/Yahoo/Finnhub K线、Finnhub/OpenBB 行情会继续兜底。",
+      fallback: "其他 provider 会作为独立来源显示，但不会冒充 IBKR 成功或覆盖 IBKR 错误。",
       nextAction: rowAction(["ibkr-gateway", "ibkr-marketdata", "ibkr-options"]) || "在 IB Gateway/TWS 完成登录和二次验证后，点击“等待登录并验证”。",
       verifyKeys: ["ibkr-gateway", "ibkr-marketdata", "ibkr-options"],
       needsUserAction: !ibkrFullyReady,
@@ -7468,11 +7539,11 @@ function buildIntegrationReadiness(db, providers = getProviderStatus()) {
     {
       key: "youtube",
       title: "YouTube 视频信号",
-      status: providers.youtubeApi ? "ok" : providers.youtubeFeeds || providers.youtubeYtDlp ? "fallback" : "manual",
-      label: providers.youtubeApi ? "官方 API 已接入" : providers.youtubeFeeds || providers.youtubeYtDlp ? "无 key 兜底可用" : "需配置",
+      status: providers.youtubeApi ? "ok" : "manual",
+      label: providers.youtubeApi ? "官方 API 已接入" : "官方 API 未配置",
       configured: Boolean(providers.youtubeApi || providers.youtubeFeeds || providers.youtubeYtDlp),
       evidence: diagnosticEvidence(map, ["youtube-api", "youtube-rss", "youtube-ytdlp"]) || "YouTube 状态尚未复检。",
-      fallback: providers.youtubeFeeds || providers.youtubeYtDlp ? "频道 RSS 和 yt-dlp 搜索会继续提供视频元数据线索。" : "暂无 YouTube 兜底。",
+      fallback: providers.youtubeFeeds || providers.youtubeYtDlp ? "频道 RSS 和 yt-dlp 是独立来源，会单独标注来源与错误。" : "暂无其他 YouTube 来源。",
       nextAction: providers.youtubeApi
         ? "无需处理。"
         : rowAction(["youtube-api", "youtube-rss", "youtube-ytdlp"]) || "如需官方搜索和配额，在 Google Cloud 创建 YouTube Data API key 并写入 YOUTUBE_API_KEY。",
@@ -7483,11 +7554,11 @@ function buildIntegrationReadiness(db, providers = getProviderStatus()) {
     {
       key: "x-search",
       title: "X 官方搜索",
-      status: providers.xSearch ? "ok" : providers.apeWisdomSocial || providers.stocktwitsSocial ? "fallback" : "manual",
-      label: providers.xSearch ? "官方搜索已接入" : "无 key 社交兜底可用",
+      status: providers.xSearch ? "ok" : "manual",
+      label: providers.xSearch ? "官方搜索已接入" : "X 官方搜索未配置",
       configured: Boolean(providers.xSearch),
       evidence: diagnosticEvidence(map, ["x-search", "stocktwits-social"]) || "X Bearer Token 尚未配置。",
-      fallback: "ApeWisdom、Stocktwits Trending、Reddit RSS 和新闻回补会继续发现热股。",
+      fallback: "ApeWisdom、Stocktwits 和 Reddit 是独立社交来源，不会被标成 X 搜索结果。",
       nextAction: providers.xSearch
         ? "无需处理。"
         : rowAction(["x-search"]) || "在 X Developer Portal 创建 app-only Bearer Token 并写入 X_BEARER_TOKEN。",
@@ -7498,13 +7569,13 @@ function buildIntegrationReadiness(db, providers = getProviderStatus()) {
     {
       key: "enhanced-news",
       title: "增强新闻 API",
-      status: providers.newsapiHotNews || providers.polygonHotNews || providers.alphaVantage ? "ok" : providers.hotNewsRss || providers.googleTickerNewsRss ? "fallback" : "manual",
-      label: providers.newsapiHotNews || providers.polygonHotNews || providers.alphaVantage ? "部分 API 已接入" : "无 key 新闻兜底可用",
+      status: providers.newsapiHotNews || providers.polygonHotNews || providers.alphaVantage ? "ok" : "manual",
+      label: providers.newsapiHotNews || providers.polygonHotNews || providers.alphaVantage ? "部分 API 已接入" : "增强新闻 API 未配置",
       configured: Boolean(providers.newsapiHotNews || providers.polygonHotNews || providers.alphaVantage),
       evidence:
         diagnosticEvidence(map, ["newsapi-hot-news", "polygon-hot-news", "alpha-vantage-news", "hot-news-rss", "google-ticker-news-rss"]) ||
         "增强新闻 API key 尚未配置。",
-      fallback: "Finnhub、OpenBB、SEC、热门 RSS、Google ticker RSS 和网页正文抽取会继续兜底。",
+      fallback: "Finnhub、OpenBB、SEC、RSS 和网页正文是独立新闻来源，均保留自己的 provider 与质量状态。",
       nextAction:
         providers.newsapiHotNews || providers.polygonHotNews || providers.alphaVantage
           ? "可按需继续补齐剩余新闻 API。"
@@ -7519,7 +7590,7 @@ function buildIntegrationReadiness(db, providers = getProviderStatus()) {
       acc[item.status] = (acc[item.status] || 0) + 1;
       return acc;
     },
-    { ok: 0, fallback: 0, manual: 0, warn: 0 },
+    { ok: 0, manual: 0, warn: 0 },
   );
   return {
     generatedAt: nowIso(),
@@ -7530,7 +7601,7 @@ function buildIntegrationReadiness(db, providers = getProviderStatus()) {
       ...item,
       statusLabel: readinessStatusLabel(item.status),
     })),
-    summary: `外部接入：${counts.ok || 0} 项已接入，${counts.fallback || 0} 项有可用兜底，${counts.manual || 0} 项需要登录或 key。`,
+    summary: `外部接入：${counts.ok || 0} 项已完整接入，${counts.warn || 0} 项部分可用，${counts.manual || 0} 项仍需要登录或 key。`,
   };
 }
 
@@ -8550,24 +8621,30 @@ async function runSourceDiagnostics(options = {}) {
 async function timedCollector(source, collectFn, options = {}) {
   const startedAt = Date.now();
   const timeoutMs = Number(options.timeoutMs ?? collectorTimeoutForSource(source));
-  const timeoutLabel = Math.max(1, Math.round(timeoutMs / 1000));
   markRunStage(`collector:${source}`, `正在采集：${source}`);
   try {
-    const task = Promise.resolve().then(collectFn);
-    task.catch(() => {});
-    const result =
-      Number.isFinite(timeoutMs) && timeoutMs > 0
-        ? await Promise.race([
-            task,
-            new Promise((_, reject) => {
-              setTimeout(() => {
-                const error = new Error(`${source} 超过 ${timeoutLabel} 秒未完成，已跳过本轮。`);
-                error.collectorTimeout = true;
-                reject(error);
-              }, timeoutMs);
-            }),
-          ])
-        : await task;
+    const result = await retryOperation(
+      source,
+      async ({ attempt, maxAttempts, signal }) => {
+        const value = await collectFn(signal, attempt);
+        const itemCount = resultItemCount(value);
+        if (!itemCount && value?.errors?.length) {
+          const error = new Error(value.errors.map((item) => item.error || item.message).filter(Boolean).join("；") || `${source} 未返回可用数据。`);
+          error.collectorResult = value;
+          throw error;
+        }
+        return {
+          ...value,
+          retry: { attemptsUsed: attempt, maxAttempts },
+        };
+      },
+      {
+        attempts: 3,
+        attemptTimeoutMs: Number.isFinite(timeoutMs) && timeoutMs > 0 ? timeoutMs : 0,
+        baseDelayMs: Number(process.env.EXTERNAL_RETRY_DELAY_MS || 800),
+        shouldRetry: options.shouldRetry || ((error) => !error?.noCollectorRetry),
+      },
+    );
     const durationMs = Date.now() - startedAt;
     return {
       ...result,
@@ -8580,15 +8657,25 @@ async function timedCollector(source, collectFn, options = {}) {
       },
     };
   } catch (error) {
-    const timedOut = Boolean(error.collectorTimeout);
+    const timedOut = error?.errors?.some?.((item) => item?.code === "ERR_OPERATION_TIMEOUT") || error?.code === "ERR_OPERATION_TIMEOUT";
     return {
-      errors: [{ source, error: error.message }],
+      errors: [{
+        source,
+        error: error.message,
+        attempts: Number(error.attempts || 1),
+        attemptErrors: (error.attemptErrors || []).map((item) => ({
+          attempt: item.attempt,
+          error: item.error?.message || String(item.error || ""),
+          durationMs: item.durationMs,
+        })),
+      }],
       quality: {
         source,
         status: timedOut ? "timeout" : "failed",
         durationMs: Date.now() - startedAt,
         items: 0,
         errors: 1,
+        attempts: Number(error.attempts || 1),
       },
     };
   }
@@ -8740,10 +8827,13 @@ function buildReportReadiness(rows, errorBySource, providers, sourceControls = n
   }
   if (errorBySource["Article LLM Summary"]) {
     score -= 2;
-    limitations.push("部分新闻原文 LLM 摘要超时，已使用本地正文摘要");
+    limitations.push("部分新闻原文 LLM 摘要失败；失败条目不会进入重要新闻结论");
   }
   if (!providers.openai && !providers.gemini && !providers.geminiCli && !providers.antigravityCli && !providers.codexCli) {
-    limitations.push("外部 LLM 未配置，当前使用本地规则");
+    blocked = true;
+    score -= 25;
+    limitations.push("外部 LLM 未配置，无法生成 AI 报告");
+    actions.push("配置并诊断 Codex CLI；新闻正文摘要还需要可用的 Antigravity CLI Gemini Pro。");
   }
 
   score = Math.max(0, Math.min(100, Math.round(score)));
@@ -8759,10 +8849,10 @@ function buildReportReadiness(rows, errorBySource, providers, sourceControls = n
   const summary =
     status === "usable"
       ? uniqueLimitations.length
-        ? "核心新闻、行情、技术面和大盘数据可用；部分增强源降级，不阻塞报告。"
+        ? "核心新闻、行情、技术面和大盘数据可用；部分增强源失败已明确记录，不阻塞报告。"
         : "核心新闻、行情、技术面、大盘数据和增强源均可用；报告可直接阅读。"
       : status === "degraded"
-        ? "核心报告可用，但部分增强源降级，需要按需补齐。"
+        ? "核心报告可用，但部分增强源失败已明确记录，需要按需补齐。"
         : status === "limited"
           ? "报告可读但证据覆盖偏弱，使用前需要优先核验核心数据。"
           : "核心数据缺失，当前报告不能作为有效投研输入。";
@@ -11613,23 +11703,9 @@ async function collectGlobalMarketNews(timeoutMs = AKSHARE_TIMEOUT_MS) {
 
 async function summarizeGlobalMarketNews(items = [], llmProvider = LLM_PROVIDER) {
   const normalizedProvider = normalizeLlmProvider(llmProvider);
-  const fallback = {
-    headline: items.length ? `筛选到 ${items.length} 条与美股、全球市场或日韩股市相关的全球市场新闻。` : "本小时未筛选到相关全球市场新闻。",
-    takeaway: items.length
-      ? `本小时筛选到 ${items.length} 条全球市场相关新闻，需优先核对美股、全球宏观、日韩股市相关条目的原文和行情反馈。`
-      : "本小时未筛选到相关全球市场新闻。",
-    bullets: items.slice(0, 10).map((item) => `${item.tags.join("/") || "财经"}：${item.title}`),
-    risks: ["全球新闻来自 GDELT、财经 RSS、Longbridge 或第三方新闻 API，仍需结合原文发布时间和实时行情核验。"],
-    summarySource: "rules",
-  };
-  if (!items.length) return { ...fallback, llmStatus: "empty", llmProvider: normalizedProvider || null };
+  if (!items.length) throw new Error("全球市场新闻采集没有返回可总结的近期材料，邮件不会发送。");
   if (!activeLlmProvider(normalizedProvider)) {
-    return {
-      ...fallback,
-      llmStatus: "unavailable",
-      llmProvider: normalizedProvider || null,
-      error: "未配置可用 LLM provider，邮件使用规则摘要兜底。",
-    };
+    throw new Error(missingLlmMessage(normalizedProvider) || `全球市场新闻总结要求 ${normalizedProvider}，当前不可用。`);
   }
   const system = "你是谨慎的全球市场新闻编辑。只基于给定新闻标题和摘要做中文筛选总结，优先美股、全球宏观、日韩股市；过滤纯A股/港股内盘消息，不编造数字，不给直接买卖指令。必须输出 JSON。";
   const user = `请从这些最近 ${GLOBAL_MARKET_NEWS_MAX_AGE_HOURS} 小时内的全球市场新闻里筛选与美股、全球市场、日韩股市相关的信息，输出 JSON：
@@ -11646,33 +11722,39 @@ async function summarizeGlobalMarketNews(items = [], llmProvider = LLM_PROVIDER)
     tags: item.tags,
     publishedAt: item.publishedAt,
   })))}`;
-  try {
-    const result = await callConfiguredLlm(system, user, llmProvider, {
-      task: "fallback-summary",
-      timeoutMs: GLOBAL_MARKET_NEWS_LLM_TIMEOUT_MS,
-      bypassCooldown: true,
-      suppressFailureCooldown: true,
-    });
-    const parsed = extractJsonObject(result.text);
-    const bullets = normalizeArticleLlmArray(parsed?.bullets, 10);
-    const risks = normalizeArticleLlmArray(parsed?.risks, 3);
-    return {
-      headline: normalizeDisplayText(parsed?.headline) || fallback.headline,
-      takeaway: normalizeDisplayText(parsed?.takeaway) || fallback.takeaway,
-      bullets: bullets.length ? bullets : fallback.bullets,
-      risks: risks.length ? risks : fallback.risks,
-      summarySource: "llm",
-      llmStatus: "ok",
-      llmProvider: result.provider,
-    };
-  } catch (error) {
-    return {
-      ...fallback,
-      llmStatus: "failed",
-      llmProvider: normalizedProvider || null,
-      error: error.message,
-    };
-  }
+  return retryOperation(
+    "全球市场新闻 LLM 总结",
+    async () => {
+      const result = await callConfiguredLlm(system, user, normalizedProvider, {
+        task: "global-market-news-summary",
+        timeoutMs: GLOBAL_MARKET_NEWS_LLM_TIMEOUT_MS,
+        retryAttempts: 1,
+        bypassCooldown: true,
+        suppressFailureCooldown: true,
+      });
+      const parsed = extractJsonObject(result.text);
+      const headline = normalizeDisplayText(parsed?.headline);
+      const takeaway = normalizeDisplayText(parsed?.takeaway);
+      const bullets = normalizeArticleLlmArray(parsed?.bullets, 10);
+      if (!headline || !takeaway || !bullets.length) {
+        throw new Error("全球市场新闻 LLM 返回的 JSON 缺少 headline、takeaway 或 bullets。");
+      }
+      return {
+        headline,
+        takeaway,
+        bullets,
+        risks: normalizeArticleLlmArray(parsed?.risks, 3),
+        summarySource: "llm",
+        llmStatus: "ok",
+        llmProvider: result.provider,
+      };
+    },
+    {
+      attempts: 3,
+      attemptTimeoutMs: GLOBAL_MARKET_NEWS_LLM_TIMEOUT_MS,
+      baseDelayMs: Number(process.env.EXTERNAL_RETRY_DELAY_MS || 800),
+    },
+  );
 }
 
 function buildGlobalMarketNewsEmail(items = [], summary = {}) {
@@ -11683,7 +11765,7 @@ function buildGlobalMarketNewsEmail(items = [], summary = {}) {
     "",
     "LLM总结：",
     summary.takeaway || summary.headline || "",
-    summary.llmStatus ? `摘要状态：${summary.llmStatus === "ok" ? `LLM(${summary.llmProvider || "unknown"})` : `规则兜底(${summary.llmStatus}${summary.error ? `：${summary.error}` : ""})`}` : "",
+    summary.llmStatus ? `摘要状态：LLM(${summary.llmProvider || "unknown"})` : "",
     "",
     ...(summary.bullets || []).map((line, index) => `${index + 1}. ${line}`),
     "",
@@ -11699,9 +11781,7 @@ function buildGlobalMarketNewsEmail(items = [], summary = {}) {
     ${
       summary.llmStatus
         ? `<p style="color:#667;font-size:12px">摘要状态：${escapeHtmlText(
-            summary.llmStatus === "ok"
-              ? `LLM(${summary.llmProvider || "unknown"})`
-              : `规则兜底(${summary.llmStatus}${summary.error ? `：${summary.error}` : ""})`,
+            `LLM(${summary.llmProvider || "unknown"})`,
           )}</p>`
         : ""
     }
@@ -11760,10 +11840,34 @@ async function maybeRunAkshareGlobalNews() {
   const key = due.key;
   if ((db.akshareGlobalNewsLog || []).some((item) => item.key === key)) return;
   const collected = await collectGlobalMarketNews();
-  const summary = await summarizeGlobalMarketNews(
-    collected.items || [],
-    GLOBAL_MARKET_NEWS_LLM_PROVIDER || SCHEDULE_LLM_PROVIDER || LLM_PROVIDER,
-  );
+  let summary;
+  try {
+    summary = await summarizeGlobalMarketNews(
+      collected.items || [],
+      GLOBAL_MARKET_NEWS_LLM_PROVIDER || SCHEDULE_LLM_PROVIDER || LLM_PROVIDER,
+    );
+  } catch (error) {
+    const failedLog = {
+      key,
+      id: `${key}:${Date.now()}`,
+      createdAt: nowIso(),
+      source: "Global Market News",
+      itemCount: collected.items?.length || 0,
+      status: "failed",
+      reason: error.message,
+      attemptErrors: (error.attemptErrors || []).map((item) => ({
+        attempt: item.attempt,
+        durationMs: item.durationMs,
+        error: item.error?.message || String(item.error || ""),
+      })),
+      meta: { ...(collected.meta || {}), schedule: due },
+      errors: [...(collected.errors || []), { source: "Global Market News LLM", error: error.message }],
+    };
+    db.akshareGlobalNewsLog = [failedLog, ...(db.akshareGlobalNewsLog || [])].slice(0, 48);
+    appendAuditEvent(db, "global_market_news.failed", { key, reason: error.message }, "fail");
+    await saveStore(db);
+    return;
+  }
   const config = reportEmailConfig();
   const log = {
     key,
@@ -12837,6 +12941,7 @@ function articleExtractionCandidate(item) {
   if (!ARTICLE_EXTRACT_ENABLED) return false;
   if (item?.type !== "news") return false;
   if (!isHttpUrl(item.url)) return false;
+  if (isUnusableArticleUrl(item.url)) return false;
   if (isArticleProxyUrl(item.url) && !ARTICLE_SOURCE_RESOLVE_ENABLED) return false;
   return true;
 }
@@ -13165,12 +13270,12 @@ function articleEvidenceLinesKeywords(keywords, lower) {
 }
 
 function articleNoiseSentence(sentence) {
-  return /skip to navigation|skip to main content|skip to right column|never miss an important update|watchlist|portfolio and cut through the noise|advertisement|subscribe|newsletter|cookie|sign in|create account|warning:\s*target url returned error|requiring captcha|reference id|access denied|forbidden/i.test(sentence);
+  return /skip to navigation|skip to main content|skip to right column|never miss an important update|watchlist|portfolio and cut through the noise|advertisement|subscribe|newsletter|cookie|sign in|create account|continue reading|more for you|page maybe not yet fully loaded|shadow dom|blob:http:\/\/localhost|warning:\s*target url returned error|requiring captcha|reference id|access denied|forbidden/i.test(sentence);
 }
 
 function articleTextLooksBlocked(article = {}) {
   const text = normalizeDisplayText(article.text || article.error || "");
-  if (!/warning:\s*target url returned error|captcha|access denied|forbidden|unavailable for legal reasons/i.test(text)) return false;
+  if (!/warning:\s*target url returned error|page maybe not yet fully loaded|shadow dom|continue reading|more for you|blob:http:\/\/localhost|captcha|access denied|forbidden|unavailable for legal reasons/i.test(text)) return false;
   const useful = splitArticleSentences(text).filter((sentence) => !articleNoiseSentence(sentence));
   return useful.length < 2;
 }
@@ -13702,40 +13807,36 @@ function recordArticleLlmSuccess(provider) {
 }
 
 function articleLlmPromptPayload(item, article) {
-  const localCatalyst = item.catalyst || summarizeArticleCatalyst(item, article);
   return {
-    ticker: safeTicker(item?.ticker),
     source: item.publisher || item.source || article.siteName || "",
     title: item.title || "",
     articleTitle: article.title || "",
     publishedAt: item.publishedAt || article.publishedAt || "",
     finalUrl: article.finalUrl || article.resolvedUrl || item.url || "",
-    localFallback: {
-      summaryZh: localCatalyst.summaryZh || localCatalyst.summary || "",
-      themes: localCatalyst.themes || [],
-      direction: localCatalyst.direction || "neutral",
-      evidenceLines: localCatalyst.evidenceLines || [],
-      investmentMemo: localCatalyst.investmentMemo || null,
-    },
     text: normalizeDisplayText(article.text || "").slice(0, ARTICLE_LLM_TEXT_LIMIT),
   };
+}
+
+function articleWorkKey(provider, item, article) {
+  const identity = [
+    article?.finalUrl || article?.resolvedUrl || item?.url || "",
+    article?.title || item?.title || "",
+    normalizeDisplayText(article?.text || ""),
+  ].join("\n");
+  return `${provider}:${ARTICLE_LOCAL_ANALYSIS_VERSION}:${crypto.createHash("sha256").update(identity).digest("hex")}`;
 }
 
 async function summarizeArticleWithLlm(item, llmProvider, timeoutMs = ARTICLE_LLM_SUMMARY_TIMEOUT_MS) {
   if (!ARTICLE_LLM_SUMMARY_ENABLED || !item?.article || item.article.status !== "ok") return item;
   const provider = articleLlmSummaryProvider(llmProvider);
   const activeProvider = activeLlmProvider(provider);
-  if (!activeProvider) return item;
+  if (!activeProvider) {
+    throw new Error(missingLlmMessage(provider) || `新闻正文摘要要求 ${provider}，系统不会保留本地摘要降级。`);
+  }
   const cooldown = articleLlmCooldown(activeProvider);
   if (cooldown) {
     const seconds = Math.max(1, Math.ceil((cooldown.cooldownUntil - Date.now()) / 1000));
-    return {
-      ...item,
-      article: {
-        ...item.article,
-        llmSkippedReason: `文章 LLM 摘要已临时熔断，约 ${seconds} 秒后重试；已保留本地正文摘要。最近错误：${cooldown.lastError || "连续超时"}`,
-      },
-    };
+    throw new Error(`新闻正文摘要仍在熔断窗口，约 ${seconds} 秒后可重试；不会使用本地摘要降级。最近错误：${cooldown.lastError || "连续超时"}`);
   }
   const system =
     "你是谨慎的美股新闻原文分析助手。只基于用户给出的新闻正文做中文摘要，不新增正文没有的数字或事实，不给直接买卖指令。必须输出严格 JSON 对象。";
@@ -13761,50 +13862,83 @@ const user = `请阅读下面这篇美股新闻原文，输出 JSON 对象，不
 }
 
 新闻材料：${JSON.stringify(payload)}`;
-  let result;
-  try {
-    result = await callConfiguredLlm(system, user, provider, {
-      task: "article-summary",
-      timeoutMs,
-      bypassCooldown: true,
-      suppressFailureCooldown: true,
-    });
-    recordArticleLlmSuccess(activeProvider);
-  } catch (error) {
-    recordArticleLlmFailure(activeProvider, error);
-    throw error;
+  const workKey = articleWorkKey(activeProvider, item, item.article);
+  let summaryTask = articleLlmSummaryInFlight.get(workKey);
+  const ownsSummaryTask = !summaryTask;
+  if (!summaryTask) {
+    summaryTask = retryOperation(
+      `新闻正文 LLM 摘要 ${item.article.finalUrl || item.article.resolvedUrl || item.url || item.title || ""}`,
+      async () => {
+        const result = await callConfiguredLlm(system, user, provider, {
+          task: "article-summary",
+          timeoutMs,
+          retryAttempts: 1,
+          bypassCooldown: true,
+          suppressFailureCooldown: true,
+        });
+        const parsed = extractJsonObject(result.text);
+        if (!parsed?.summaryZh) throw new Error("LLM article summary returned invalid JSON");
+        if (!parsed.investmentMemo || typeof parsed.investmentMemo !== "object") {
+          throw new Error("LLM article summary missing investmentMemo");
+        }
+        if (!["positive", "negative", "mixed", "neutral"].includes(String(parsed.direction))) {
+          throw new Error("LLM article summary returned invalid direction");
+        }
+        if (!Number.isFinite(numberOrNull(parsed.materiality))) {
+          throw new Error("LLM article summary returned invalid materiality");
+        }
+        const memo = parsed.investmentMemo;
+        if (
+          !normalizeDisplayText(memo.stance) ||
+          !normalizeDisplayText(memo.confidence) ||
+          !normalizeDisplayText(parsed.investmentView || memo.view) ||
+          !normalizeDisplayText(memo.suggestedAction || parsed.investmentAdvice)
+        ) {
+          throw new Error("LLM article summary returned incomplete investmentMemo");
+        }
+        return { result, parsed };
+      },
+      {
+        attempts: 3,
+        attemptTimeoutMs: timeoutMs,
+        baseDelayMs: Number(process.env.EXTERNAL_RETRY_DELAY_MS || 800),
+      },
+    );
+    articleLlmSummaryInFlight.set(workKey, summaryTask);
   }
-  const parsed = extractJsonObject(result.text);
-  if (!parsed?.summaryZh) throw new Error("LLM article summary returned invalid JSON");
+  let result;
+  let parsed;
+  try {
+    ({ result, parsed } = await summaryTask);
+    if (ownsSummaryTask) recordArticleLlmSuccess(activeProvider);
+  } catch (error) {
+    if (ownsSummaryTask) recordArticleLlmFailure(activeProvider, error);
+    throw error;
+  } finally {
+    if (ownsSummaryTask && articleLlmSummaryInFlight.get(workKey) === summaryTask) {
+      articleLlmSummaryInFlight.delete(workKey);
+    }
+  }
   const summaryZh = normalizeReadableArticleSummary(parsed.summaryZh, item).slice(0, 900);
-  const direction = ["positive", "negative", "mixed", "neutral"].includes(String(parsed.direction))
-    ? String(parsed.direction)
-    : item.catalyst?.direction || "neutral";
+  const direction = String(parsed.direction);
   const themes = normalizeArticleLlmArray(parsed.themes, 5);
   const keyData = normalizeArticleLlmArray(parsed.keyData, 6);
   const whyItMatters = normalizeArticleLlmArray(parsed.whyItMatters, 4);
   const checks = normalizeArticleLlmArray(parsed.checks, 4);
   const materiality = clampScore(numberOrNull(parsed.materiality) ?? item.catalyst?.materiality ?? 45);
-  const localMemo = item.catalyst?.investmentMemo || buildArticleInvestmentMemo({
-    ticker: safeTicker(item?.ticker) || primaryTickerLabel(item),
-    articleType: item.article.articleType || item.catalyst?.articleType || "",
-    direction,
-    materiality,
-    themes: [...themes, ...(item.catalyst?.themes || [])],
-    whyItMatters,
-    checks,
-    keyData,
-  });
-  const parsedMemo = parsed.investmentMemo && typeof parsed.investmentMemo === "object" ? parsed.investmentMemo : {};
+  const parsedMemo = parsed.investmentMemo;
   const investmentMemo = {
-    stance: normalizeDisplayText(parsedMemo.stance) || localMemo.stance,
-    confidence: normalizeDisplayText(parsedMemo.confidence) || localMemo.confidence,
-    view: normalizeDisplayText(parsed.investmentView || parsedMemo.view) || localMemo.view,
-    suggestedAction: normalizeDisplayText(parsedMemo.suggestedAction || parsed.investmentAdvice) || localMemo.suggestedAction,
-    bullCase: normalizeArticleLlmArray(parsedMemo.bullCase, 3).length ? normalizeArticleLlmArray(parsedMemo.bullCase, 3) : localMemo.bullCase,
-    bearCase: normalizeArticleLlmArray(parsedMemo.bearCase, 3).length ? normalizeArticleLlmArray(parsedMemo.bearCase, 3) : localMemo.bearCase,
-    monitor: normalizeArticleLlmArray(parsedMemo.monitor, 4).length ? normalizeArticleLlmArray(parsedMemo.monitor, 4) : localMemo.monitor,
+    stance: normalizeDisplayText(parsedMemo.stance),
+    confidence: normalizeDisplayText(parsedMemo.confidence),
+    view: normalizeDisplayText(parsed.investmentView || parsedMemo.view),
+    suggestedAction: normalizeDisplayText(parsedMemo.suggestedAction || parsed.investmentAdvice),
+    bullCase: normalizeArticleLlmArray(parsedMemo.bullCase, 3),
+    bearCase: normalizeArticleLlmArray(parsedMemo.bearCase, 3),
+    monitor: normalizeArticleLlmArray(parsedMemo.monitor, 4),
   };
+  if (!investmentMemo.stance || !investmentMemo.confidence || !investmentMemo.view || !investmentMemo.suggestedAction) {
+    throw new Error("LLM article summary returned incomplete investmentMemo");
+  }
   return {
     ...item,
     summary: summaryZh,
@@ -13826,12 +13960,12 @@ const user = `请阅读下面这篇美股新闻原文，输出 JSON 对象，不
       ...(item.catalyst || {}),
       summary: summaryZh,
       direction,
-      themes: [...new Set([...themes, ...(item.catalyst?.themes || [])])].slice(0, 6),
+      themes,
       materiality,
       materialityLabel: materiality >= 70 ? "高材料性" : materiality >= 45 ? "中材料性" : "低材料性",
       lowSignal: materiality < 45,
-      whyItMatters: [...new Set([...whyItMatters, ...(item.catalyst?.whyItMatters || [])])].slice(0, 6),
-      checks: [...new Set([...checks, ...(item.catalyst?.checks || [])])].slice(0, 6),
+      whyItMatters,
+      checks,
       articleBased: true,
       llmBased: true,
       articleType: item.article.articleType || item.catalyst?.articleType || "",
@@ -13935,7 +14069,43 @@ function withSourceLimitedArticle(item, article = {}, errorMessage = "") {
 async function extractArticleForNews(item, timeoutMs = ARTICLE_EXTRACT_TIMEOUT_MS, articleCache = null, options = {}) {
   const retryAttempts = Math.max(1, Number(options.retryAttempts || EXTERNAL_RETRY_ATTEMPTS));
   if (item?.article?.status === "ok" && normalizeDisplayText(item.article.text || "").length >= 120) {
-    return mergeArticleCatalyst(item, item.article);
+    const preloadedArticle = item.article;
+    const originalPublisherUrl = articleOriginalPublisherUrl(preloadedArticle);
+    if (originalPublisherUrl) {
+      const originalResult = await extractArticleForNews(
+        {
+          ...item,
+          article: null,
+          url: originalPublisherUrl,
+          aggregatorUrl: item.url,
+          resolvedUrl: originalPublisherUrl,
+        },
+        timeoutMs,
+        articleCache,
+        options,
+      );
+      if (originalResult.article?.status === "ok") {
+        return {
+          ...originalResult,
+          url: item.url,
+          resolvedUrl: originalPublisherUrl,
+          article: {
+            ...originalResult.article,
+            aggregatorUrl: item.url,
+            originalPublisherUrl,
+          },
+        };
+      }
+      return withSourceLimitedArticle(
+        item,
+        { ...preloadedArticle, originalPublisherUrl },
+        originalResult.article?.error || originalResult.article?.reason || "原始媒体正文不可读",
+      );
+    }
+    if (articleLooksLikeSiteShell(preloadedArticle) || articleTextLooksBlocked(preloadedArticle)) {
+      return withSourceLimitedArticle(item, preloadedArticle, "预载材料是站点页面壳，不是新闻正文");
+    }
+    return mergeArticleCatalyst(item, preloadedArticle);
   }
   if (!articleExtractionCandidate(item)) {
     return {
@@ -13966,32 +14136,58 @@ async function extractArticleForNews(item, timeoutMs = ARTICLE_EXTRACT_TIMEOUT_M
       },
     };
   }
-  try {
-    const payload = await withExternalRetries(
-      `新闻正文抽取 ${item.ticker || ""} ${socialSentenceFragment(item.title || item.rawTitle || extractUrl, 60)}`,
-      async () => {
-        const extracted = await runJsonCli(
-          ARTICLE_EXTRACTOR_PYTHON,
-          [
-            ARTICLE_EXTRACTOR_SCRIPT,
-            "extract",
-            "--url",
-            extractUrl,
-            "--timeout",
-            String(Math.max(5, Math.ceil(timeoutMs / 1000) - 2)),
-            "--max-chars",
-            String(ARTICLE_EXTRACT_TEXT_LIMIT),
-          ],
-          timeoutMs,
-        );
-        if (extracted?.status !== "ok") {
-          const message = extracted?.error || extracted?.fallbackReason || extracted?.status || "";
-          if (retryableExternalError(message)) throw new Error(message);
-        }
-        return extracted;
+  if (isUnusableArticleUrl(extractUrl)) {
+    return {
+      ...itemWithResolvedUrl,
+      article: {
+        status: "skipped",
+        url: item.url,
+        resolvedUrl: resolvedUrl || "",
+        finalUrl: extractUrl,
+        reason: "解析结果是站点首页、搜索页或同意页，不是新闻正文",
       },
-      { attempts: retryAttempts },
-    );
+    };
+  }
+  try {
+    const extractionKey = `${ARTICLE_LOCAL_ANALYSIS_VERSION}:${extractUrl}`;
+    let extractionTask = articleExtractionInFlight.get(extractionKey);
+    const ownsExtractionTask = !extractionTask;
+    if (!extractionTask) {
+      extractionTask = withExternalRetries(
+        `新闻正文抽取 ${socialSentenceFragment(item.title || item.rawTitle || extractUrl, 60)}`,
+        async () => {
+          const extracted = await runJsonCli(
+            ARTICLE_EXTRACTOR_PYTHON,
+            [
+              ARTICLE_EXTRACTOR_SCRIPT,
+              "extract",
+              "--url",
+              extractUrl,
+              "--timeout",
+              String(Math.max(5, Math.ceil(timeoutMs / 1000) - 2)),
+              "--max-chars",
+              String(ARTICLE_EXTRACT_TEXT_LIMIT),
+            ],
+            timeoutMs,
+          );
+          if (extracted?.status !== "ok") {
+            const message = extracted?.error || extracted?.fallbackReason || extracted?.status || "";
+            if (retryableExternalError(message)) throw new Error(message);
+          }
+          return extracted;
+        },
+        { attempts: retryAttempts },
+      );
+      articleExtractionInFlight.set(extractionKey, extractionTask);
+    }
+    let payload;
+    try {
+      payload = await extractionTask;
+    } finally {
+      if (ownsExtractionTask && articleExtractionInFlight.get(extractionKey) === extractionTask) {
+        articleExtractionInFlight.delete(extractionKey);
+      }
+    }
     const article = {
       status: payload.status || "unknown",
       url: item.url,
@@ -14012,6 +14208,40 @@ async function extractArticleForNews(item, timeoutMs = ARTICLE_EXTRACT_TIMEOUT_M
         return withSourceLimitedArticle(item, article, article.error);
       }
       return { ...item, article };
+    }
+    const originalPublisherUrl = articleOriginalPublisherUrl(article);
+    if (originalPublisherUrl && originalPublisherUrl !== extractUrl) {
+      const originalResult = await extractArticleForNews(
+        {
+          ...item,
+          url: originalPublisherUrl,
+          aggregatorUrl: item.url,
+          resolvedUrl: originalPublisherUrl,
+        },
+        timeoutMs,
+        articleCache,
+        options,
+      );
+      if (originalResult.article?.status === "ok") {
+        return {
+          ...originalResult,
+          url: item.url,
+          resolvedUrl: originalPublisherUrl,
+          article: {
+            ...originalResult.article,
+            aggregatorUrl: item.url,
+            originalPublisherUrl,
+          },
+        };
+      }
+      return withSourceLimitedArticle(
+        item,
+        {
+          ...article,
+          originalPublisherUrl,
+        },
+        originalResult.article?.error || originalResult.article?.reason || "原始媒体正文不可读",
+      );
     }
     if (articleLooksLikeSiteShell(article)) {
       return withSourceLimitedArticle(
@@ -14052,6 +14282,7 @@ async function extractArticleForNews(item, timeoutMs = ARTICLE_EXTRACT_TIMEOUT_M
 
 async function enrichNewsArticles(news, llmProvider, articleCache = null) {
   if (!ARTICLE_EXTRACT_ENABLED || !news.length) return { news, errors: [] };
+  markRunStage("article:extract", "正在读取高材料性新闻正文");
   const perTicker = new Map();
   const candidates = news
     .filter(articleExtractionCandidate)
@@ -14110,16 +14341,11 @@ async function enrichNewsArticles(news, llmProvider, articleCache = null) {
       : Number.POSITIVE_INFINITY;
   const llmRows = llmCandidates.length
     ? await mapWithConcurrency(llmCandidates, ARTICLE_LLM_CONCURRENCY, async (item) => {
+      markRunStage("article:llm-summary", `正在用 Gemini Pro 总结新闻正文（${llmCandidates.length} 篇）`);
       try {
         const remainingMs = llmDeadline - Date.now();
         if (Number.isFinite(llmDeadline) && remainingMs < ARTICLE_LLM_SUMMARY_MIN_REMAINING_MS) {
-          return {
-            ...item,
-            article: {
-              ...item.article,
-              llmSkippedReason: `新闻原文 LLM 摘要预算已用尽（${ARTICLE_LLM_SUMMARY_RUN_BUDGET_MS}ms），已保留本地正文摘要`,
-            },
-          };
+          throw new Error(`新闻原文 LLM 摘要预算已用尽（${ARTICLE_LLM_SUMMARY_RUN_BUDGET_MS}ms）；本轮不会使用本地正文摘要降级。`);
         }
         const timeoutMs = Number.isFinite(llmDeadline)
           ? Math.min(
@@ -14142,7 +14368,7 @@ async function enrichNewsArticles(news, llmProvider, articleCache = null) {
   const llmById = new Map(llmRows.map((item) => [item.id || item.url, item]));
   const extracted = extractedBase.map((item) => llmById.get(item.id || item.url) || item);
   for (const item of extracted) {
-    cacheArticleItem(articleCache, item);
+    if (!item.article?.llmError) cacheArticleItem(articleCache, item);
   }
   if (articleCache) pruneArticleCache(articleCache);
   const byId = new Map(extracted.map((item) => [item.id || item.url, item]));
@@ -14179,6 +14405,11 @@ async function enrichNewsArticles(news, llmProvider, articleCache = null) {
       ticker: item.ticker,
       error: `${item.title}: ${item.article.llmError}`,
     }));
+  if (llmErrors.length) {
+    const error = new Error(`新闻正文 LLM 摘要有 ${llmErrors.length} 条失败，已完成单条重试且不会保留本地摘要降级：${llmErrors[0].error}`);
+    error.noCollectorRetry = true;
+    throw error;
+  }
   return { news: enriched, errors: [...extractionErrors, ...llmErrors] };
 }
 
@@ -16958,15 +17189,21 @@ function sanitizeRankedNewsBrief(item = {}, brief = "") {
   return `${title} 属于疑似财报/指引相关线索，但当前系统没有提取到收入、EPS、毛利率或下季指引等关键数字。投资上只能先作为待核验材料，不能据此判断 beat/miss 或估值变化。`;
 }
 
-async function rankImportantNewsWithLlm(news = [], llmProvider = LLM_PROVIDER) {
-  const fallback = buildHotNewsSummary(news);
+async function rankImportantNewsWithLlm(news = [], llmProvider = LLM_PROVIDER, fundamentals = []) {
   const activeProvider = activeLlmProvider(llmProvider);
-  if (!activeProvider || !news.length) return fallback;
+  if (!news.length) throw new Error("没有可供 LLM 排序的正文级新闻材料。");
+  if (!activeProvider) {
+    throw new Error(missingLlmMessage(llmProvider) || `新闻排序要求 ${llmProvider}，但该 provider 当前不可用；系统不会使用规则排序降级。`);
+  }
   const candidates = (news || [])
+    .map((item) => retagHotNewsToHeadlineSubject(item, fundamentals))
+    .filter((item) => hotNewsOwnershipEligible(item, fundamentals, Date.now()))
     .map(prepareHotNewsDisplayItem)
     .sort((a, b) => (b.effectiveScore || 0) - (a.effectiveScore || 0) || newsPublishedTimeValue(b) - newsPublishedTimeValue(a))
     .slice(0, 50);
-  if (!candidates.length) return fallback;
+  if (candidates.length < Math.min(10, HOT_NEWS_DISPLAY_LIMIT)) {
+    throw new Error(`新闻候选经过正文、时效与主体归属过滤后只有 ${candidates.length} 条，少于严格热闻要求的 ${Math.min(10, HOT_NEWS_DISPLAY_LIMIT)} 条。`);
+  }
   const payload = candidates.map(compactNewsRankingPayloadItem);
   const system =
     "你是谨慎的美股盘前/盘后新闻编辑。只基于给出的新闻标题、正文摘要和数据打重要性分，不补充外部事实。所有输出必须是自然中文，不能用分号堆字段，不能输出乱码、HTML、英文长句或内部标签。必须输出严格 JSON。";
@@ -16987,60 +17224,74 @@ async function rankImportantNewsWithLlm(news = [], llmProvider = LLM_PROVIDER) {
   ]
 }
 
-新闻候选：${JSON.stringify(payload)}`;
+  新闻候选：${JSON.stringify(payload)}`;
   try {
-    const result = await callConfiguredLlm(system, user, llmProvider, {
-      task: "news-ranking",
-      timeoutMs: 45000,
-      bypassCooldown: true,
-      suppressFailureCooldown: true,
-    });
-    const parsed = extractJsonObject(result.text);
-    if (!Array.isArray(parsed?.items)) throw new Error("LLM news ranking returned invalid JSON");
-    const byId = new Map(candidates.map((item, index) => [payload[index].id, item]));
-    const ranked = parsed.items
-      .map((row) => {
-        const item = byId.get(row.id);
-        if (!item) return null;
-        const briefZh = sanitizeRankedNewsBrief(item, row.briefZh || "");
+    return await retryOperation(
+      "热闻 LLM 排序",
+      async () => {
+        const result = await callConfiguredLlm(system, user, llmProvider, {
+          task: "news-ranking",
+          timeoutMs: HOT_NEWS_LLM_TIMEOUT_MS,
+          retryAttempts: 1,
+          bypassCooldown: true,
+          suppressFailureCooldown: true,
+        });
+        const parsed = extractJsonObject(result.text);
+        if (!Array.isArray(parsed?.items)) throw new Error("LLM news ranking returned invalid JSON");
+        const byId = new Map(candidates.map((item, index) => [payload[index].id, item]));
+        const ranked = parsed.items
+          .map((row) => {
+            const item = byId.get(row.id);
+            if (!item) return null;
+            const briefZh = sanitizeRankedNewsBrief(item, row.briefZh || "");
+            if (!briefZh || !cleanHotNewsText(row.reasonZh || "")) return null;
+            return {
+              ...item,
+              llmImportanceScore: clampScore(numberOrNull(row.importance) ?? item.effectiveScore ?? 50),
+              llmImportanceReason: cleanHotNewsText(row.reasonZh || ""),
+              llmBriefZh: briefZh,
+              llmDirection: ["positive", "negative", "mixed", "neutral"].includes(row.direction) ? row.direction : item.catalyst?.direction || "neutral",
+            };
+          })
+          .filter(Boolean)
+          .slice(0, HOT_NEWS_DISPLAY_LIMIT);
+        const requiredItems = Math.min(10, HOT_NEWS_DISPLAY_LIMIT, candidates.length);
+        if (ranked.length < requiredItems) {
+          throw new Error(`LLM 新闻排序只返回 ${ranked.length} 条完整结果，要求 ${requiredItems} 条。`);
+        }
+        const marketSummaryZh = cleanHotNewsText(parsed.marketSummaryZh || "");
+        const themeBullets = normalizeArticleLlmArray(parsed.themeBullets, 5).map(cleanHotNewsText).filter(Boolean);
+        const riskBullets = normalizeArticleLlmArray(parsed.riskBullets, 4).map(cleanHotNewsText).filter(Boolean);
+        const watchBullets = normalizeArticleLlmArray(parsed.watchBullets, 4).map(cleanHotNewsText).filter(Boolean);
+        if (!marketSummaryZh || themeBullets.length < 3 || riskBullets.length < 2 || watchBullets.length < 2) {
+          throw new Error("LLM 新闻排序缺少市场总结、主线、风险或观察清单。");
+        }
+        const items = ranked.map(withHotNewsCategory);
         return {
-          ...item,
-          llmImportanceScore: clampScore(numberOrNull(row.importance) ?? item.effectiveScore ?? 50),
-          llmImportanceReason: cleanHotNewsText(row.reasonZh || ""),
-          llmBriefZh: briefZh,
-          llmDirection: ["positive", "negative", "mixed", "neutral"].includes(row.direction) ? row.direction : item.catalyst?.direction || "neutral",
+          status: "ok",
+          source: "LLM Ranking",
+          provider: result.provider,
+          marketSummaryZh,
+          themeBullets,
+          riskBullets,
+          watchBullets,
+          filter: {
+            candidateCount: candidates.length,
+            shownCount: items.length,
+            llmRanked: true,
+          },
+          categoryGroups: buildHotNewsCategoryGroups(items),
+          items,
         };
-      })
-      .filter(Boolean)
-      .slice(0, HOT_NEWS_DISPLAY_LIMIT);
-    const items = (ranked.length ? ranked : fallback.items).map(withHotNewsCategory);
-    return {
-      ...fallback,
-      source: `${fallback.source}/LLM Ranking`,
-      provider: result.provider,
-      marketSummaryZh: cleanHotNewsText(parsed.marketSummaryZh || ""),
-      themeBullets: normalizeArticleLlmArray(parsed.themeBullets, 5).map(cleanHotNewsText).filter(Boolean),
-      riskBullets: normalizeArticleLlmArray(parsed.riskBullets, 4).map(cleanHotNewsText).filter(Boolean),
-      watchBullets: normalizeArticleLlmArray(parsed.watchBullets, 4).map(cleanHotNewsText).filter(Boolean),
-      filter: {
-        ...fallback.filter,
-        candidateCount: candidates.length,
-        shownCount: items.length,
-        llmRanked: true,
       },
-      categoryGroups: buildHotNewsCategoryGroups(items),
-      items,
-    };
+      {
+        attempts: 3,
+        attemptTimeoutMs: HOT_NEWS_LLM_TIMEOUT_MS,
+        baseDelayMs: Number(process.env.EXTERNAL_RETRY_DELAY_MS || 800),
+      },
+    );
   } catch (error) {
-    return {
-      ...fallback,
-      llmError: error.message,
-      filter: {
-        ...fallback.filter,
-        candidateCount: candidates.length,
-        llmRanked: false,
-      },
-    };
+    throw new Error(`热闻 LLM 排序失败，已完成重试且不会使用规则结果降级：${errorZh(error.message)}`, { cause: error });
   }
 }
 
@@ -21458,10 +21709,13 @@ function loadAllStockAgentSkill() {
   } catch (error) {
     return {
       path: path.relative(__dirname, ALL_STOCK_AGENT_SKILL_FILE),
-      status: "fallback",
+      status: "failed",
       skill: normalizeAllStockAgentSkill(defaultAllStockAgentSkill()),
       raw: "",
-      errors: [{ source: "All Stock Agent Skill", error: error.message }],
+      errors: [{
+        source: "All Stock Agent Skill",
+        error: `策略 Skill 加载失败，已阻止 Agent 运行且不会使用默认策略降级：${error.message}`,
+      }],
     };
   }
 }
@@ -23917,6 +24171,33 @@ function allStockAgentHistoryPricePoint(stockHistory = [], ticker = "", dueAt = 
   return rest;
 }
 
+function allStockAgentHistoryPricePointAtOrBefore(stockHistory = [], ticker = "", at = null) {
+  const symbol = safeTicker(ticker);
+  const atMs = at ? new Date(at).getTime() : NaN;
+  if (!symbol || !Number.isFinite(atMs)) return null;
+  const match = (stockHistory || [])
+    .filter((item) => safeTicker(item.ticker) === symbol)
+    .map((item) => {
+      const capturedMs = new Date(item.capturedAt || 0).getTime();
+      const price = firstFiniteNumber(item.quote?.price, item.technical?.latestClose);
+      return Number.isFinite(capturedMs) && capturedMs <= atMs && Number.isFinite(price) && price > 0
+        ? {
+            ticker: symbol,
+            price,
+            capturedAt: item.capturedAt,
+            provider: item.quote?.provider || "stockHistory",
+            source: "stockHistory",
+            capturedMs,
+          }
+        : null;
+    })
+    .filter(Boolean)
+    .sort((a, b) => b.capturedMs - a.capturedMs)[0] || null;
+  if (!match) return null;
+  const { capturedMs, ...rest } = match;
+  return rest;
+}
+
 function allStockAgentPricePoint(db = {}, run = {}, ticker = "", dueAt = null) {
   const dueMs = dueAt ? new Date(dueAt).getTime() : 0;
   if (dueMs) {
@@ -23951,7 +24232,7 @@ function allStockAgentEntryBenchmarkPoint(db = {}, decision = {}, run = {}) {
     : allStockAgentBenchmarkTickers();
   const entryMs = new Date(at || 0).getTime();
   for (const ticker of tickers) {
-    const point = allStockAgentHistoryPricePoint(db.stockHistory || [], ticker, at);
+    const point = allStockAgentHistoryPricePointAtOrBefore(db.stockHistory || [], ticker, at);
     if (point) return point;
     const runPoint = allStockAgentRunPricePoint(run, ticker);
     const runMs = new Date(runPoint?.capturedAt || 0).getTime();
@@ -24006,29 +24287,47 @@ function allStockAgentOutcomeFromExcess(excessPct) {
   return outcomeFromExcess(excessPct, ALL_STOCK_AGENT_OUTCOME_DEADBAND_PCT);
 }
 
+function allStockAgentOutcomeDueAt(decisionAt = "", horizonDays = 0) {
+  const dueDate = addBusinessDays(decisionAt, horizonDays);
+  if (!dueDate) return null;
+  return nyseSessionCloseAt(dueDate);
+}
+
+function allStockAgentOutcomeQualityInput(outcome = {}) {
+  const expectedDueDate = allStockAgentOutcomeDueAt(outcome.decisionAt, outcome.horizonDays);
+  return {
+    ...outcome,
+    expectedDueAt: expectedDueDate?.toISOString() || outcome.expectedDueAt || "",
+  };
+}
+
 function classifyAllStockAgentOutcomeQuality(outcome = {}) {
-  return classifyRecommendationOutcomeQuality(outcome, {
+  return classifyRecommendationOutcomeQuality(allStockAgentOutcomeQualityInput(outcome), {
     suspectReturnPct: ALL_STOCK_AGENT_SUSPECT_PRICE_RETURN_PCT,
   });
 }
 
 function allStockAgentOutcomeIsUsable(outcome = {}) {
-  return recommendationOutcomeIsUsable(outcome, {
+  return recommendationOutcomeIsUsable(allStockAgentOutcomeQualityInput(outcome), {
     suspectReturnPct: ALL_STOCK_AGENT_SUSPECT_PRICE_RETURN_PCT,
   });
 }
 
 function withAllStockAgentOutcomeQuality(outcome = {}) {
   if (!outcome || typeof outcome !== "object") return outcome;
-  if (outcome.outcomeQualityStatus === "ok" || outcome.outcomeQualityStatus === "suspect_price") return outcome;
   const quality = classifyAllStockAgentOutcomeQuality(outcome);
   return {
     ...outcome,
-    outcomeQualityStatus: quality.status,
-    outcomeQualityReasons: Array.isArray(outcome.outcomeQualityReasons) && outcome.outcomeQualityReasons.length
-      ? outcome.outcomeQualityReasons
-      : quality.reasons,
-    outcomeUsable: quality.usable,
+    ...(outcome.outcomeQualityStatus
+      ? {}
+      : {
+          outcomeQualityStatus: quality.status,
+          outcomeQualityReasons: quality.reasons,
+          outcomeUsable: quality.usable,
+        }),
+    outcomeQualityCurrentStatus: quality.status,
+    outcomeQualityCurrentReasons: quality.reasons,
+    outcomeUsableCurrent: quality.usable,
   };
 }
 
@@ -24113,7 +24412,7 @@ function buildAllStockAgentOutcomeSnapshots(state = {}, run = {}, db = {}, skill
     for (const horizonDays of horizons) {
       const key = `${decision.id}:${horizonDays}`;
       if (existingKeys.has(key)) continue;
-      const dueDate = addBusinessDays(decisionAt, horizonDays);
+      const dueDate = allStockAgentOutcomeDueAt(decisionAt, horizonDays);
       const dueAt = dueDate ? dueDate.toISOString() : "";
       const dueMs = dueDate ? dueDate.getTime() : NaN;
       if (!Number.isFinite(dueMs) || !Number.isFinite(nowMs) || nowMs < dueMs) continue;
@@ -24125,21 +24424,26 @@ function buildAllStockAgentOutcomeSnapshots(state = {}, run = {}, db = {}, skill
           ? decision.benchmarkBasket
           : buildBenchmarkBasket(ticker, { marketCapitalization: decision.marketCapitalization, industry: decision.industry }),
       );
-      const benchmark = allStockAgentBenchmarkReturn(db, run, benchmarkBasket, decisionAt, dueAt);
+      const benchmark = allStockAgentBenchmarkReturn(db, run, benchmarkBasket, decisionAt, dueAt, false);
       const benchmarkReturnPct = numberOrNull(benchmark.returnPct);
-      const excessPct = Number.isFinite(benchmarkReturnPct)
-        ? decision.action === "卖出"
-          ? benchmarkReturnPct - rawReturnPct
-          : rawReturnPct - benchmarkReturnPct
-        : allStockAgentDecisionPerformance(decision, exit.price);
+      if (!Number.isFinite(benchmarkReturnPct) || benchmark.used?.length !== benchmark.basket?.length) continue;
+      const excessPct = decision.action === "卖出"
+        ? benchmarkReturnPct - rawReturnPct
+        : rawReturnPct - benchmarkReturnPct;
       const outcome = allStockAgentOutcomeFromExcess(excessPct);
       const process = allStockAgentOutcomeProcess(decision, db.stockHistory || [], entryPrice, decisionAt, dueAt, outcome);
       const quality = classifyAllStockAgentOutcomeQuality({
+        decisionAt,
+        dueAt,
+        expectedDueAt: dueAt,
+        exitPriceAt: exit.capturedAt,
+        horizonDays,
         entryPrice,
         exitPrice: exit.price,
         rawReturnPct,
         performancePct: decision.action === "卖出" ? -rawReturnPct : rawReturnPct,
         benchmarkReturnPct,
+        benchmarkComponents: benchmark.used || [],
         excessPct,
       });
       additions.push({
@@ -24177,6 +24481,9 @@ function buildAllStockAgentOutcomeSnapshots(state = {}, run = {}, db = {}, skill
         outcomeQualityStatus: quality.status,
         outcomeQualityReasons: quality.reasons,
         outcomeUsable: quality.usable,
+        outcomeQualityCurrentStatus: quality.status,
+        outcomeQualityCurrentReasons: quality.reasons,
+        outcomeUsableCurrent: quality.usable,
         maePct: process.maePct,
         mfePct: process.mfePct,
         timeToProfitDays: process.timeToProfitDays,
@@ -24268,7 +24575,7 @@ function updateAllStockAgentRuleStat(row, value, outcome, options = {}) {
   return row;
 }
 
-function buildAllStockAgentRuleStats(reviews = [], outcomeSnapshots = []) {
+function buildAllStockAgentRuleStats(_reviews = [], outcomeSnapshots = []) {
   const stats = {};
   const snapshots = (outcomeSnapshots || []).filter((item) => item?.outcome && item.outcome !== "pending" && allStockAgentOutcomeIsUsable(item));
   if (snapshots.length) {
@@ -24310,31 +24617,6 @@ function buildAllStockAgentRuleStats(reviews = [], outcomeSnapshots = []) {
         row.horizons[hKey] = hRow;
         stats[id] = row;
       }
-    }
-    return stats;
-  }
-  for (const review of reviews) {
-    if ((review.ageDays || 0) < 1) continue;
-    if (review.outcomeUsable === false || review.outcomeQualityStatus === "suspect_price") continue;
-    for (const rule of review.matchedRules || []) {
-      const id = rule.id;
-      if (!id) continue;
-      const row = stats[id] || {
-        id,
-        label: rule.label || id,
-        samples: 0,
-        wins: 0,
-        flats: 0,
-        losses: 0,
-        totalReturnPct: 0,
-        avgReturnPct: 0,
-        avgExcessPct: 0,
-        winRate: 0,
-        lastReturnPct: null,
-        horizons: {},
-      };
-      updateAllStockAgentRuleStat(row, review.performancePct, review.performancePct >= 0 ? "win" : "loss", { isExcess: false });
-      stats[id] = row;
     }
   }
   return stats;
@@ -24593,11 +24875,22 @@ async function maybeUpdateAllStockAgentSkill(skillBundle, state = {}, ruleStats 
     id: compactId("all-stock-skill-revision"),
     generatedAt: nowIso(),
     reviewDate: today,
-    summary: "根据历史买入/卖出建议后续收益，小幅调整规则权重",
+    summary: ALL_STOCK_AGENT_SKILL_AUTO_WRITE_ENABLED
+      ? "根据可用的冻结超额收益样本，小幅调整规则权重"
+      : "根据可用的冻结超额收益样本生成规则权重候选，等待人工确认",
+    status: ALL_STOCK_AGENT_SKILL_AUTO_WRITE_ENABLED ? "applied" : "candidate",
+    applied: ALL_STOCK_AGENT_SKILL_AUTO_WRITE_ENABLED,
     changes,
+    candidateSkill: ALL_STOCK_AGENT_SKILL_AUTO_WRITE_ENABLED ? null : next,
   };
-  await saveAllStockAgentSkill(next, revision, skillBundle.raw);
-  return { skill: next, revision, reviewDate: today };
+  if (ALL_STOCK_AGENT_SKILL_AUTO_WRITE_ENABLED) {
+    await saveAllStockAgentSkill(next, revision, skillBundle.raw);
+  }
+  return {
+    skill: ALL_STOCK_AGENT_SKILL_AUTO_WRITE_ENABLED ? next : skill,
+    revision,
+    reviewDate: today,
+  };
 }
 
 function allStockAgentMissingData(run = {}, universe = [], evaluations = []) {
@@ -24762,15 +25055,22 @@ function persistAllStockAgentPrefetchToRun(db = {}, sourceRun = {}, enrichedSour
   }
 }
 
-async function runAllStockAgentForRun(db, sourceRun, trigger = "manual", options = {}) {
+async function runAllStockAgentForRunUnlocked(db, sourceRun, trigger = "manual", options = {}) {
   if (!ALL_STOCK_AGENT_ENABLED) throw new Error("候选池 Agent 未启用。");
   if (!sourceRun) throw new Error("暂无报告数据，先运行一次采集。");
   const state = normalizeAllStockAgentState(db.allStockAgent);
   let source = runWithDerivedAnalysisLayers(sourceRun);
-  const skillBundle = loadAllStockAgentSkill();
-  let skill = skillBundle.skill;
+  let skillBundle = loadAllStockAgentSkill();
+  if (skillBundle.status !== "ok") {
+    throw new Error(skillBundle.errors?.[0]?.error || "策略 Skill 加载失败，候选池 Agent 已停止。请修复后重试。");
+  }
+  const activeVersionAtStart = activeStrategyVersion(state.strategyVersions);
+  let skill = activeVersionAtStart?.json
+    ? normalizeAllStockAgentSkill(activeVersionAtStart.json)
+    : skillBundle.skill;
+  skillBundle = { ...skillBundle, skill };
   let skillStrategyVersion = allStockAgentStrategyVersion(skillBundle, skill);
-  let strategyVersion = activeStrategyVersion(state.strategyVersions) || skillStrategyVersion;
+  let strategyVersion = activeVersionAtStart || skillStrategyVersion;
   const regimeTag = allStockAgentRegimeTagFromRun(source);
   let securityMaster = cachedNasdaqSecurityMasterSync();
   const securityMasterErrors = [];
@@ -25159,6 +25459,16 @@ async function runAllStockAgentForRun(db, sourceRun, trigger = "manual", options
   if (options.scheduleKey) db.scheduleLog[options.scheduleKey] = agentRun.id;
   await saveStore(db);
   return agentRun;
+}
+
+async function runAllStockAgentForRun(db, sourceRun, trigger = "manual", options = {}) {
+  if (allStockAgentRunInProgress) return allStockAgentRunInProgress;
+  allStockAgentRunInProgress = runAllStockAgentForRunUnlocked(db, sourceRun, trigger, options);
+  try {
+    return await allStockAgentRunInProgress;
+  } finally {
+    allStockAgentRunInProgress = null;
+  }
 }
 
 function compactAllStockAgentCardForClient(row = {}) {
@@ -26552,20 +26862,11 @@ async function collectLongBridgeStockSnapshot(ticker, llmProvider = null, articl
     })),
     timeboxedTask(
       "All News Pack 快照",
-      () => collectAllNewsPackForTicker(safe, llmProvider, articleCache, sourceControls, {
+      (signal) => collectAllNewsPackForTicker(safe, llmProvider, articleCache, sourceControls, {
         akshareTimeoutMs: AKSHARE_SNAPSHOT_TIMEOUT_MS,
+        signal,
       }),
       STOCK_SNAPSHOT_ALL_NEWS_TIMEOUT_MS,
-      (error) => ({
-        ticker: safe,
-        provider: "All News Pack",
-        generatedAt: nowIso(),
-        status: "partial",
-        items: baseNews.slice(0, Math.max(12, ALL_NEWS_PACK_SUMMARY_LIMIT)),
-        sourceCoverage: newsPackSourceCoverage(baseNews),
-        summary: localAllNewsPackSummary(baseNews, [{ source: "All News Pack", ticker: safe, error: error.message }]),
-        errors: [{ source: "All News Pack", ticker: safe, error: error.message }],
-      }),
     ).catch((error) => ({
       ticker: safe,
       provider: "All News Pack",
@@ -29267,7 +29568,7 @@ function buildLocalMarketOverviewSynthesis(marketOverview, marketPortal = null, 
   };
 }
 
-function normalizeMarketOverviewLlmResult(parsed, fallback) {
+function normalizeMarketOverviewLlmResult(parsed) {
   const summary = normalizeDisplayText(parsed?.summary || parsed?.conclusion || "").slice(0, 520);
   const drivers = normalizeArticleLlmArray(parsed?.drivers, 4);
   const watchItems = normalizeArticleLlmArray(parsed?.watchItems || parsed?.nextChecks, 4);
@@ -29275,21 +29576,20 @@ function normalizeMarketOverviewLlmResult(parsed, fallback) {
   const portalTakeaway = normalizeDisplayText(parsed?.portalTakeaway || "").slice(0, 240);
   const editorialTakeaway = normalizeDisplayText(parsed?.editorialTakeaway || "").slice(0, 360);
   return {
-    summary: summary || fallback.summary,
-    drivers: drivers.length ? drivers : fallback.drivers,
-    watchItems: watchItems.length ? watchItems : fallback.watchItems,
+    summary,
+    drivers,
+    watchItems,
     risks,
-    portalTakeaway: portalTakeaway || fallback.portalTakeaway,
-    editorialTakeaway: editorialTakeaway || fallback.editorialTakeaway,
-    confidence: normalizeDisplayText(parsed?.confidence || fallback.confidence || "中").slice(0, 12),
+    portalTakeaway,
+    editorialTakeaway,
+    confidence: normalizeDisplayText(parsed?.confidence || "").slice(0, 12),
   };
 }
 
-function marketOverviewLlmPayload(marketOverview, marketPortal, marketEditorialBrief, fallback) {
+function marketOverviewLlmPayload(marketOverview, marketPortal, marketEditorialBrief) {
   return {
     regime: marketOverview?.regime || "",
     riskScore: marketOverview?.riskScore ?? null,
-    localFallback: fallback,
     assets: (marketOverview?.assets || [])
       .filter((asset) => asset.available)
       .slice(0, 12)
@@ -29328,9 +29628,10 @@ function sanitizedMarketPortalForOverview(marketPortal, synthesis) {
 }
 
 async function synthesizeMarketOverview(marketOverview, marketPortal, marketEditorialBrief, llmProvider) {
-  const fallback = buildLocalMarketOverviewSynthesis(marketOverview, marketPortal, marketEditorialBrief);
-  if (!MARKET_OVERVIEW_LLM_ENABLED || !activeLlmProvider(normalizeLlmProvider(llmProvider))) {
-    return { ...fallback, provider: fallback.source };
+  if (!MARKET_OVERVIEW_LLM_ENABLED) throw new Error("MARKET_OVERVIEW_LLM_ENABLED=false，无法生成大盘 AI 综述。");
+  const normalizedProvider = normalizeLlmProvider(llmProvider);
+  if (!activeLlmProvider(normalizedProvider)) {
+    throw new Error(missingLlmMessage(normalizedProvider) || `大盘 AI 综述要求 ${normalizedProvider}，当前不可用。`);
   }
   const system =
     "你是谨慎的美股大盘投研助手。仅在 market editorial brief 的 readDepth 为 body 或 summary 时，才可以使用成熟财经媒体的市场综述判断盘面驱动，再用结构化行情校验；readDepth 为 title 时必须说明正文不足，不能从标题臆测原因；不要复制新闻原文、标题或链接；不要编造指数点位或数据；不要给直接买卖指令。必须输出严格 JSON 对象。";
@@ -29345,28 +29646,41 @@ async function synthesizeMarketOverview(marketOverview, marketPortal, marketEdit
   "confidence": "高|中|低"
 }
 
-材料：${JSON.stringify(marketOverviewLlmPayload(marketOverview, marketPortal, marketEditorialBrief, fallback))}`;
-  try {
-    const result = await callConfiguredLlm(system, user, llmProvider, {
-      task: "market-overview",
-      timeoutMs: MARKET_OVERVIEW_LLM_TIMEOUT_MS,
-      bypassCooldown: true,
-      suppressFailureCooldown: true,
-    });
-    const parsed = extractJsonObject(result.text);
-    if (!parsed) throw new Error("Market overview LLM returned invalid JSON");
-    return {
-      ...normalizeMarketOverviewLlmResult(parsed, fallback),
-      topicTags: fallback.topicTags,
-      provider: result.provider,
-    };
-  } catch (error) {
-    return {
-      ...fallback,
-      provider: `${fallback.source}:llm-fallback`,
-      error: error.message,
-    };
-  }
+材料：${JSON.stringify(marketOverviewLlmPayload(marketOverview, marketPortal, marketEditorialBrief))}`;
+  return retryOperation(
+    "大盘 AI 综述",
+    async () => {
+      const result = await callConfiguredLlm(system, user, normalizedProvider, {
+        task: "market-overview",
+        timeoutMs: MARKET_OVERVIEW_LLM_TIMEOUT_MS,
+        retryAttempts: 1,
+        bypassCooldown: true,
+        suppressFailureCooldown: true,
+      });
+      const parsed = extractJsonObject(result.text);
+      if (!parsed) throw new Error("大盘 AI 综述返回的不是有效 JSON。");
+      const normalized = normalizeMarketOverviewLlmResult(parsed);
+      if (!normalized.summary || !normalized.drivers.length || !normalized.watchItems.length || !normalized.confidence) {
+        throw new Error("大盘 AI 综述缺少 summary、drivers、watchItems 或 confidence。");
+      }
+      if (marketEditorialBrief?.items?.length && !normalized.editorialTakeaway) {
+        throw new Error("大盘 AI 综述未总结已读取的市场编辑正文。");
+      }
+      if (marketPortal && !normalized.portalTakeaway) {
+        throw new Error("大盘 AI 综述未总结 IBKR Portal 材料。");
+      }
+      return {
+        ...normalized,
+        topicTags: marketPortalTopicTags(marketPortal),
+        provider: result.provider,
+      };
+    },
+    {
+      attempts: 3,
+      attemptTimeoutMs: MARKET_OVERVIEW_LLM_TIMEOUT_MS,
+      baseDelayMs: Number(process.env.EXTERNAL_RETRY_DELAY_MS || 800),
+    },
+  );
 }
 
 async function collectMarketOverview() {
@@ -29535,7 +29849,7 @@ async function mergeMarketOverviewWithPortal(marketOverview, marketPortal, marke
   if (!marketOverview && !marketPortal && !marketEditorialBrief) return null;
   const synthesis = await synthesizeMarketOverview(marketOverview, marketPortal, marketEditorialBrief, llmProvider);
   const editorialBrief = sanitizedMarketEditorialBriefForClient(marketEditorialBrief);
-  const editorialBriefText = synthesis.editorialTakeaway || marketEditorialTakeaway(marketEditorialBrief);
+  const editorialBriefText = synthesis.editorialTakeaway;
   if (!marketOverview) {
     return {
       generatedAt: marketPortal?.updatedAt || marketEditorialBrief?.generatedAt || nowIso(),
@@ -29555,7 +29869,7 @@ async function mergeMarketOverviewWithPortal(marketOverview, marketPortal, marke
       ].filter(Boolean),
       assets: [],
       marketSynthesis: synthesis,
-      portalBrief: marketPortal ? synthesis.portalTakeaway || marketPortalTakeaway(marketPortal) : "",
+      portalBrief: marketPortal ? synthesis.portalTakeaway : "",
       portal: sanitizedMarketPortalForOverview(marketPortal, synthesis),
       editorialBriefText,
       editorialBrief,
@@ -29579,10 +29893,9 @@ async function mergeMarketOverviewWithPortal(marketOverview, marketPortal, marke
       ...(marketOverview.caveats || []),
       marketPortal ? "IBKR Portal 观察用于补充新闻叙事，不能替代实时指数/波动率行情核验。" : "",
       marketEditorialBrief ? "市场编辑综述用于提供成熟财经媒体的盘面归因，不能替代实时指数、成交和波动率核验。" : "",
-      synthesis.error ? `大盘 LLM 整理超时或失败，已用本地规则结论：${errorZh(synthesis.error)}` : "",
     ].filter(Boolean).slice(0, 4),
     marketSynthesis: synthesis,
-    portalBrief: marketPortal ? synthesis.portalTakeaway || marketPortalTakeaway(marketPortal) : "",
+    portalBrief: marketPortal ? synthesis.portalTakeaway : "",
     portal: sanitizedMarketPortalForOverview(marketPortal, synthesis),
     editorialBriefText,
     editorialBrief,
@@ -36621,25 +36934,49 @@ function buildLocalStockNarratives(run) {
 
 function mergeStockNarratives(base, llmRows, provider) {
   const byTicker = new Map((base.items || []).map((item) => [item.ticker, item]));
+  const received = new Set();
   for (const row of llmRows || []) {
     const ticker = safeTicker(row?.ticker);
     if (!ticker || !byTicker.has(ticker)) continue;
+    const oneLine = normalizeDisplayText(row.oneLine);
+    const newsCatalyst = normalizeDisplayText(row.newsCatalyst);
+    const secSummary = normalizeDisplayText(row.secSummary);
+    const socialReason = normalizeDisplayText(row.socialReason);
+    const investmentAngle = normalizeDisplayText(row.investmentAngle);
+    const validationSteps = Array.isArray(row.validationSteps)
+      ? row.validationSteps.map(normalizeDisplayText).filter(Boolean).slice(0, 7)
+      : [];
+    const riskNotes = Array.isArray(row.riskNotes)
+      ? row.riskNotes.map(normalizeDisplayText).filter(Boolean).slice(0, 4)
+      : [];
+    if (
+      !oneLine ||
+      !newsCatalyst ||
+      !secSummary ||
+      !socialReason ||
+      !investmentAngle ||
+      !validationSteps.length ||
+      !riskNotes.length
+    ) {
+      throw new Error(`LLM 单股摘要字段不完整：${ticker}`);
+    }
+    received.add(ticker);
     const current = byTicker.get(ticker);
     byTicker.set(ticker, {
       ...current,
       provider,
-      oneLine: normalizeDisplayText(row.oneLine) || current.oneLine,
-      newsCatalyst: normalizeDisplayText(row.newsCatalyst) || current.newsCatalyst,
-      secSummary: normalizeDisplayText(row.secSummary) || current.secSummary,
-      socialReason: normalizeDisplayText(row.socialReason) || current.socialReason,
-      investmentAngle: normalizeDisplayText(row.investmentAngle) || current.investmentAngle,
-      validationSteps: Array.isArray(row.validationSteps)
-        ? row.validationSteps.map(normalizeDisplayText).filter(Boolean).slice(0, 7)
-        : current.validationSteps,
-      riskNotes: Array.isArray(row.riskNotes)
-        ? row.riskNotes.map(normalizeDisplayText).filter(Boolean).slice(0, 4)
-        : current.riskNotes,
+      oneLine,
+      newsCatalyst,
+      secSummary,
+      socialReason,
+      investmentAngle,
+      validationSteps,
+      riskNotes,
     });
+  }
+  const missing = [...byTicker.keys()].filter((ticker) => !received.has(ticker));
+  if (missing.length) {
+    throw new Error(`LLM 单股摘要缺少 ${missing.length} 个 ticker：${missing.slice(0, 12).join("、")}`);
   }
   return {
     ...base,
@@ -36650,10 +36987,12 @@ function mergeStockNarratives(base, llmRows, provider) {
 
 async function buildStockNarratives(run, llmProvider) {
   const base = buildLocalStockNarratives(run);
-  if (!activeLlmProvider(llmProvider)) return base;
+  if (!activeLlmProvider(llmProvider)) {
+    throw new Error(missingLlmMessage(llmProvider) || `单股摘要要求 ${llmProvider}，系统不会使用本地模板降级。`);
+  }
   const payload = base.items.map((item) => ({
     ticker: item.ticker,
-    localFallback: {
+    structuredContext: {
       oneLine: item.oneLine,
       newsCatalyst: item.newsCatalyst,
       secSummary: item.secSummary,
@@ -36675,23 +37014,44 @@ async function buildStockNarratives(run, llmProvider) {
   }));
   const system =
     "你是谨慎的美股投研助理。只基于用户给你的材料，为单只股票解释最近新闻催化和社交热议原因。必须中文输出，不编造没有给出的事实，不给直接买卖指令。";
-  const user = `请为每个 ticker 输出严格 JSON 数组。字段必须是 ticker、oneLine、newsCatalyst、secSummary、socialReason、investmentAngle、validationSteps、riskNotes。oneLine 是一句清晰日报结论；newsCatalyst 说明最近新闻在讲什么和影响方向；secSummary 说明 SEC 文件为什么重要；socialReason 说明为什么被热议；investmentAngle 只给非个性化观察和核验动作；validationSteps/riskNotes 是字符串数组。\n\n材料：${JSON.stringify(payload)}`;
   try {
-    const result = await callConfiguredLlm(system, user, llmProvider, {
-      task: "stock-narrative",
-      timeoutMs: STOCK_NARRATIVE_LLM_TIMEOUT_MS,
-      bypassCooldown: true,
-    });
-    return mergeStockNarratives(base, extractJsonArray(result.text), result.provider);
+    const rows = [];
+    const providers = new Set();
+    const batchCount = Math.ceil(payload.length / STOCK_NARRATIVE_BATCH_SIZE);
+    for (let offset = 0; offset < payload.length; offset += STOCK_NARRATIVE_BATCH_SIZE) {
+      const batch = payload.slice(offset, offset + STOCK_NARRATIVE_BATCH_SIZE);
+      const batchIndex = Math.floor(offset / STOCK_NARRATIVE_BATCH_SIZE) + 1;
+      markRunStage("stock-narratives", `正在生成个股日报摘要（第 ${batchIndex}/${batchCount} 批，共 ${payload.length} 只）。`);
+      const user = `请为输入中的每个 ticker 各输出一条严格 JSON 数组记录，不能漏掉任何 ticker，也不能输出输入之外的 ticker。字段必须完整包含 ticker、oneLine、newsCatalyst、secSummary、socialReason、investmentAngle、validationSteps、riskNotes。oneLine 是一句清晰日报结论；newsCatalyst 说明最近新闻正文在讲什么和影响方向，没有正文证据时要明确说明；secSummary 说明 SEC 文件为什么重要，没有文件时要明确说明；socialReason 说明为什么被热议，没有有效样本时要明确说明；investmentAngle 只给非个性化观察和核验动作；validationSteps/riskNotes 必须是至少含一项的字符串数组。\n\n材料：${JSON.stringify(batch)}`;
+      const batchResult = await retryOperation(
+        `LLM 单股摘要第 ${batchIndex}/${batchCount} 批`,
+        async () => {
+          const result = await callConfiguredLlm(system, user, llmProvider, {
+            task: "stock-narrative",
+            timeoutMs: STOCK_NARRATIVE_LLM_TIMEOUT_MS,
+            retryAttempts: 1,
+            bypassCooldown: true,
+            suppressFailureCooldown: true,
+          });
+          const parsedRows = extractJsonArray(result.text);
+          const expected = new Set(batch.map((item) => item.ticker));
+          const actual = new Set(parsedRows.map((item) => safeTicker(item?.ticker)).filter((ticker) => expected.has(ticker)));
+          const missing = [...expected].filter((ticker) => !actual.has(ticker));
+          if (missing.length) throw new Error(`本批缺少 ticker：${missing.join("、")}`);
+          return { result, parsedRows };
+        },
+        {
+          attempts: 3,
+          attemptTimeoutMs: STOCK_NARRATIVE_LLM_TIMEOUT_MS,
+          baseDelayMs: Number(process.env.EXTERNAL_RETRY_DELAY_MS || 800),
+        },
+      );
+      providers.add(batchResult.result.provider);
+      rows.push(...batchResult.parsedRows);
+    }
+    return mergeStockNarratives(base, rows, [...providers].join(", "));
   } catch (error) {
-    return {
-      ...base,
-      llmError: error.message,
-      items: base.items.map((item) => ({
-        ...item,
-        riskNotes: [...(item.riskNotes || []), `LLM 单股摘要失败，已使用本地兜底：${error.message}`].slice(0, 4),
-      })),
-    };
+    throw new Error(`LLM 单股摘要失败，已完成重试且不会使用本地模板降级：${errorZh(error.message)}`, { cause: error });
   }
 }
 
@@ -37357,6 +37717,22 @@ function codexCliArgs(system, user, model, outputFile) {
   return resolved;
 }
 
+const activeCliChildren = new Set();
+
+function trackCliChild(child) {
+  if (!child) return child;
+  activeCliChildren.add(child);
+  const forget = () => activeCliChildren.delete(child);
+  child.once("close", forget);
+  child.once("error", forget);
+  return child;
+}
+
+function terminateActiveCliChildren() {
+  for (const child of activeCliChildren) killProcessTree(child, "SIGTERM");
+  activeCliChildren.clear();
+}
+
 function killProcessTree(child, signal = "SIGTERM") {
   if (!child?.pid) return;
   try {
@@ -37372,6 +37748,52 @@ function killProcessTree(child, signal = "SIGTERM") {
 
 function isConnectionClosedError(error) {
   return ["EPIPE", "ECONNRESET", "ERR_STREAM_DESTROYED"].includes(error?.code);
+}
+
+function isolatedLlmCliEnv(extra = {}) {
+  const allowed = [
+    "PATH",
+    "HOME",
+    "USER",
+    "LOGNAME",
+    "SHELL",
+    "TMPDIR",
+    "TMP",
+    "TEMP",
+    "LANG",
+    "LC_ALL",
+    "HTTP_PROXY",
+    "HTTPS_PROXY",
+    "ALL_PROXY",
+    "NO_PROXY",
+    "http_proxy",
+    "https_proxy",
+    "all_proxy",
+    "no_proxy",
+    "SSL_CERT_FILE",
+    "SSL_CERT_DIR",
+    "NODE_EXTRA_CA_CERTS",
+    "XDG_CONFIG_HOME",
+    "XDG_CACHE_HOME",
+    "XDG_DATA_HOME",
+    "CODEX_HOME",
+    "GEMINI_CLI_HOME",
+    "ANTIGRAVITY_HOME",
+    "AGY_CONFIG_HOME",
+    "GOOGLE_APPLICATION_CREDENTIALS",
+    "GOOGLE_CLOUD_PROJECT",
+    "GOOGLE_CLOUD_LOCATION",
+  ];
+  const env = {};
+  for (const key of allowed) {
+    if (process.env[key] !== undefined) env[key] = process.env[key];
+  }
+  return {
+    ...env,
+    NO_COLOR: "1",
+    TERM: process.env.TERM && process.env.TERM !== "dumb" ? process.env.TERM : "xterm-256color",
+    ...extra,
+  };
 }
 
 function geminiCliEffectiveAuthType() {
@@ -37430,12 +37852,9 @@ async function callGemini(system, user, task = resolveLlmTask({}, user)) {
 
 function geminiCliEnv() {
   const authType = geminiCliEffectiveAuthType();
-  const env = {
-    ...process.env,
+  const env = isolatedLlmCliEnv({
     GEMINI_CLI_TRUST_WORKSPACE: "true",
-    NO_COLOR: "1",
-    TERM: process.env.TERM && process.env.TERM !== "dumb" ? process.env.TERM : "xterm-256color",
-  };
+  });
   if (GEMINI_CLI_HOME_DIR) {
     try {
       mkdirSync(path.join(GEMINI_CLI_HOME_DIR, ".gemini"), { recursive: true });
@@ -37450,6 +37869,7 @@ function geminiCliEnv() {
     delete env.GOOGLE_API_KEY;
   }
   if (authType === "gemini-api-key") {
+    if (GEMINI_CLI_INHERIT_API_KEY && process.env.GEMINI_API_KEY) env.GEMINI_API_KEY = process.env.GEMINI_API_KEY;
     delete env.GOOGLE_GENAI_USE_VERTEXAI;
     delete env.GOOGLE_GENAI_USE_GCA;
   } else if (authType === "vertex-ai") {
@@ -37516,7 +37936,7 @@ async function callGeminiCli(system, user, task = resolveLlmTask({}, user)) {
       finish(reject, timeoutError());
     }, timeoutMs);
 
-    child = spawn(GEMINI_CLI_COMMAND, args, {
+    child = trackCliChild(spawn(GEMINI_CLI_COMMAND, args, {
       cwd: os.tmpdir(),
       env: geminiCliEnv(),
       shell: false,
@@ -37525,7 +37945,7 @@ async function callGeminiCli(system, user, task = resolveLlmTask({}, user)) {
       killSignal: "SIGTERM",
       signal: controller.signal,
       stdio: ["pipe", "pipe", "pipe"],
-    });
+    }));
 
     child.stdout.on("data", (chunk) => {
       stdout += chunk.toString();
@@ -37623,20 +38043,16 @@ async function callAntigravityCli(system, user, task = resolveLlmTask({}, user))
       finish(reject, timeoutError());
     }, timeoutMs);
 
-    child = spawn(ANTIGRAVITY_CLI_COMMAND, args, {
+    child = trackCliChild(spawn(ANTIGRAVITY_CLI_COMMAND, args, {
       cwd: os.tmpdir(),
-      env: {
-        ...process.env,
-        NO_COLOR: "1",
-        TERM: process.env.TERM && process.env.TERM !== "dumb" ? process.env.TERM : "xterm-256color",
-      },
+      env: isolatedLlmCliEnv(),
       shell: false,
       detached: true,
       timeout: timeoutMs,
       killSignal: "SIGTERM",
       signal: controller.signal,
       stdio: ["pipe", "pipe", "pipe"],
-    });
+    }));
 
     child.stdout.on("data", (chunk) => {
       stdout += chunk.toString();
@@ -37754,20 +38170,16 @@ async function callCodexCli(system, user, task = resolveLlmTask({}, user)) {
       finish(reject, timeoutError());
     }, timeoutMs);
 
-    child = spawn(CODEX_CLI_COMMAND, args, {
+    child = trackCliChild(spawn(CODEX_CLI_COMMAND, args, {
       cwd: os.tmpdir(),
-      env: {
-        ...process.env,
-        NO_COLOR: "1",
-        TERM: process.env.TERM && process.env.TERM !== "dumb" ? process.env.TERM : "xterm-256color",
-      },
+      env: isolatedLlmCliEnv(),
       shell: false,
       detached: true,
       timeout: timeoutMs,
       killSignal: "SIGTERM",
       signal: controller.signal,
       stdio: ["pipe", "pipe", "pipe"],
-    });
+    }));
 
     child.stdout.on("data", (chunk) => {
       stdout += chunk.toString();
@@ -37894,25 +38306,10 @@ async function callConfiguredLlm(system, user, preference = LLM_PROVIDER, option
         text,
       };
     } catch (error) {
-      if (isGeminiCliEligibilityError(error) && process.env.GEMINI_API_KEY) {
-        try {
-          const apiModel = geminiApiModelForTask(task);
-          const text = await withExternalRetries(
-            `Gemini API fallback ${apiModel} ${task.tier}`,
-            () => callGemini(system, user, task),
-            { attempts: options.retryAttempts || EXTERNAL_RETRY_ATTEMPTS },
-          );
-          recordLlmSuccess("gemini", task);
-          return {
-            provider: `gemini:${apiModel}:${task.tier}:cli-fallback`,
-            text,
-          };
-        } catch (fallbackError) {
-          if (!options.suppressFailureCooldown) recordLlmFailure(provider, task, error);
-          throw new Error(`Gemini CLI 不再支持当前账号层级，且 Gemini API fallback 失败：${errorZh(fallbackError.message)}`);
-        }
-      }
       if (!options.suppressFailureCooldown) recordLlmFailure(provider, task, error);
+      if (isGeminiCliEligibilityError(error)) {
+        throw new Error(`Gemini CLI 当前账号层级不可用；系统不会切换到其他 provider 降级。原始错误：${errorZh(error.message)}`);
+      }
       throw error;
     }
   }
@@ -37972,14 +38369,7 @@ async function analyzeWithLlmOrLocal(payload) {
   const llmProvider = normalizeLlmProvider(payload.llmProvider);
   const missingMessage = missingLlmMessage(llmProvider);
   if (!activeLlmProvider(llmProvider)) {
-    if (missingMessage) {
-      return {
-        ...local,
-        llmError: missingMessage,
-        risks: [...local.risks, `LLM 未执行：${missingMessage}`],
-      };
-    }
-    return local;
+    throw new Error(missingMessage || `主报告要求 ${llmProvider}，系统不会使用本地规则摘要降级。`);
   }
   const items = [...payload.news, ...payload.filings, ...payload.videos, ...(payload.socialPosts || [])].sort(
     (a, b) => newsPublishedTimeValue(b) - newsPublishedTimeValue(a),
@@ -37993,12 +38383,6 @@ async function analyzeWithLlmOrLocal(payload) {
   )}\n\n本地规则雷达：${JSON.stringify(local, null, 2)}\n\n材料：\n${compactMaterials(
     items,
   )}\n\n${reportShape}`;
-  const fallbackUser = `主模型响应较慢。请用更简洁但完整的方式生成${payload.session}简报。关注列表：${payload.tickers.join(
-    ", ",
-  )}\n\n本地规则雷达：${JSON.stringify(local, null, 2)}\n\n优先材料：\n${compactMaterials(
-    items,
-    28,
-  )}\n\n${reportShape}`;
   try {
     const result = await callConfiguredLlm(system, user, llmProvider, {
       task: "full-report",
@@ -38006,28 +38390,7 @@ async function analyzeWithLlmOrLocal(payload) {
     });
     return { ...local, provider: result.provider, llmText: result.text };
   } catch (error) {
-    try {
-      const result = await callConfiguredLlm(system, fallbackUser, llmProvider, {
-        task: "fallback-summary",
-        timeoutMs: payload.llmFallbackTimeoutMs || LLM_FULL_REPORT_FALLBACK_TIMEOUT_MS,
-        bypassCooldown: true,
-      });
-      return {
-        ...local,
-        provider: `${result.provider}:fallback`,
-        llmText: result.text,
-        llmError: `主报告 LLM 调用失败，已用标准模型降级生成：${error.message}`,
-        risks: [...local.risks, `主报告 LLM 调用失败，已用标准模型降级生成：${error.message}`],
-      };
-    } catch (fallbackError) {
-      const message = `主模型失败：${error.message}；降级模型也失败：${fallbackError.message}`;
-      return {
-        ...local,
-        provider: "local-rule-analyzer",
-        llmError: message,
-        risks: [...local.risks, `LLM 调用失败，已退回本地分析：${message}`],
-      };
-    }
+    throw new Error(`主报告 LLM 调用失败，已完成重试且不会切换模型或退回本地摘要：${errorZh(error.message)}`, { cause: error });
   }
 }
 
@@ -38203,6 +38566,9 @@ async function runCollection(session = "manual", trigger = "manual", options = {
         combinedSocialPosts,
         socialHeatCatalystWebResult.evidenceByTicker || {},
       );
+      markRunStage("article-cache", "正在保存已验证的新闻正文与 AI 摘要缓存。");
+      pruneArticleCache(db.articleCache);
+      await saveStore(db);
       const mergedFundamentals = mergeFundamentals(
         fundamentalResult.fundamentals || [],
         [
@@ -38342,6 +38708,11 @@ async function runCollection(session = "manual", trigger = "manual", options = {
         microstructureResult,
         industryRankResult,
       ];
+      const collectorReadiness = buildDataQuality(collectorResults, errors, customFeeds, sourceControls);
+      if (collectorReadiness.readiness?.status === "blocked") {
+        const detail = (collectorReadiness.readiness.limitations || []).join("、") || "核心采集源缺少可用数据";
+        throw new Error(`核心数据源连续重试后仍不可用，本轮报告已停止且不会降级生成：${detail}`);
+      }
       markRunStage("localize", "正在把报告条目整理为中文展示文案。");
       const localizationResult = await localizeItemsForDisplay(
         {
@@ -38361,7 +38732,15 @@ async function runCollection(session = "manual", trigger = "manual", options = {
         companyMap: relevanceCompanyMap,
       });
       const localizedForAnalysis = { ...localized, news: localizedNews };
-      const hotNewsSummary = await rankImportantNewsWithLlm(localizedNews, llmProvider);
+      const llmSummarizedNews = uniqBy(
+        localizedNews.filter((item) => item.article?.status === "ok" && item.article?.llmBased && item.catalyst?.llmBased),
+        newsDedupeKey,
+      );
+      const requiredLlmNews = Math.min(10, Math.max(1, ARTICLE_LLM_SUMMARY_LIMIT));
+      if (llmSummarizedNews.length < requiredLlmNews) {
+        throw new Error(`新闻正文 AI 摘要只有 ${llmSummarizedNews.length} 条，低于主报告要求的 ${requiredLlmNews} 条；本轮不会用标题或规则摘要补位。`);
+      }
+      const hotNewsSummary = await rankImportantNewsWithLlm(llmSummarizedNews, llmProvider, mergedFundamentals);
       const dataQuality = buildDataQuality(collectorResults, errors, customFeeds, sourceControls);
       const portfolioRisk = calculatePortfolioRisk(
         portfolio,
@@ -38521,7 +38900,7 @@ async function runCollection(session = "manual", trigger = "manual", options = {
 }
 
 async function maybeRunSchedule() {
-  const db = await ensureStore();
+  let db = await ensureStore();
   let due = dueScheduleCandidate(new Date(), db.scheduleLog);
   let trigger = "schedule";
   if (!due) {
@@ -38544,7 +38923,21 @@ async function maybeRunSchedule() {
   }
   if (!due) return;
   if (due.job.id === "agent") {
-    await runAllStockAgentForRun(db, latestRun(db), trigger, { scheduleKey: due.key });
+    const postKey = `${due.newYorkDate}:post`;
+    let postRunId = db.scheduleLog?.[postKey] || "";
+    let sourceRun = (db.runs || []).find((item) => item.id === postRunId && item.session === "post") || null;
+    if (!sourceRun) {
+      sourceRun = await runCollection("post", "catch-up", {
+        llmProvider: SCHEDULE_LLM_PROVIDER,
+        scheduleKey: postKey,
+      });
+      db = await ensureStore();
+      postRunId = db.scheduleLog?.[postKey] || "";
+    }
+    if (!sourceRun || sourceRun.id !== postRunId || sourceRun.session !== "post") {
+      throw new Error(`${due.newYorkDate} 盘后报告尚未完整落库，候选池 Agent 不会使用旧报告降级运行；请重试盘后采集。`);
+    }
+    await runAllStockAgentForRun(db, sourceRun, trigger, { scheduleKey: due.key });
     return;
   }
   await runCollection(due.job.id, trigger, { llmProvider: SCHEDULE_LLM_PROVIDER, scheduleKey: due.key });
@@ -38948,26 +39341,75 @@ function newsItemForClient(item) {
   };
 }
 
+function hotNewsSubjectCandidates(fundamentals = []) {
+  const byTicker = new Map();
+  const add = (ticker, name, aliases = []) => {
+    const symbol = safeTicker(ticker);
+    if (!symbol) return;
+    const current = byTicker.get(symbol) || { ticker: symbol, name: "", aliases: [] };
+    if (!current.name && normalizeDisplayText(name)) current.name = normalizeDisplayText(name);
+    current.aliases = [...new Set([
+      ...current.aliases,
+      ...(aliases || []).map(normalizeDisplayText).filter(Boolean),
+    ])];
+    byTicker.set(symbol, current);
+  };
+  for (const [ticker, profile] of Object.entries(KNOWN_EQUITY_PROFILES)) {
+    add(ticker, profile.name, [
+      ...(ARTICLE_TICKER_ALIASES[ticker] || []),
+      ...(TICKER_CHINESE_NAMES[ticker] || "").split("/"),
+    ]);
+  }
+  for (const row of fundamentals || []) {
+    add(row.ticker, row.name || row.companyName, ARTICLE_TICKER_ALIASES[safeTicker(row.ticker)] || []);
+  }
+  return [...byTicker.values()];
+}
+
+function retagHotNewsToHeadlineSubject(item = {}, fundamentals = []) {
+  const inferred = inferHeadlineSubjectTicker(item, hotNewsSubjectCandidates(fundamentals));
+  const currentTicker = safeTicker(item.ticker);
+  if (!inferred?.ticker || inferred.ticker === currentTicker) return item;
+  return {
+    ...item,
+    ticker: inferred.ticker,
+    relatedTickers: [...new Set([inferred.ticker, ...(item.relatedTickers || []).map(safeTicker).filter(Boolean)])],
+    newsRelevance: null,
+    relevanceCategory: "",
+    relevanceLabel: "",
+    relevanceConfidence: null,
+    subjectAttribution: {
+      ...inferred,
+      originalTicker: currentTicker || null,
+    },
+  };
+}
+
+function hotNewsOwnershipEligible(item, fundamentals = [], referenceMs = Date.now()) {
+  const maxAgeMs = GLOBAL_MARKET_NEWS_MAX_AGE_HOURS * 60 * 60 * 1000;
+  const publishedMs = newsPublishedTimeValue(item);
+  if (!publishedMs || !Number.isFinite(referenceMs)) return false;
+  const ageMs = referenceMs - publishedMs;
+  if (ageMs > maxAgeMs || ageMs < -6 * 60 * 60 * 1000) return false;
+  const ticker = safeTicker(item.ticker);
+  if (!ticker || ticker === "MARKET") {
+    const rawTitle = `${item.title || ""} ${item.titleZh || ""} ${item.article?.title || ""}`;
+    return /stock market|market today|wall street|nasdaq|s&p|dow jones|nikkei|kospi|hang seng|fed|fomc|inflation|treasury|yield|股市|大盘|纳斯达克|标普|道琼斯|日经|恒生|美联储|通胀|收益率/i.test(rawTitle);
+  }
+  const fundamental = (fundamentals || []).find((row) => safeTicker(row.ticker) === ticker) || {};
+  const ownership = semanticOwnershipForMaterial(item, ticker, fundamental);
+  const profile = knownEquityProfile(ticker) || fundamental;
+  const isMarketInstrument = /ETF|指数|基金/i.test(`${profile?.industry || ""} ${profile?.mainBusiness || ""}`);
+  return ownership.category === "direct_company" || (isMarketInstrument && ownership.category === "macro_market");
+}
+
 function hotNewsForClient(hotNews, run = {}) {
   if (!hotNews?.items) return hotNews;
   const referenceMs = new Date(run.completedAt || Date.now()).getTime();
-  const maxAgeMs = GLOBAL_MARKET_NEWS_MAX_AGE_HOURS * 60 * 60 * 1000;
-  const eligibleItems = hotNews.items.filter((item) => {
-    const publishedMs = newsPublishedTimeValue(item);
-    if (!publishedMs || !Number.isFinite(referenceMs)) return false;
-    const ageMs = referenceMs - publishedMs;
-    if (ageMs > maxAgeMs || ageMs < -6 * 60 * 60 * 1000) return false;
-    const ticker = safeTicker(item.ticker);
-    if (!ticker || ticker === "MARKET") {
-      const rawTitle = `${item.title || ""} ${item.titleZh || ""} ${item.article?.title || ""}`;
-      return /stock market|market today|wall street|nasdaq|s&p|dow jones|nikkei|kospi|hang seng|fed|fomc|inflation|treasury|yield|股市|大盘|纳斯达克|标普|道琼斯|日经|恒生|美联储|通胀|收益率/i.test(rawTitle);
-    }
-    const fundamental = (run.fundamentals || []).find((row) => safeTicker(row.ticker) === ticker) || {};
-    const ownership = semanticOwnershipForMaterial(item, ticker, fundamental);
-    const profile = knownEquityProfile(ticker) || fundamental;
-    const isMarketInstrument = /ETF|指数|基金/i.test(`${profile?.industry || ""} ${profile?.mainBusiness || ""}`);
-    return ownership.category === "direct_company" || (isMarketInstrument && ownership.category === "macro_market");
-  });
+  const eligibleItems = hotNews.items
+    .map((item) => retagHotNewsToHeadlineSubject(item, run.fundamentals || []))
+    .filter((item) => hotNewsOwnershipEligible(item, run.fundamentals || [], referenceMs));
+  const strictLlmRanked = Boolean(hotNews.filter?.llmRanked);
   const displayItems = eligibleItems.map((item) => {
     const normalized = newsItemForClient(item);
     const rawText = `${normalized.title || ""} ${normalized.article?.title || ""}`;
@@ -38981,13 +39423,14 @@ function hotNewsForClient(hotNews, run = {}) {
     ]);
     const derivedText = `${normalized.summaryZh || ""} ${normalized.article?.summaryZh || ""} ${normalized.article?.investmentView || ""} ${normalized.catalyst?.summary || ""}`;
     const staleAiCatalyst =
+      !strictLlmRanked &&
       !rawHasHardAiSignal &&
       (
         (normalized.catalyst?.themes || []).includes("AI/芯片/数据中心") ||
         /AI\/芯片|AI\/数据中心|AI 相关|AI\/云\/芯片/.test(derivedText)
       );
     const displayCatalyst =
-      staleAiCatalyst || normalized.catalyst?.lowSignal
+      !strictLlmRanked && (staleAiCatalyst || normalized.catalyst?.lowSignal)
         ? analyzeHeadlineCatalyst({ ...normalized, summary: "", summaryZh: "", catalyst: null })
         : normalized.catalyst;
     const displayItem = {
@@ -39035,7 +39478,10 @@ function hotNewsForClient(hotNews, run = {}) {
       effectiveScore: Number.isFinite(result.effectiveScore) ? result.effectiveScore : hotNewsEffectiveScore(result),
     };
   });
-  const items = selectEffectiveHotNews(displayItems, HOT_NEWS_DISPLAY_LIMIT).map(withHotNewsCategory);
+  const items = (strictLlmRanked
+    ? displayItems.slice(0, HOT_NEWS_DISPLAY_LIMIT)
+    : selectEffectiveHotNews(displayItems, HOT_NEWS_DISPLAY_LIMIT)
+  ).map(withHotNewsCategory);
   return {
     ...hotNews,
     marketSummaryZh: cleanHotNewsText(hotNews.marketSummaryZh || ""),
@@ -39455,7 +39901,8 @@ function configForClient(db) {
       },
       stockNarrative: {
         timeoutMs: STOCK_NARRATIVE_LLM_TIMEOUT_MS,
-        fallback: "local-stock-narrative",
+        batchSize: STOCK_NARRATIVE_BATCH_SIZE,
+        failurePolicy: "三次重试后明确失败，不使用本地模板降级",
       },
     },
     ibkr: {
@@ -42653,7 +43100,22 @@ const server = http.createServer(async (req, res) => {
     }
   });
   try {
+    if (!requestHostIsAllowed(req)) {
+      return sendJson(res, { error: "请求 Host 不在允许列表中。" }, 403);
+    }
     const url = new URL(req.url, `http://${req.headers.host}`);
+    if (url.pathname.startsWith("/api/") && !requestOriginIsAllowed(req)) {
+      return sendJson(res, { error: "跨站 API 请求已被拒绝。" }, 403);
+    }
+    const mutating = ["POST", "PUT", "PATCH", "DELETE"].includes(req.method || "");
+    if (url.pathname.startsWith("/api/") && mutating && !isLoopbackHost(HOST) && !requestAdminTokenIsValid(req)) {
+      return sendJson(res, { error: "非本地写操作需要 ADMIN_API_TOKEN。" }, 401);
+    }
+    const contentLength = Number(req.headers["content-length"] || 0);
+    const contentType = String(req.headers["content-type"] || "").toLowerCase();
+    if (url.pathname.startsWith("/api/") && mutating && contentLength > 0 && !contentType.startsWith("application/json")) {
+      return sendJson(res, { error: "API 写请求必须使用 application/json。" }, 415);
+    }
     if (url.pathname.slice(0, 5) === "/api/" && requestContentLengthExceedsLimit(req, MAX_REQUEST_BODY_BYTES)) {
       return sendJson(res, { error: `请求体超过上限 ${MAX_REQUEST_BODY_BYTES} 字节。` }, 413);
     }
@@ -42704,6 +43166,9 @@ await refreshDriveArchiveStatus(bootDb).catch((error) => {
   };
 });
 await setupServerLock(bootDb);
+if (!isLoopbackHost(HOST) && !ADMIN_API_TOKEN) {
+  throw new Error("HOST 绑定到非本地地址时必须配置 ADMIN_API_TOKEN；服务已拒绝启动。请勿在无认证状态下暴露管理 API。");
+}
 server.listen(PORT, HOST, () => {
   const url = `http://${HOST === "0.0.0.0" ? "localhost" : HOST}:${PORT}`;
   console.log(`Market Pulse AI running at ${url}`);

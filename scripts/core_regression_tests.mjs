@@ -14,7 +14,9 @@ import {
 import {
   addNyseTradingDays,
   calculateOptionFifoLots,
+  inferHeadlineSubjectTicker,
   isNyseTradingDay,
+  nyseSessionCloseAt,
   nyseSessionForYmdRuleBased,
   nyseSessionForYmd,
   scoreFredMacroRegime,
@@ -132,7 +134,11 @@ try {
     migrateLegacy: true,
   });
   assert.equal(fs.existsSync(legacyBackupFile), true, "Legacy store should be renamed only after section files are written");
-  assert.equal(fs.existsSync(path.join(storeDir, "runs.json")), true, "Runs section should be written");
+  assert.equal(
+    fs.existsSync(path.join(storeDir, "_generations", firstWrite.generation, "runs.json")),
+    true,
+    "Runs section should be written into the committed generation",
+  );
   const loaded = await readSectionedStore(storeDir);
   assert.deepEqual(loaded.store, legacyStore, "Sectioned store cold load should reconstruct the legacy payload");
 
@@ -153,8 +159,11 @@ try {
   const partialDir = path.join(sectionedStoreTmp, "partial-store");
   fs.mkdirSync(partialDir, { recursive: true });
   fs.writeFileSync(path.join(partialDir, "alerts.json"), JSON.stringify([{ id: "a1" }]), "utf8");
-  const partial = await readSectionedStore(partialDir);
-  assert.deepEqual(partial.store, { alerts: [{ id: "a1" }] }, "Partial section writes should still leave a loadable store");
+  await assert.rejects(
+    readSectionedStore(partialDir),
+    (error) => /manifest|snapshot|section/i.test(error?.message || ""),
+    "A partial store without a complete manifest must fail instead of loading defaults",
+  );
 } finally {
   fs.rmSync(sectionedStoreTmp, { recursive: true, force: true });
 }
@@ -261,6 +270,30 @@ const direct = semanticNewsOwnership(
 );
 assert.equal(direct.category, "direct_company", "Company name hit should classify as direct company news");
 assert.equal(direct.mismatch, false, "Direct company news should not be marked mismatch");
+
+const broadcomHeadlineSubject = inferHeadlineSubjectTicker(
+  { title: "Broadcom Stock Forecast: $30B Apple Partnership Sparks Rally" },
+  [
+    { ticker: "AAPL", name: "Apple", aliases: ["苹果"] },
+    { ticker: "AVGO", name: "Broadcom", aliases: ["博通"] },
+  ],
+);
+assert.equal(
+  broadcomHeadlineSubject?.ticker,
+  "AVGO",
+  "A later Apple mention must not steal a headline whose leading subject is Broadcom",
+);
+const metaHeadlineSubject = inferHeadlineSubjectTicker(
+  {
+    article: { title: "关键事实：Meta计划在2026年扩建AI算力，通信ETF同步受关注" },
+    title: "Key facts: Meta expands AI compute while communication ETFs draw attention",
+  },
+  [
+    { ticker: "META", name: "Meta Platforms", aliases: ["Meta"] },
+    { ticker: "XLC", name: "Communication Services Select Sector SPDR Fund", aliases: ["通信ETF"] },
+  ],
+);
+assert.equal(metaHeadlineSubject?.ticker, "META", "The first named company should own the headline instead of a later ETF mention");
 
 const fifo = calculateOptionFifoLots([
   {
@@ -1423,6 +1456,21 @@ if (fs.existsSync(nyseReferencePath)) {
   assert.equal(nyseSessionForYmd("2026-07-03").source, "pandas-market-calendars-reference", "Generated NYSE reference calendar should win when present");
   assert.equal(isNyseTradingDay("2026-07-03"), false, "Generated NYSE reference calendar should mark observed Independence Day closed");
 }
+assert.equal(
+  nyseSessionCloseAt("2026-07-10")?.toISOString(),
+  "2026-07-10T20:00:00.000Z",
+  "NYSE summer close should resolve to 16:00 America/New_York",
+);
+assert.equal(
+  nyseSessionCloseAt("2026-01-05")?.toISOString(),
+  "2026-01-05T21:00:00.000Z",
+  "NYSE winter close should resolve to 16:00 America/New_York",
+);
+assert.equal(
+  nyseSessionCloseAt("2026-11-27")?.toISOString(),
+  "2026-11-27T18:00:00.000Z",
+  "NYSE half-day close should resolve to 13:00 America/New_York",
+);
 
 assert.equal(outcomeFromExcess(1.2, 0.5), "win", "Excess return above deadband should be win");
 assert.equal(marketNumberOrNull(null), null, "null must not be coerced into a numeric zero");
@@ -1448,6 +1496,34 @@ const normalOutcomeQuality = classifyOutcomeQuality({
   excessPct: 3,
 });
 assert.equal(normalOutcomeQuality.status, "ok", "Normal outcome should remain usable");
+const prematureOutcomeQuality = classifyOutcomeQuality({
+  decisionAt: "2026-07-09T20:30:00.000Z",
+  expectedDueAt: "2026-07-10T20:00:00.000Z",
+  exitPriceAt: "2026-07-10T12:00:00.000Z",
+  horizonDays: 1,
+  entryPrice: 100,
+  exitPrice: 100,
+  rawReturnPct: 0,
+  benchmarkReturnPct: 0,
+  excessPct: 0,
+});
+assert.equal(prematureOutcomeQuality.status, "suspect_timing", "A premarket T+1 snapshot must be quarantined until the target close");
+assert.equal(prematureOutcomeQuality.usable, false, "A premarket T+1 snapshot must not enter learning");
+assert.equal(
+  outcomeIsUsable({
+    decisionAt: "2026-07-09T20:30:00.000Z",
+    expectedDueAt: "2026-07-10T20:00:00.000Z",
+    exitPriceAt: "2026-07-10T20:01:00.000Z",
+    horizonDays: 1,
+    entryPrice: 100,
+    exitPrice: 102,
+    rawReturnPct: 2,
+    excessPct: 1,
+    outcomeQualityStatus: "ok",
+  }),
+  true,
+  "A snapshot after the required session close should remain usable",
+);
 assert.equal(
   outcomeIsUsable({ entryPrice: 100, exitPrice: 104, rawReturnPct: 4, benchmarkReturnPct: 1, excessPct: 3 }),
   true,

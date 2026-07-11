@@ -5,6 +5,7 @@ import argparse
 import hashlib
 import json
 import sqlite3
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -35,14 +36,46 @@ def clean_surrogates(value: str) -> str:
     return value.encode("utf-8", "replace").decode("utf-8")
 
 
+def canonical_hash(value: Any) -> str:
+    payload = json.dumps(value, ensure_ascii=False, separators=(",", ":"), sort_keys=True)
+    return sha256_text(payload)
+
+
+def utc_now() -> str:
+    return datetime.now(timezone.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z")
+
+
 def load_json(path: Path) -> dict[str, Any]:
     with path.open("r", encoding="utf-8") as f:
         payload = json.load(f)
     return payload if isinstance(payload, dict) else {}
 
 
+def run_updated_at(run: dict[str, Any]) -> str:
+    return text(
+        run.get("updatedAt")
+        or run.get("revisedAt")
+        or run.get("modifiedAt")
+        or run.get("completedAt")
+        or run.get("generatedAt")
+        or run.get("startedAt")
+        or run.get("id")
+    )
+
+
 def run_watermark(run: dict[str, Any]) -> str:
-    return text(run.get("completedAt") or run.get("generatedAt") or run.get("startedAt") or run.get("id"))
+    return run_updated_at(run)
+
+
+def run_declared_revision(run: dict[str, Any]) -> int:
+    for key in ("storageRevision", "revision"):
+        try:
+            value = int(run.get(key) or 0)
+        except (TypeError, ValueError):
+            continue
+        if value > 0:
+            return value
+    return 0
 
 
 def run_after_since(run: dict[str, Any], since: str = "") -> bool:
@@ -250,6 +283,9 @@ def init_schema(conn: sqlite3.Connection) -> None:
           trigger TEXT,
           started_at TEXT,
           completed_at TEXT,
+          updated_at TEXT,
+          revision INTEGER NOT NULL DEFAULT 1,
+          content_hash TEXT,
           summary_only INTEGER DEFAULT 0,
           news_count INTEGER DEFAULT 0,
           social_posts_count INTEGER DEFAULT 0,
@@ -260,6 +296,19 @@ def init_schema(conn: sqlite3.Connection) -> None:
           slim_json TEXT,
           row_count_checksum TEXT,
           spot_hash TEXT
+        );
+
+        CREATE TABLE IF NOT EXISTS run_revisions (
+          run_id TEXT NOT NULL,
+          revision INTEGER NOT NULL,
+          updated_at TEXT,
+          completed_at TEXT,
+          content_hash TEXT NOT NULL,
+          mirrored_at TEXT NOT NULL,
+          summary_json TEXT NOT NULL,
+          full_json TEXT NOT NULL,
+          slim_json TEXT,
+          PRIMARY KEY (run_id, revision)
         );
 
         CREATE TABLE IF NOT EXISTS article_cache (
@@ -511,6 +560,7 @@ def init_schema(conn: sqlite3.Connection) -> None:
         );
 
         CREATE INDEX IF NOT EXISTS idx_runs_completed_at ON runs(completed_at DESC);
+        CREATE INDEX IF NOT EXISTS idx_run_revisions_hash ON run_revisions(run_id, content_hash);
         CREATE INDEX IF NOT EXISTS idx_stock_history_ticker_time ON stock_history(ticker, captured_at DESC);
         CREATE INDEX IF NOT EXISTS idx_social_posts_ticker_time ON social_posts(ticker, published_at DESC);
         CREATE INDEX IF NOT EXISTS idx_article_cache_ticker ON article_cache(ticker);
@@ -535,18 +585,120 @@ def init_schema(conn: sqlite3.Connection) -> None:
     ensure_column(conn, "runs", "slim_json", "TEXT")
     ensure_column(conn, "runs", "row_count_checksum", "TEXT")
     ensure_column(conn, "runs", "spot_hash", "TEXT")
+    ensure_column(conn, "runs", "updated_at", "TEXT")
+    ensure_column(conn, "runs", "revision", "INTEGER DEFAULT 1")
+    ensure_column(conn, "runs", "content_hash", "TEXT")
     ensure_column(conn, "recommendation_decisions", "strategy_version", "TEXT")
     ensure_column(conn, "recommendation_decisions", "regime", "TEXT")
     ensure_column(conn, "recommendation_decisions", "evidence_refs", "TEXT")
     ensure_column(conn, "recommendation_outcomes", "regime", "TEXT")
     ensure_column(conn, "recommendation_outcomes", "outcome_quality_status", "TEXT")
     ensure_column(conn, "factor_stats", "regime", "TEXT")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_runs_updated_at ON runs(updated_at DESC)")
+    backfill_run_revision_state(conn)
+    conn.commit()
+
+
+def parse_json_object(value: Any) -> dict[str, Any]:
+    if isinstance(value, dict):
+        return value
+    try:
+        parsed = json.loads(text(value))
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return {}
+    return parsed if isinstance(parsed, dict) else {}
+
+
+def backfill_run_revision_state(conn: sqlite3.Connection) -> None:
+    rows = conn.execute(
+        """
+        SELECT id, completed_at, updated_at, revision, content_hash,
+               summary_json, full_json, slim_json
+        FROM runs
+        """
+    ).fetchall()
+    mirrored_at = utc_now()
+    for row in rows:
+        run_id, completed_at, updated_at, revision, content_hash, summary_json, full_json, slim_json = row
+        payload = parse_json_object(full_json)
+        normalized_hash = text(content_hash) or (canonical_hash(payload) if payload else sha256_text(text(full_json)))
+        normalized_updated_at = text(updated_at) or run_updated_at(payload) or text(completed_at)
+        try:
+            normalized_revision = max(1, int(revision or run_declared_revision(payload) or 1))
+        except (TypeError, ValueError):
+            normalized_revision = 1
+        conn.execute(
+            "UPDATE runs SET updated_at=?, revision=?, content_hash=? WHERE id=?",
+            (normalized_updated_at, normalized_revision, normalized_hash, text(run_id)),
+        )
+        conn.execute(
+            """
+            INSERT OR IGNORE INTO run_revisions(
+              run_id, revision, updated_at, completed_at, content_hash,
+              mirrored_at, summary_json, full_json, slim_json
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                text(run_id),
+                normalized_revision,
+                normalized_updated_at,
+                text(completed_at),
+                normalized_hash,
+                mirrored_at,
+                text(summary_json) or "{}",
+                text(full_json) or "{}",
+                text(slim_json),
+            ),
+        )
+
+
+def changed_run_candidates(
+    conn: sqlite3.Connection,
+    store: dict[str, Any],
+) -> tuple[list[dict[str, Any]], dict[str, dict[str, Any]]]:
+    current = {
+        text(row[0]): {
+            "revision": int(row[1] or 0),
+            "updatedAt": text(row[2]),
+            "contentHash": text(row[3]),
+        }
+        for row in conn.execute("SELECT id, revision, updated_at, content_hash FROM runs").fetchall()
+    }
+    candidates: list[dict[str, Any]] = []
+    states: dict[str, dict[str, Any]] = {}
+    for run in store.get("runs") or []:
+        if not isinstance(run, dict) or not run.get("id"):
+            continue
+        run_id = text(run.get("id"))
+        content_hash = canonical_hash(run)
+        updated_at = run_updated_at(run)
+        previous = current.get(run_id)
+        declared_revision = run_declared_revision(run)
+        unchanged = bool(
+            previous
+            and previous["contentHash"] == content_hash
+            and declared_revision <= previous["revision"]
+            and (not updated_at or updated_at <= previous["updatedAt"])
+        )
+        if unchanged:
+            continue
+        previous_revision = previous["revision"] if previous else 0
+        revision = max(previous_revision + 1, declared_revision or 1)
+        candidates.append(run)
+        states[run_id] = {
+            "revision": revision,
+            "updatedAt": updated_at,
+            "contentHash": content_hash,
+            "mirroredAt": utc_now(),
+        }
+    return candidates, states
 
 
 def sync_store(conn: sqlite3.Connection, store: dict[str, Any], since: str = "") -> dict[str, int]:
     init_schema(conn)
     counts = {
         "runs": 0,
+        "runRevisions": 0,
         "articleCache": 0,
         "stockHistory": 0,
         "socialPosts": 0,
@@ -569,11 +721,16 @@ def sync_store(conn: sqlite3.Connection, store: dict[str, Any], since: str = "")
         "userPaperAcceptances": 0,
         "traderProfileSnapshots": 0,
     }
-    runs_to_sync = [run for run in store.get("runs") or [] if isinstance(run, dict) and run_after_since(run, since)]
     with conn:
+        conn.execute("BEGIN IMMEDIATE")
+        # A timestamp watermark remains useful for append-only side tables, but run snapshots
+        # are selected by durable revision/hash state so an older completed run can still evolve.
+        runs_to_sync, run_states = changed_run_candidates(conn, store)
         for run in runs_to_sync:
             if not isinstance(run, dict) or not run.get("id"):
                 continue
+            run_id = text(run.get("id"))
+            revision_state = run_states[run_id]
             summary = run_summary(run)
             slim = run_slim_json(run)
             row_count_checksum = sha256_text(dump(slim.get("counts") or {}))
@@ -581,15 +738,19 @@ def sync_store(conn: sqlite3.Connection, store: dict[str, Any], since: str = "")
             conn.execute(
                 """
                 INSERT INTO runs (
-                  id, session, trigger, started_at, completed_at, summary_only,
+                  id, session, trigger, started_at, completed_at, updated_at,
+                  revision, content_hash, summary_only,
                   news_count, social_posts_count, options_count, error_count,
                   summary_json, full_json, slim_json, row_count_checksum, spot_hash
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(id) DO UPDATE SET
                   session=excluded.session,
                   trigger=excluded.trigger,
                   started_at=excluded.started_at,
                   completed_at=excluded.completed_at,
+                  updated_at=excluded.updated_at,
+                  revision=excluded.revision,
+                  content_hash=excluded.content_hash,
                   summary_only=excluded.summary_only,
                   news_count=excluded.news_count,
                   social_posts_count=excluded.social_posts_count,
@@ -602,11 +763,14 @@ def sync_store(conn: sqlite3.Connection, store: dict[str, Any], since: str = "")
                   spot_hash=excluded.spot_hash
                 """,
                 (
-                    text(run.get("id")),
+                    run_id,
                     text(run.get("session")),
                     text(run.get("trigger")),
                     text(run.get("startedAt")),
                     text(run.get("completedAt")),
+                    revision_state["updatedAt"],
+                    revision_state["revision"],
+                    revision_state["contentHash"],
                     1 if run.get("summaryOnly") else 0,
                     int(summary.get("newsCount") or 0),
                     int(summary.get("socialPostsCount") or 0),
@@ -619,7 +783,27 @@ def sync_store(conn: sqlite3.Connection, store: dict[str, Any], since: str = "")
                     spot_hash,
                 ),
             )
+            conn.execute(
+                """
+                INSERT INTO run_revisions(
+                  run_id, revision, updated_at, completed_at, content_hash,
+                  mirrored_at, summary_json, full_json, slim_json
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    run_id,
+                    revision_state["revision"],
+                    revision_state["updatedAt"],
+                    text(run.get("completedAt")),
+                    revision_state["contentHash"],
+                    revision_state["mirroredAt"],
+                    dump(summary),
+                    dump(run),
+                    dump(slim),
+                ),
+            )
             counts["runs"] += 1
+            counts["runRevisions"] += 1
 
             news_rows: dict[str, dict[str, Any]] = {}
             for source_key in ["news", "filings"]:
@@ -1433,6 +1617,7 @@ def status(conn: sqlite3.Connection) -> dict[str, Any]:
     tables = {}
     for table in [
         "runs",
+        "run_revisions",
         "article_cache",
         "stock_history",
         "social_posts",
@@ -1456,10 +1641,23 @@ def status(conn: sqlite3.Connection) -> dict[str, Any]:
     ]:
         count = conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
         tables[table] = count
-    latest = conn.execute("SELECT id, completed_at FROM runs ORDER BY completed_at DESC LIMIT 1").fetchone()
+    latest = conn.execute(
+        """
+        SELECT id, completed_at, updated_at, revision, content_hash
+        FROM runs
+        ORDER BY COALESCE(NULLIF(updated_at, ''), completed_at) DESC
+        LIMIT 1
+        """
+    ).fetchone()
     return {
         "tables": tables,
-        "latestRun": {"id": latest[0], "completedAt": latest[1]} if latest else None,
+        "latestRun": {
+            "id": latest[0],
+            "completedAt": latest[1],
+            "updatedAt": latest[2],
+            "revision": latest[3],
+            "contentHash": latest[4],
+        } if latest else None,
     }
 
 

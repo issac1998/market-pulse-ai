@@ -251,8 +251,9 @@ async function api(path, options = {}) {
     ...options,
     headers: { "Content-Type": "application/json", ...(options.headers || {}) },
   });
-  const data = await response.json();
-  if (!response.ok) throw new Error(data.error || "请求失败");
+  const raw = response.status === 204 ? "" : await response.text();
+  const data = raw ? JSON.parse(raw) : null;
+  if (!response.ok) throw new Error(data?.error || `请求失败（HTTP ${response.status}）`);
   return data;
 }
 
@@ -320,11 +321,10 @@ function mergeDiagnosticRows(partialDiagnostics) {
 function sectionStatus(section) {
   const map = diagnosticMap();
   const rows = (section.diagnostics || []).map((key) => map.get(key)).filter(Boolean);
-  if (!rows.length) return "ok";
-  if (rows.some((row) => row.status === "ok")) return "ok";
+  if (!rows.length || rows.length < (section.diagnostics || []).length) return "warn";
   if (rows.some((row) => row.status === "fail")) return "fail";
   if (rows.some((row) => row.status === "warn" || row.status === "skipped")) return "warn";
-  return "warn";
+  return rows.every((row) => row.status === "ok") ? "ok" : "warn";
 }
 
 function diagnosticSummaryFor(keys = []) {
@@ -433,7 +433,7 @@ function renderIntegrationTasks() {
           </div>
           <span class="tag ${integrationTaskClass(item.status)}">${escapeHtml(item.statusLabel || item.label || item.status || "未知")}</span>
         </div>
-        ${item.fallback ? `<p><strong>当前兜底：</strong>${escapeHtml(shortText(item.fallback, 260))}</p>` : ""}
+        ${item.fallback ? `<p><strong>其他独立来源：</strong>${escapeHtml(shortText(item.fallback, 260))}</p>` : ""}
         ${item.nextAction ? `<p><strong>下一步：</strong>${escapeHtml(shortText(item.nextAction, 300))}</p>` : ""}
         ${
           env.length

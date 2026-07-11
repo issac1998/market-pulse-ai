@@ -1,9 +1,11 @@
 import unittest
+import os
 from tempfile import TemporaryDirectory
+from unittest.mock import patch
 
 from harness.agents.loader import load_agent
 from harness.invoker.agy_cli import _parse_agy_stdout
-from harness.invoker.base import LlmResult
+from harness.invoker.base import LlmResult, safe_subprocess_env
 from harness.invoker.codex_cli import CodexCliInvoker, _parse_codex_stdout
 from harness.invoker import build_invoker
 from harness.invoker.mock import MockInvoker
@@ -110,6 +112,23 @@ class HarnessSmokeTest(unittest.TestCase):
 
     def test_build_codex_invoker(self):
         self.assertIsInstance(build_invoker("codex-cli"), CodexCliInvoker)
+
+    def test_llm_subprocess_env_excludes_server_secrets(self):
+        with patch.dict(
+            os.environ,
+            {
+                "PATH": "/usr/bin",
+                "HTTPS_PROXY": "http://127.0.0.1:7890",
+                "FINNHUB_API_KEY": "do-not-inherit",
+                "RESEND_API_KEY": "do-not-inherit",
+            },
+            clear=True,
+        ):
+            env = safe_subprocess_env()
+        self.assertEqual(env["PATH"], "/usr/bin")
+        self.assertEqual(env["HTTPS_PROXY"], "http://127.0.0.1:7890")
+        self.assertNotIn("FINNHUB_API_KEY", env)
+        self.assertNotIn("RESEND_API_KEY", env)
 
     def test_force_final_after_max_steps_keeps_tool_evidence(self):
         class SequenceInvoker:

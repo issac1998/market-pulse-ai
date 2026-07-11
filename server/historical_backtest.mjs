@@ -150,7 +150,7 @@ function sqliteExec(dbPath, sql, timeoutMs = 60000) {
       }
       resolve(stdout);
     });
-    child.stdin.end(sql);
+    child.stdin.end(`.bail on\n${sql}`);
   });
 }
 
@@ -1108,7 +1108,33 @@ CREATE TABLE IF NOT EXISTS historical_backtest_outcomes (
 );
 CREATE INDEX IF NOT EXISTS idx_historical_backtest_outcomes_run_horizon
   ON historical_backtest_outcomes(run_id, horizon_days, decision_at);
-CREATE TABLE IF NOT EXISTS historical_decisions (
+CREATE TABLE IF NOT EXISTS historical_backtest_daily (
+  run_id TEXT NOT NULL,
+  date TEXT NOT NULL,
+  decisions INTEGER,
+  outcome_samples INTEGER,
+  avg_excess_pct REAL,
+  json TEXT NOT NULL,
+  PRIMARY KEY (run_id, date)
+);
+CREATE INDEX IF NOT EXISTS idx_historical_backtest_daily_run_date
+  ON historical_backtest_daily(run_id, date);
+CREATE TABLE IF NOT EXISTS historical_backtest_write_state (
+  run_id TEXT PRIMARY KEY,
+  write_id TEXT NOT NULL,
+  content_hash TEXT,
+  status TEXT NOT NULL,
+  expected_decisions INTEGER NOT NULL DEFAULT 0,
+  expected_outcomes INTEGER NOT NULL DEFAULT 0,
+  expected_daily INTEGER NOT NULL DEFAULT 0,
+  staged_decisions INTEGER NOT NULL DEFAULT 0,
+  staged_outcomes INTEGER NOT NULL DEFAULT 0,
+  staged_daily INTEGER NOT NULL DEFAULT 0,
+  updated_at TEXT NOT NULL,
+  error TEXT
+);
+CREATE TABLE IF NOT EXISTS historical_backtest_decisions_staging (
+  write_id TEXT NOT NULL,
   run_id TEXT NOT NULL,
   id TEXT NOT NULL,
   ticker TEXT,
@@ -1116,11 +1142,10 @@ CREATE TABLE IF NOT EXISTS historical_decisions (
   action_score REAL,
   alpha_score REAL,
   json TEXT NOT NULL,
-  PRIMARY KEY (run_id, id)
+  PRIMARY KEY (write_id, id)
 );
-CREATE INDEX IF NOT EXISTS idx_historical_decisions_run_signal
-  ON historical_decisions(run_id, signal_date, ticker);
-CREATE TABLE IF NOT EXISTS historical_outcomes (
+CREATE TABLE IF NOT EXISTS historical_backtest_outcomes_staging (
+  write_id TEXT NOT NULL,
   run_id TEXT NOT NULL,
   decision_id TEXT NOT NULL,
   ticker TEXT,
@@ -1135,22 +1160,219 @@ CREATE TABLE IF NOT EXISTS historical_outcomes (
   outcome_quality_status TEXT,
   regime TEXT,
   json TEXT NOT NULL,
-  PRIMARY KEY (run_id, decision_id, horizon_days)
+  PRIMARY KEY (write_id, decision_id, horizon_days)
 );
-CREATE INDEX IF NOT EXISTS idx_historical_outcomes_run_horizon
-  ON historical_outcomes(run_id, horizon_days, decision_at);
-CREATE TABLE IF NOT EXISTS historical_backtest_daily (
+CREATE TABLE IF NOT EXISTS historical_backtest_daily_staging (
+  write_id TEXT NOT NULL,
   run_id TEXT NOT NULL,
   date TEXT NOT NULL,
   decisions INTEGER,
   outcome_samples INTEGER,
   avg_excess_pct REAL,
   json TEXT NOT NULL,
-  PRIMARY KEY (run_id, date)
+  PRIMARY KEY (write_id, date)
 );
-CREATE INDEX IF NOT EXISTS idx_historical_backtest_daily_run_date
-  ON historical_backtest_daily(run_id, date);
+CREATE INDEX IF NOT EXISTS idx_historical_backtest_decisions_staging_write
+  ON historical_backtest_decisions_staging(write_id);
+CREATE INDEX IF NOT EXISTS idx_historical_backtest_outcomes_staging_write
+  ON historical_backtest_outcomes_staging(write_id);
+CREATE INDEX IF NOT EXISTS idx_historical_backtest_daily_staging_write
+  ON historical_backtest_daily_staging(write_id);
 `;
+}
+
+const HISTORICAL_DETAIL_COMPATIBILITY = [
+  {
+    legacy: "historical_decisions",
+    canonical: "historical_backtest_decisions",
+    columns: ["run_id", "id", "ticker", "signal_date", "action_score", "alpha_score", "json"],
+    keys: ["run_id", "id"],
+  },
+  {
+    legacy: "historical_outcomes",
+    canonical: "historical_backtest_outcomes",
+    columns: [
+      "run_id",
+      "decision_id",
+      "ticker",
+      "horizon_days",
+      "decision_at",
+      "entry_date",
+      "exit_date",
+      "raw_return_pct",
+      "benchmark_return_pct",
+      "excess_pct",
+      "outcome",
+      "outcome_quality_status",
+      "regime",
+      "json",
+    ],
+    keys: ["run_id", "decision_id", "horizon_days"],
+  },
+];
+
+async function sqliteObject(dbPath, name, timeoutMs = 60000) {
+  return (await sqliteJson(
+    dbPath,
+    `SELECT name,type,sql FROM sqlite_master WHERE name='${sqlText(name)}' LIMIT 1;`,
+    timeoutMs,
+  ))[0] || null;
+}
+
+async function assertSqliteColumns(dbPath, table, expected = [], timeoutMs = 60000) {
+  const rows = await sqliteJson(dbPath, `PRAGMA table_info('${sqlText(table)}');`, timeoutMs);
+  const actual = rows.map((row) => String(row.name || "")).filter(Boolean);
+  const missing = expected.filter((column) => !actual.includes(column));
+  if (missing.length) {
+    throw new Error(`SQLite schema incompatible for ${table}: missing columns ${missing.join(", ")}; actual=${actual.join(", ")}`);
+  }
+  return actual;
+}
+
+async function availableArchiveName(dbPath, base, timeoutMs = 60000) {
+  for (let suffix = 0; suffix < 1000; suffix += 1) {
+    const candidate = suffix ? `${base}_${suffix + 1}` : base;
+    if (!(await sqliteObject(dbPath, candidate, timeoutMs))) return candidate;
+  }
+  throw new Error(`Unable to allocate archive table name for ${base}`);
+}
+
+async function migrateLegacyDetailAlias(dbPath, spec, timeoutMs = 60000) {
+  await assertSqliteColumns(dbPath, spec.canonical, spec.columns, timeoutMs);
+  const legacyObject = await sqliteObject(dbPath, spec.legacy, timeoutMs);
+  const columnsSql = spec.columns.join(",");
+  if (!legacyObject) {
+    await sqliteExec(dbPath, `CREATE VIEW ${spec.legacy} AS SELECT ${columnsSql} FROM ${spec.canonical};`, timeoutMs);
+    return { alias: spec.legacy, status: "created-view", archive: null, migratedRows: 0 };
+  }
+  await assertSqliteColumns(dbPath, spec.legacy, spec.columns, timeoutMs);
+  if (legacyObject.type === "view") {
+    return { alias: spec.legacy, status: "existing-view", archive: null, migratedRows: 0 };
+  }
+  if (legacyObject.type !== "table") {
+    throw new Error(`SQLite schema incompatible for ${spec.legacy}: expected table or view, got ${legacyObject.type}`);
+  }
+
+  const keyJoin = spec.keys.map((key) => `c.${key}=l.${key}`).join(" AND ");
+  const mismatchWhere = spec.columns.map((column) => `NOT (c.${column} IS l.${column})`).join(" OR ");
+  const preexistingMismatch = (await sqliteJson(
+    dbPath,
+    `SELECT COUNT(*) AS n FROM ${spec.legacy} l JOIN ${spec.canonical} c ON ${keyJoin} WHERE ${mismatchWhere};`,
+    timeoutMs,
+  ))[0]?.n || 0;
+  if (Number(preexistingMismatch)) {
+    throw new Error(`Historical detail migration conflict for ${spec.legacy}: mismatches=${preexistingMismatch}; both source tables were preserved`);
+  }
+
+  const before = (await sqliteJson(dbPath, `SELECT COUNT(*) AS n FROM ${spec.canonical};`, timeoutMs))[0]?.n || 0;
+  const archive = await availableArchiveName(dbPath, `${spec.legacy}_legacy_archive`, timeoutMs);
+  try {
+    await sqliteExec(
+      dbPath,
+      [
+        "BEGIN IMMEDIATE;",
+        `INSERT OR IGNORE INTO ${spec.canonical}(${columnsSql}) SELECT ${columnsSql} FROM ${spec.legacy};`,
+        "CREATE TEMP TABLE historical_detail_migration_guard(value INTEGER CHECK(value=0));",
+        `INSERT INTO historical_detail_migration_guard(value) SELECT
+          (SELECT COUNT(*) FROM ${spec.legacy} l JOIN ${spec.canonical} c ON ${keyJoin} WHERE ${mismatchWhere}) +
+          (SELECT COUNT(*) FROM ${spec.legacy} l LEFT JOIN ${spec.canonical} c ON ${keyJoin} WHERE c.${spec.keys[0]} IS NULL);`,
+        "DROP TABLE historical_detail_migration_guard;",
+        `ALTER TABLE ${spec.legacy} RENAME TO ${archive};`,
+        `CREATE VIEW ${spec.legacy} AS SELECT ${columnsSql} FROM ${spec.canonical};`,
+        "COMMIT;",
+      ].join("\n"),
+      timeoutMs,
+    );
+  } catch (error) {
+    throw new Error(`Atomic historical detail migration failed for ${spec.legacy}; source data was preserved: ${error.message}`);
+  }
+  const after = (await sqliteJson(dbPath, `SELECT COUNT(*) AS n FROM ${spec.canonical};`, timeoutMs))[0]?.n || 0;
+  return {
+    alias: spec.legacy,
+    status: "migrated-to-view",
+    archive,
+    migratedRows: Math.max(0, Number(after) - Number(before)),
+  };
+}
+
+async function validateHistoricalDetailCompatibility(dbPath, runId = "", timeoutMs = 60000) {
+  const results = [];
+  const where = runId ? ` WHERE run_id='${sqlText(runId)}'` : "";
+  for (const spec of HISTORICAL_DETAIL_COMPATIBILITY) {
+    const columnsSql = spec.columns.join(",");
+    const [counts] = await sqliteJson(
+      dbPath,
+      `SELECT (SELECT COUNT(*) FROM ${spec.canonical}${where}) AS canonical_count, (SELECT COUNT(*) FROM ${spec.legacy}${where}) AS legacy_count;`,
+      timeoutMs,
+    );
+    const canonicalOnly = (await sqliteJson(
+      dbPath,
+      `SELECT COUNT(*) AS n FROM (SELECT ${columnsSql} FROM ${spec.canonical}${where} EXCEPT SELECT ${columnsSql} FROM ${spec.legacy}${where});`,
+      timeoutMs,
+    ))[0]?.n || 0;
+    const legacyOnly = (await sqliteJson(
+      dbPath,
+      `SELECT COUNT(*) AS n FROM (SELECT ${columnsSql} FROM ${spec.legacy}${where} EXCEPT SELECT ${columnsSql} FROM ${spec.canonical}${where});`,
+      timeoutMs,
+    ))[0]?.n || 0;
+    results.push({
+      canonical: spec.canonical,
+      legacy: spec.legacy,
+      canonicalCount: Number(counts?.canonical_count || 0),
+      legacyCount: Number(counts?.legacy_count || 0),
+      canonicalOnly: Number(canonicalOnly),
+      legacyOnly: Number(legacyOnly),
+      status: Number(canonicalOnly) || Number(legacyOnly) ? "mismatch" : "ok",
+    });
+  }
+  return {
+    status: results.every((row) => row.status === "ok") ? "ok" : "mismatch",
+    tables: results,
+  };
+}
+
+export async function ensureHistoricalRunStorage(dbPath, timeoutMs = 60000) {
+  await sqliteExec(dbPath, ["PRAGMA busy_timeout=60000;", historicalRunSchemaSql()].join("\n"), timeoutMs);
+  const migrations = [];
+  for (const spec of HISTORICAL_DETAIL_COMPATIBILITY) {
+    migrations.push(await migrateLegacyDetailAlias(dbPath, spec, timeoutMs));
+  }
+  await sqliteExec(
+    dbPath,
+    `
+INSERT OR IGNORE INTO historical_backtest_write_state(
+  run_id,write_id,content_hash,status,
+  expected_decisions,expected_outcomes,expected_daily,
+  staged_decisions,staged_outcomes,staged_daily,updated_at,error
+)
+SELECT
+  r.id,'legacy:' || r.id,NULL,
+  CASE
+    WHEN COALESCE(r.decisions_count,0)=(SELECT COUNT(*) FROM historical_backtest_decisions d WHERE d.run_id=r.id)
+     AND COALESCE(r.outcomes_count,0)=(SELECT COUNT(*) FROM historical_backtest_outcomes o WHERE o.run_id=r.id)
+     AND COALESCE(r.daily_count,0)=(SELECT COUNT(*) FROM historical_backtest_daily x WHERE x.run_id=r.id)
+    THEN 'ready' ELSE 'quality-error'
+  END,
+  COALESCE(r.decisions_count,0),COALESCE(r.outcomes_count,0),COALESCE(r.daily_count,0),
+  (SELECT COUNT(*) FROM historical_backtest_decisions d WHERE d.run_id=r.id),
+  (SELECT COUNT(*) FROM historical_backtest_outcomes o WHERE o.run_id=r.id),
+  (SELECT COUNT(*) FROM historical_backtest_daily x WHERE x.run_id=r.id),
+  COALESCE(r.generated_at,datetime('now')),
+  CASE
+    WHEN COALESCE(r.decisions_count,0)=(SELECT COUNT(*) FROM historical_backtest_decisions d WHERE d.run_id=r.id)
+     AND COALESCE(r.outcomes_count,0)=(SELECT COUNT(*) FROM historical_backtest_outcomes o WHERE o.run_id=r.id)
+     AND COALESCE(r.daily_count,0)=(SELECT COUNT(*) FROM historical_backtest_daily x WHERE x.run_id=r.id)
+    THEN NULL ELSE 'legacy detail counts do not match run summary'
+  END
+FROM historical_backtest_runs r;
+`,
+    timeoutMs,
+  );
+  const compatibility = await validateHistoricalDetailCompatibility(dbPath, "", timeoutMs);
+  if (compatibility.status !== "ok") {
+    throw new Error(`Historical canonical/legacy compatibility validation failed: ${JSON.stringify(compatibility)}`);
+  }
+  return { migrations, compatibility };
 }
 
 function historicalRunSummary(run = {}) {
@@ -1181,8 +1403,9 @@ function historicalRunSummary(run = {}) {
   };
 }
 
-async function persistHistoricalBacktestRun(sqlitePath, run = {}, report = {}, timeoutMs = 60000) {
+export async function persistHistoricalBacktestRun(sqlitePath, run = {}, report = {}, timeoutMs = 60000) {
   if (!sqlitePath || !run?.id) return { persisted: false, reason: "missing-sqlite-or-run-id" };
+  const storageSetup = await ensureHistoricalRunStorage(sqlitePath, timeoutMs);
   const summary = historicalRunSummary(run);
   const compactJson = {
     ...summary,
@@ -1195,85 +1418,203 @@ async function persistHistoricalBacktestRun(sqlitePath, run = {}, report = {}, t
     ...(report || {}),
     json: compactJson,
   };
-  const decisionCount = run.decisions?.length || run.detailCounts?.decisions || 0;
-  const outcomeCount = run.outcomes?.length || run.detailCounts?.outcomes || 0;
-  const dailyCount = run.daily?.length || run.detailCounts?.daily || 0;
+  const decisions = Array.isArray(run.decisions) ? run.decisions : [];
+  const outcomes = Array.isArray(run.outcomes) ? run.outcomes : [];
+  const daily = Array.isArray(run.daily) ? run.daily : [];
+  const decisionCount = decisions.length;
+  const outcomeCount = outcomes.length;
+  const dailyCount = daily.length;
+  const declaredCounts = {
+    decisions: Number(run.detailCounts?.decisions ?? decisionCount),
+    outcomes: Number(run.detailCounts?.outcomes ?? outcomeCount),
+    daily: Number(run.detailCounts?.daily ?? dailyCount),
+  };
+  if (declaredCounts.decisions !== decisionCount || declaredCounts.outcomes !== outcomeCount || declaredCounts.daily !== dailyCount) {
+    throw new Error(`Refusing partial historical detail persistence for ${run.id}: declared=${JSON.stringify(declaredCounts)}, supplied=${JSON.stringify({ decisions: decisionCount, outcomes: outcomeCount, daily: dailyCount })}`);
+  }
+  const contentHash = hashJson({
+    schemaVersion: "historical-backtest-storage-content-v1",
+    run: compactJson,
+    decisions,
+    outcomes,
+    daily,
+  });
+  const existingRun = (await sqliteJson(
+    sqlitePath,
+    `SELECT r.id,s.status,s.content_hash,s.expected_decisions,s.expected_outcomes,s.expected_daily FROM historical_backtest_runs r LEFT JOIN historical_backtest_write_state s ON s.run_id=r.id WHERE r.id='${sqlText(run.id)}' LIMIT 1;`,
+    timeoutMs,
+  ))[0] || null;
+  if (existingRun) {
+    if (existingRun.status === "ready" && existingRun.content_hash === contentHash) {
+      const compatibility = await validateHistoricalDetailCompatibility(sqlitePath, run.id, timeoutMs);
+      return {
+        persisted: true,
+        idempotent: true,
+        runId: run.id,
+        contentHash,
+        storageStatus: "ready",
+        inserted: { decisions: 0, outcomes: 0, daily: 0 },
+        detailCounts: { decisions: decisionCount, outcomes: outcomeCount, daily: dailyCount },
+        compatibility,
+        migrations: storageSetup.migrations,
+      };
+    }
+    throw new Error(`Historical backtest run id conflict for ${run.id}: existing content is immutable; persist a new run id`);
+  }
+
+  const priorState = (await sqliteJson(
+    sqlitePath,
+    `SELECT run_id,write_id,status,updated_at FROM historical_backtest_write_state WHERE run_id='${sqlText(run.id)}' LIMIT 1;`,
+    timeoutMs,
+  ))[0] || null;
+  if (priorState?.status === "ready") {
+    throw new Error(`Historical storage state is inconsistent for ${run.id}: ready state exists without a run summary`);
+  }
+  const priorStateAgeMs = priorState?.updated_at ? Date.now() - new Date(priorState.updated_at).getTime() : 0;
+  const staleWrite = ["staging", "staged"].includes(priorState?.status) && Number.isFinite(priorStateAgeMs) && priorStateAgeMs > 60 * 60 * 1000;
+  if (priorState && priorState.status !== "failed" && !staleWrite) {
+    throw new Error(`Historical storage write already in progress for ${run.id}: status=${priorState.status}, writeId=${priorState.write_id}`);
+  }
+  const writeId = `hist-write-${crypto.randomUUID()}`;
+  const startedAt = new Date().toISOString();
+  const acquireStateSql = priorState
+    ? `UPDATE historical_backtest_write_state SET
+      write_id='${sqlText(writeId)}',content_hash='${sqlText(contentHash)}',status='staging',
+      expected_decisions=${decisionCount},expected_outcomes=${outcomeCount},expected_daily=${dailyCount},
+      staged_decisions=0,staged_outcomes=0,staged_daily=0,updated_at='${sqlText(startedAt)}',error=NULL
+      WHERE run_id='${sqlText(run.id)}' AND write_id='${sqlText(priorState.write_id)}' AND status='${sqlText(priorState.status)}';`
+    : `INSERT INTO historical_backtest_write_state(
+      run_id,write_id,content_hash,status,
+      expected_decisions,expected_outcomes,expected_daily,
+      staged_decisions,staged_outcomes,staged_daily,updated_at,error
+    ) VALUES (
+      '${sqlText(run.id)}','${sqlText(writeId)}','${sqlText(contentHash)}','staging',
+      ${decisionCount},${outcomeCount},${dailyCount},0,0,0,'${sqlText(startedAt)}',NULL
+    );`;
   await sqliteExec(sqlitePath, [
     "PRAGMA busy_timeout=60000;",
-    historicalRunSchemaSql(),
-    "BEGIN;",
-    `DELETE FROM historical_backtest_decisions WHERE run_id='${sqlText(run.id)}';`,
-    `DELETE FROM historical_backtest_outcomes WHERE run_id='${sqlText(run.id)}';`,
-    `DELETE FROM historical_decisions WHERE run_id='${sqlText(run.id)}';`,
-    `DELETE FROM historical_outcomes WHERE run_id='${sqlText(run.id)}';`,
-    `DELETE FROM historical_backtest_daily WHERE run_id='${sqlText(run.id)}';`,
-    `DELETE FROM historical_backtest_runs WHERE id='${sqlText(run.id)}';`,
-    `INSERT INTO historical_backtest_runs(id, generated_at, status, decisions_count, outcomes_count, daily_count, summary_json, metrics_json, report_json, json)
-      VALUES ('${sqlText(run.id)}','${sqlText(run.generatedAt)}','${sqlText(run.status)}',${Number(decisionCount)},${Number(outcomeCount)},${Number(dailyCount)},'${sqlJson(summary)}','${sqlJson(run.metrics || {})}','${sqlJson(compactReport)}','${sqlJson(compactJson)}');`,
+    "BEGIN IMMEDIATE;",
+    acquireStateSql,
+    priorState ? "CREATE TEMP TABLE historical_write_acquire_guard(value INTEGER CHECK(value=1));" : "",
+    priorState ? "INSERT INTO historical_write_acquire_guard(value) VALUES(changes());" : "",
+    priorState ? "DROP TABLE historical_write_acquire_guard;" : "",
+    priorState?.write_id ? `DELETE FROM historical_backtest_decisions_staging WHERE write_id='${sqlText(priorState.write_id)}';` : "",
+    priorState?.write_id ? `DELETE FROM historical_backtest_outcomes_staging WHERE write_id='${sqlText(priorState.write_id)}';` : "",
+    priorState?.write_id ? `DELETE FROM historical_backtest_daily_staging WHERE write_id='${sqlText(priorState.write_id)}';` : "",
     "COMMIT;",
-  ].join("\n"), timeoutMs);
+  ].filter(Boolean).join("\n"), timeoutMs);
 
-  let decisionRows = 0;
-  for (const chunk of chunks(run.decisions || [], 500)) {
+  try {
+    for (const chunk of chunks(decisions, 500)) {
     const values = chunk.map((decision) =>
-      `('${sqlText(run.id)}','${sqlText(decision.id)}','${sqlText(decision.ticker)}','${sqlText(ymd(decision.signalDate || decision.generatedAt))}',${pct(decision.actionScore) ?? "NULL"},${pct(decision.alphaScore) ?? "NULL"},'${sqlJson(decision)}')`,
+        `('${sqlText(writeId)}','${sqlText(run.id)}','${sqlText(decision.id)}','${sqlText(decision.ticker)}','${sqlText(ymd(decision.signalDate || decision.generatedAt))}',${pct(decision.actionScore) ?? "NULL"},${pct(decision.alphaScore) ?? "NULL"},'${sqlJson(decision)}')`,
     );
     if (!values.length) continue;
     await sqliteExec(sqlitePath, [
       "PRAGMA busy_timeout=60000;",
-      "BEGIN;",
-      `INSERT OR REPLACE INTO historical_backtest_decisions(run_id, id, ticker, signal_date, action_score, alpha_score, json) VALUES ${values.join(",")};`,
-      `INSERT OR REPLACE INTO historical_decisions(run_id, id, ticker, signal_date, action_score, alpha_score, json) VALUES ${values.join(",")};`,
+        "BEGIN IMMEDIATE;",
+        `INSERT INTO historical_backtest_decisions_staging(write_id,run_id,id,ticker,signal_date,action_score,alpha_score,json) VALUES ${values.join(",")};`,
       "COMMIT;",
     ].join("\n"), timeoutMs);
-    decisionRows += chunk.length;
-  }
+    }
 
-  let outcomeRows = 0;
-  for (const chunk of chunks(run.outcomes || [], 500)) {
+    for (const chunk of chunks(outcomes, 500)) {
     const values = chunk.map((outcome) =>
-      `('${sqlText(run.id)}','${sqlText(outcome.decisionId)}','${sqlText(outcome.ticker)}',${Number(outcome.horizonDays || 0)},'${sqlText(ymd(outcome.decisionAt))}','${sqlText(outcome.entryDate)}','${sqlText(outcome.exitDate)}',${pct(outcome.rawReturnPct) ?? "NULL"},${pct(outcome.benchmarkReturnPct) ?? "NULL"},${pct(outcome.excessPct) ?? "NULL"},'${sqlText(outcome.outcome)}','${sqlText(outcome.outcomeQualityStatus)}','${sqlText(outcomeRegimeBucket(outcome))}','${sqlJson(outcome)}')`,
+        `('${sqlText(writeId)}','${sqlText(run.id)}','${sqlText(outcome.decisionId)}','${sqlText(outcome.ticker)}',${Number(outcome.horizonDays || 0)},'${sqlText(ymd(outcome.decisionAt))}','${sqlText(outcome.entryDate)}','${sqlText(outcome.exitDate)}',${pct(outcome.rawReturnPct) ?? "NULL"},${pct(outcome.benchmarkReturnPct) ?? "NULL"},${pct(outcome.excessPct) ?? "NULL"},'${sqlText(outcome.outcome)}','${sqlText(outcome.outcomeQualityStatus)}','${sqlText(outcomeRegimeBucket(outcome))}','${sqlJson(outcome)}')`,
     );
     if (!values.length) continue;
     await sqliteExec(sqlitePath, [
       "PRAGMA busy_timeout=60000;",
-      "BEGIN;",
-      `INSERT OR REPLACE INTO historical_backtest_outcomes(run_id, decision_id, ticker, horizon_days, decision_at, entry_date, exit_date, raw_return_pct, benchmark_return_pct, excess_pct, outcome, outcome_quality_status, regime, json) VALUES ${values.join(",")};`,
-      `INSERT OR REPLACE INTO historical_outcomes(run_id, decision_id, ticker, horizon_days, decision_at, entry_date, exit_date, raw_return_pct, benchmark_return_pct, excess_pct, outcome, outcome_quality_status, regime, json) VALUES ${values.join(",")};`,
+        "BEGIN IMMEDIATE;",
+        `INSERT INTO historical_backtest_outcomes_staging(write_id,run_id,decision_id,ticker,horizon_days,decision_at,entry_date,exit_date,raw_return_pct,benchmark_return_pct,excess_pct,outcome,outcome_quality_status,regime,json) VALUES ${values.join(",")};`,
       "COMMIT;",
     ].join("\n"), timeoutMs);
-    outcomeRows += chunk.length;
-  }
+    }
 
-  let dailyRows = 0;
-  for (const chunk of chunks(run.daily || [], 500)) {
+    for (const chunk of chunks(daily, 500)) {
     const values = chunk.map((row) =>
-      `('${sqlText(run.id)}','${sqlText(row.date)}',${Number(row.decisions || 0)},${Number(row.outcomeSamples || 0)},${pct(row.avgExcessPct) ?? "NULL"},'${sqlJson(row)}')`,
+        `('${sqlText(writeId)}','${sqlText(run.id)}','${sqlText(row.date)}',${Number(row.decisions || 0)},${Number(row.outcomeSamples || 0)},${pct(row.avgExcessPct) ?? "NULL"},'${sqlJson(row)}')`,
     );
     if (!values.length) continue;
     await sqliteExec(sqlitePath, [
       "PRAGMA busy_timeout=60000;",
-      "BEGIN;",
-      `INSERT OR REPLACE INTO historical_backtest_daily(run_id, date, decisions, outcome_samples, avg_excess_pct, json) VALUES ${values.join(",")};`,
+        "BEGIN IMMEDIATE;",
+        `INSERT INTO historical_backtest_daily_staging(write_id,run_id,date,decisions,outcome_samples,avg_excess_pct,json) VALUES ${values.join(",")};`,
       "COMMIT;",
     ].join("\n"), timeoutMs);
-    dailyRows += chunk.length;
+    }
+
+    const [staged] = await sqliteJson(
+      sqlitePath,
+      `SELECT
+        (SELECT COUNT(*) FROM historical_backtest_decisions_staging WHERE write_id='${sqlText(writeId)}') AS decisions,
+        (SELECT COUNT(*) FROM historical_backtest_outcomes_staging WHERE write_id='${sqlText(writeId)}') AS outcomes,
+        (SELECT COUNT(*) FROM historical_backtest_daily_staging WHERE write_id='${sqlText(writeId)}') AS daily;`,
+      timeoutMs,
+    );
+    const stagedCounts = {
+      decisions: Number(staged?.decisions || 0),
+      outcomes: Number(staged?.outcomes || 0),
+      daily: Number(staged?.daily || 0),
+    };
+    if (stagedCounts.decisions !== decisionCount || stagedCounts.outcomes !== outcomeCount || stagedCounts.daily !== dailyCount) {
+      throw new Error(`Historical staging count mismatch for ${run.id}: expected=${JSON.stringify({ decisions: decisionCount, outcomes: outcomeCount, daily: dailyCount })}, staged=${JSON.stringify(stagedCounts)}`);
+    }
+    const stagedAt = new Date().toISOString();
+    await sqliteExec(
+      sqlitePath,
+      `UPDATE historical_backtest_write_state SET status='staged',staged_decisions=${decisionCount},staged_outcomes=${outcomeCount},staged_daily=${dailyCount},updated_at='${sqlText(stagedAt)}',error=NULL WHERE run_id='${sqlText(run.id)}' AND write_id='${sqlText(writeId)}';`,
+      timeoutMs,
+    );
+
+    const publishedAt = new Date().toISOString();
+    await sqliteExec(sqlitePath, [
+      "PRAGMA busy_timeout=60000;",
+      "BEGIN IMMEDIATE;",
+      `INSERT INTO historical_backtest_decisions(run_id,id,ticker,signal_date,action_score,alpha_score,json)
+        SELECT run_id,id,ticker,signal_date,action_score,alpha_score,json FROM historical_backtest_decisions_staging WHERE write_id='${sqlText(writeId)}';`,
+      `INSERT INTO historical_backtest_outcomes(run_id,decision_id,ticker,horizon_days,decision_at,entry_date,exit_date,raw_return_pct,benchmark_return_pct,excess_pct,outcome,outcome_quality_status,regime,json)
+        SELECT run_id,decision_id,ticker,horizon_days,decision_at,entry_date,exit_date,raw_return_pct,benchmark_return_pct,excess_pct,outcome,outcome_quality_status,regime,json FROM historical_backtest_outcomes_staging WHERE write_id='${sqlText(writeId)}';`,
+      `INSERT INTO historical_backtest_daily(run_id,date,decisions,outcome_samples,avg_excess_pct,json)
+        SELECT run_id,date,decisions,outcome_samples,avg_excess_pct,json FROM historical_backtest_daily_staging WHERE write_id='${sqlText(writeId)}';`,
+      `INSERT INTO historical_backtest_runs(id,generated_at,status,decisions_count,outcomes_count,daily_count,summary_json,metrics_json,report_json,json)
+        VALUES ('${sqlText(run.id)}','${sqlText(run.generatedAt)}','${sqlText(run.status)}',${decisionCount},${outcomeCount},${dailyCount},'${sqlJson(summary)}','${sqlJson(run.metrics || {})}','${sqlJson(compactReport)}','${sqlJson(compactJson)}');`,
+      `UPDATE historical_backtest_write_state SET status='ready',staged_decisions=${decisionCount},staged_outcomes=${outcomeCount},staged_daily=${dailyCount},updated_at='${sqlText(publishedAt)}',error=NULL WHERE run_id='${sqlText(run.id)}' AND write_id='${sqlText(writeId)}';`,
+      "CREATE TEMP TABLE historical_publish_guard(value INTEGER CHECK(value=1));",
+      "INSERT INTO historical_publish_guard(value) VALUES(changes());",
+      "DROP TABLE historical_publish_guard;",
+      `DELETE FROM historical_backtest_decisions_staging WHERE write_id='${sqlText(writeId)}';`,
+      `DELETE FROM historical_backtest_outcomes_staging WHERE write_id='${sqlText(writeId)}';`,
+      `DELETE FROM historical_backtest_daily_staging WHERE write_id='${sqlText(writeId)}';`,
+      "COMMIT;",
+    ].join("\n"), timeoutMs);
+
+    const compatibility = await validateHistoricalDetailCompatibility(sqlitePath, run.id, timeoutMs);
+    if (compatibility.status !== "ok") {
+      throw new Error(`Historical canonical/legacy post-write mismatch for ${run.id}: ${JSON.stringify(compatibility)}`);
+    }
+    return {
+      persisted: true,
+      idempotent: false,
+      runId: run.id,
+      writeId,
+      contentHash,
+      storageStatus: "ready",
+      chunkSize: 500,
+      inserted: { decisions: decisionCount, outcomes: outcomeCount, daily: dailyCount },
+      detailCounts: { decisions: decisionCount, outcomes: outcomeCount, daily: dailyCount },
+      compatibility,
+      migrations: storageSetup.migrations,
+    };
+  } catch (error) {
+    const failedAt = new Date().toISOString();
+    await sqliteExec(
+      sqlitePath,
+      `UPDATE historical_backtest_write_state SET status='failed',updated_at='${sqlText(failedAt)}',error='${sqlText(error.message)}' WHERE run_id='${sqlText(run.id)}' AND write_id='${sqlText(writeId)}';`,
+      timeoutMs,
+    ).catch(() => {});
+    throw error;
   }
-  return {
-    persisted: true,
-    runId: run.id,
-    chunkSize: 500,
-    inserted: {
-      decisions: decisionRows,
-      outcomes: outcomeRows,
-      daily: dailyRows,
-    },
-    detailCounts: {
-      decisions: decisionCount,
-      outcomes: outcomeCount,
-      daily: dailyCount,
-    },
-  };
 }
 
 export function compactHistoricalRun(run = {}, options = {}) {
@@ -1823,6 +2164,7 @@ export async function runHistoricalWalkForwardFromSqlite({ sqlitePath, config = 
 
 export async function historicalBacktestDetailsFromSqlite({ sqlitePath, runId, kind = "outcomes", page = 1, pageSize = 100, offset = null, limit = null, horizonDays = null } = {}) {
   if (!sqlitePath) throw new Error("sqlitePath is required");
+  if (!runId) throw new Error("runId is required");
   const safeRunId = sqlText(runId);
   const safeKind = String(kind || "outcomes").toLowerCase();
   const size = Math.max(1, Math.min(500, Number(limit || pageSize || 100)));

@@ -49,6 +49,11 @@ function maybeGzipBody(res, body, headers = {}) {
 
 export function sendJson(res, data, status = 200) {
   if (res.destroyed || res.writableEnded) return;
+  if (Number(status) === 204) {
+    res.writeHead(status, { "Cache-Control": "no-store" });
+    res.end();
+    return;
+  }
   const payload = JSON.stringify(data, jsonResponseReplacer);
   const encoded = maybeGzipBody(res, payload, {
     "Content-Type": "application/json; charset=utf-8",

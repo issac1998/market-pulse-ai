@@ -775,9 +775,134 @@ async function optionalSqliteJson(dbPath, sql, diagnostics, label, timeoutMs) {
   try {
     return await sqliteJson(dbPath, sql, timeoutMs);
   } catch (error) {
-    diagnostics.push({ label, status: "unavailable", error: error.message });
+    diagnostics.push({ label, status: "error", qualityStatus: "query-error", error: error.message });
     return [];
   }
+}
+
+function parsedRowJson(value) {
+  if (value && typeof value === "object") return value;
+  try {
+    const parsed = JSON.parse(String(value || "{}"));
+    return parsed && typeof parsed === "object" && !Array.isArray(parsed) ? parsed : {};
+  } catch {
+    return {};
+  }
+}
+
+function nestedValue(value = {}, path = "") {
+  let current = value;
+  for (const part of String(path || "").split(".").filter(Boolean)) {
+    if (!current || typeof current !== "object") return undefined;
+    current = current[part];
+  }
+  return current;
+}
+
+function firstNumber(values = []) {
+  for (const value of values) {
+    const parsed = numberOrNull(value);
+    if (Number.isFinite(parsed)) return parsed;
+  }
+  return null;
+}
+
+function jsonNumber(row = {}, paths = []) {
+  const payload = parsedRowJson(row.json);
+  return firstNumber(paths.map((path) => nestedValue(payload, path)));
+}
+
+async function schemaCheckedSqliteJson(dbPath, spec = {}, diagnostics = [], timeoutMs = 60000) {
+  const label = text(spec.label);
+  let columns;
+  try {
+    columns = await sqliteJson(dbPath, `PRAGMA table_info('${sqlText(label)}');`, timeoutMs);
+  } catch (error) {
+    diagnostics.push({ label, status: "error", qualityStatus: "schema-check-error", error: error.message });
+    return [];
+  }
+  const actualColumns = columns.map((row) => text(row.name)).filter(Boolean);
+  const missingColumns = (spec.requiredColumns || []).filter((column) => !actualColumns.includes(column));
+  if (!actualColumns.length || missingColumns.length) {
+    diagnostics.push({
+      label,
+      status: "error",
+      qualityStatus: "schema-incompatible",
+      error: !actualColumns.length ? `Missing SQLite table or view: ${label}` : `Missing required columns: ${missingColumns.join(", ")}`,
+      requiredColumns: spec.requiredColumns || [],
+      actualColumns,
+      missingColumns: !actualColumns.length ? spec.requiredColumns || [] : missingColumns,
+    });
+    return [];
+  }
+  try {
+    const rows = await sqliteJson(dbPath, spec.sql, timeoutMs);
+    const normalized = typeof spec.normalize === "function" ? rows.map(spec.normalize) : rows;
+    diagnostics.push({ label, status: "ok", qualityStatus: "compatible", rowCount: normalized.length, actualColumns });
+    return normalized;
+  } catch (error) {
+    diagnostics.push({ label, status: "error", qualityStatus: "query-error", error: error.message, actualColumns });
+    return [];
+  }
+}
+
+function normalizeRevisionCorpusRow(row = {}) {
+  return {
+    ...row,
+    buy_ratio: firstNumber([
+      row.buy_ratio,
+      jsonNumber(row, ["buyRatio", "buy_ratio", "summary.buyRatio", "summary.buy_ratio"]),
+    ]),
+    consensus_eps: firstNumber([
+      row.consensus_eps,
+      jsonNumber(row, ["consensusEps", "consensus_eps", "epsEstimate", "summary.consensusEps", "summary.epsEstimate"]),
+    ]),
+  };
+}
+
+function normalizeShortInterestCorpusRow(row = {}) {
+  return {
+    ...row,
+    days_to_cover: firstNumber([
+      row.days_to_cover,
+      jsonNumber(row, ["daysToCover", "days_to_cover", "summary.daysToCover", "summary.days_to_cover"]),
+    ]),
+  };
+}
+
+function normalizeOptionsCorpusRow(row = {}) {
+  return {
+    ...row,
+    put_call_ratio: firstNumber([
+      row.put_call_ratio,
+      jsonNumber(row, ["putCallRatio", "put_call_ratio", "summary.putCallRatio", "summary.put_call_ratio"]),
+    ]),
+  };
+}
+
+function requiredCorpusLabels(spec = {}) {
+  const labels = new Set();
+  const mapping = {
+    revisions: "analyst_revision_history",
+    shortInterest: "short_interest_history",
+    ivHistory: "options_snapshots",
+    consensus: "consensus_snapshots",
+  };
+  function visit(value) {
+    if (Array.isArray(value)) {
+      value.forEach(visit);
+      return;
+    }
+    if (typeof value === "string") {
+      const prefix = value.split(".")[0];
+      if (mapping[prefix]) labels.add(mapping[prefix]);
+      return;
+    }
+    if (!value || typeof value !== "object") return;
+    Object.values(value).forEach(visit);
+  }
+  visit(spec.pipeline || []);
+  return labels;
 }
 
 async function corpusDatasetFromSqlite(dbPath = "", options = {}) {
@@ -821,34 +946,29 @@ async function corpusDatasetFromSqlite(dbPath = "", options = {}) {
     "pit_fundamentals",
     timeoutMs,
   );
-  const revisions = await optionalSqliteJson(
-    dbPath,
-    `SELECT ticker,captured_at AS date,upgrades,downgrades,buy_ratio,consensus_eps,json FROM analyst_revision_history WHERE ticker IN (${tickerList}) ORDER BY ticker,captured_at;`,
-    diagnostics,
-    "analyst_revision_history",
-    timeoutMs,
-  );
-  const shortInterest = await optionalSqliteJson(
-    dbPath,
-    `SELECT ticker,captured_at AS date,short_interest,days_to_cover,json FROM short_interest_history WHERE ticker IN (${tickerList}) ORDER BY ticker,captured_at;`,
-    diagnostics,
-    "short_interest_history",
-    timeoutMs,
-  );
-  const ivHistory = await optionalSqliteJson(
-    dbPath,
-    `SELECT ticker,captured_at AS date,iv_atm,put_call_ratio,json FROM options_snapshots WHERE ticker IN (${tickerList}) ORDER BY ticker,captured_at;`,
-    diagnostics,
-    "options_snapshots",
-    timeoutMs,
-  );
-  const consensus = await optionalSqliteJson(
-    dbPath,
-    `SELECT ticker,captured_at AS date,eps,revenue,json FROM consensus_snapshots WHERE ticker IN (${tickerList}) ORDER BY ticker,captured_at;`,
-    diagnostics,
-    "consensus_snapshots",
-    timeoutMs,
-  );
+  const revisions = await schemaCheckedSqliteJson(dbPath, {
+    label: "analyst_revision_history",
+    requiredColumns: ["ticker", "captured_at", "upgrades", "downgrades", "rating_count", "source", "json"],
+    sql: `SELECT ticker,captured_at AS date,upgrades,downgrades,rating_count,source,json FROM analyst_revision_history WHERE ticker IN (${tickerList}) ORDER BY ticker,captured_at;`,
+    normalize: normalizeRevisionCorpusRow,
+  }, diagnostics, timeoutMs);
+  const shortInterest = await schemaCheckedSqliteJson(dbPath, {
+    label: "short_interest_history",
+    requiredColumns: ["ticker", "captured_at", "short_interest", "source", "json"],
+    sql: `SELECT ticker,captured_at AS date,short_interest,source,json FROM short_interest_history WHERE ticker IN (${tickerList}) ORDER BY ticker,captured_at;`,
+    normalize: normalizeShortInterestCorpusRow,
+  }, diagnostics, timeoutMs);
+  const ivHistory = await schemaCheckedSqliteJson(dbPath, {
+    label: "options_snapshots",
+    requiredColumns: ["ticker", "as_of", "provider", "iv_atm", "chain_quality", "contracts_count", "json"],
+    sql: `SELECT ticker,as_of AS date,iv_atm,chain_quality,contracts_count,provider,json FROM options_snapshots WHERE ticker IN (${tickerList}) ORDER BY ticker,as_of;`,
+    normalize: normalizeOptionsCorpusRow,
+  }, diagnostics, timeoutMs);
+  const consensus = await schemaCheckedSqliteJson(dbPath, {
+    label: "consensus_snapshots",
+    requiredColumns: ["ticker", "event_date", "captured_at", "eps_estimate", "revenue_estimate", "source", "status", "json"],
+    sql: `SELECT ticker,captured_at AS date,event_date,eps_estimate AS eps,revenue_estimate AS revenue,source,status,json FROM consensus_snapshots WHERE ticker IN (${tickerList}) ORDER BY ticker,captured_at;`,
+  }, diagnostics, timeoutMs);
   return { bars, pit, revisions, shortInterest, ivHistory, consensus, historicalOutcomes, historicalRegimes, diagnostics };
 }
 
@@ -914,8 +1034,33 @@ export async function evaluateFactorSpecOverCorpus(specInput = {}, options = {})
       effectiveN: 0,
     };
   }
-  const dataset = await loadCorpusDataset(options.db, options);
   const parsed = parseFactorSpec(specInput);
+  const dataset = await loadCorpusDataset(options.db, options);
+  const requiredLabels = requiredCorpusLabels(parsed);
+  const blockingDiagnostics = (dataset.diagnostics || []).filter(
+    (row) => requiredLabels.has(row.label) && row.status === "error",
+  );
+  if (blockingDiagnostics.length) {
+    const qualityStatuses = [...new Set(blockingDiagnostics.map((row) => row.qualityStatus).filter(Boolean))];
+    return {
+      schemaVersion: "factor-corpus-evidence-v1",
+      factorId: parsed.factorId,
+      generatedAt: nowIso(),
+      source: "historical-corpus",
+      status: "data-quality-error",
+      qualityStatus: qualityStatuses.includes("schema-incompatible") ? "schema-incompatible" : qualityStatuses[0] || "query-error",
+      n: 0,
+      effectiveN: 0,
+      rankIC: null,
+      tStat: null,
+      horizons: {},
+      regimes: {},
+      coverage: 0,
+      diagnostics: dataset.diagnostics || [],
+      errors: blockingDiagnostics,
+      reason: `Required SQLite factor source is unavailable or incompatible: ${blockingDiagnostics.map((row) => row.label).join(", ")}`,
+    };
+  }
   const universe = (options.universe?.length
     ? options.universe
     : [...new Set((dataset.bars || []).map((row) => safeTicker(row.ticker)).filter(Boolean))]

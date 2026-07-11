@@ -80,7 +80,10 @@ function parseServerRoutes(text) {
       condition: condition.replace(/\s+/g, " ").trim(),
     });
   }
-  return routes.sort((a, b) => a.path.localeCompare(b.path) || a.method.localeCompare(b.method));
+  const catchAllIndex = routes.findLastIndex((route) => route.method === "ANY" && route.path === "/api/*");
+  return routes
+    .filter((route, index) => route.method !== "ANY" || route.path !== "/api/*" || index === catchAllIndex)
+    .sort((a, b) => a.path.localeCompare(b.path) || a.method.localeCompare(b.method));
 }
 
 function parseUiFetches(text) {
@@ -112,7 +115,8 @@ function parseUiFetches(text) {
 }
 
 function parseStoreKeys(text) {
-  const start = text.indexOf("const normalized = {");
+  const functionStart = text.indexOf("function defaultStorePayload()");
+  const start = functionStart >= 0 ? text.indexOf("return {", functionStart) : -1;
   if (start < 0) return [];
   const braceStart = text.indexOf("{", start);
   let depth = 0;
@@ -139,7 +143,7 @@ function parseStoreKeys(text) {
     }
   }
   const block = end > braceStart ? text.slice(braceStart + 1, end) : "";
-  const keys = [...block.matchAll(/^\s{6}([A-Za-z0-9_]+):/gm)].map((item) => item[1]);
+  const keys = [...block.matchAll(/^\s{4}([A-Za-z0-9_]+):/gm)].map((item) => item[1]);
   return [...new Set(keys)].sort();
 }
 

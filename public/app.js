@@ -92,8 +92,14 @@ const LLM_STORAGE_KEY = "marketPulse.llmProvider";
 const STOCK_REPORT_STORAGE_KEY = "marketPulse.stockReportTicker";
 const RUN_SELECTION_STORAGE_KEY = "marketPulse.selectedRunId";
 const STOCK_DETAIL_HASH_PREFIX = "#/stock/";
-const LLM_PROVIDERS = new Set(["local", "codex-cli", "gemini", "antigravity-cli", "gemini-cli", "openai"]);
+const LLM_PROVIDERS = new Set(["codex-cli", "gemini", "antigravity-cli", "gemini-cli", "openai"]);
 const APP_PAGES = new Set(["home", "actions", "stocks", "social", "research", "portfolio", "ops"]);
+const KNOWN_ETF_TICKERS = new Set([
+  "ARKK", "DIA", "GLD", "IAU", "IEF", "IVV", "IWM", "KBE", "KRE", "QQQ", "QQQM", "RSP", "SHY",
+  "SLV", "SMH", "SOXL", "SOXS", "SOXX", "SPY", "SQQQ", "SVXY", "TLT", "TQQQ", "UUP", "USO",
+  "UVXY", "VIXY", "VOO", "VTI", "VXX", "XLB", "XLC", "XLE", "XLF", "XLI", "XLK", "XLP", "XLRE",
+  "XLU", "XLV", "XLY", "XOP",
+]);
 const FALLBACK_TICKER_NAMES_ZH = Object.freeze({
   AAPL: "苹果",
   MSFT: "微软",
@@ -164,6 +170,8 @@ let supplementalDataError = "";
 let runDetailWarning = "";
 let runHistoryLoading = false;
 let runHistoryPagination = { loaded: false, nextOffset: 0, hasMore: false, total: 0 };
+const longListPages = { social: 0, stocks: 0 };
+const refreshErrors = new Map();
 const runDetailCache = new Map();
 const runDetailLoading = new Set();
 const optionFetchInFlight = new Set();
@@ -179,9 +187,19 @@ async function api(path, options = {}) {
     headers: { "Content-Type": "application/json" },
     ...options,
   });
-  const data = await res.json();
+  const raw = res.status === 204 ? "" : await res.text();
+  let data = null;
+  if (raw) {
+    try {
+      data = JSON.parse(raw);
+    } catch (error) {
+      const invalid = new Error(`接口返回了无效 JSON：${error.message}`);
+      invalid.status = res.status;
+      throw invalid;
+    }
+  }
   if (!res.ok) {
-    const error = new Error(data.error || "请求失败");
+    const error = new Error(data?.error || `请求失败（HTTP ${res.status}）`);
     error.status = res.status;
     error.details = data;
     throw error;
@@ -239,6 +257,10 @@ function pageLabel(page) {
 
 function renderPageShell() {
   const page = currentPage();
+  const stockDetailActive = page === "stocks" && Boolean(stockDetailTickerFromHash());
+  const pageHasSidebar = Boolean(els.sideColumn?.querySelector(`[data-page-panel="${page}"]`));
+  document.body.classList.toggle("stock-detail-mode", stockDetailActive);
+  document.body.classList.toggle("has-page-sidebar", pageHasSidebar);
   document.body.dataset.page = page;
   els.pageLinks.forEach((link) => {
     const active = link.dataset.pageLink === page;
@@ -251,9 +273,52 @@ function renderPageShell() {
     panel.setAttribute("aria-hidden", visible ? "false" : "true");
   });
   if (els.sideColumn) {
-    els.sideColumn.classList.toggle("is-page-hidden", !els.sideColumn.querySelector(`[data-page-panel="${page}"]`));
+    els.sideColumn.classList.toggle("is-page-hidden", !pageHasSidebar);
   }
   document.title = page === "home" ? "Market Pulse AI" : `${pageLabel(page)} · Market Pulse AI`;
+}
+
+function refreshErrorBanner() {
+  let banner = document.getElementById("dataRefreshError");
+  if (banner) return banner;
+  banner = document.createElement("aside");
+  banner.id = "dataRefreshError";
+  banner.className = "data-refresh-error";
+  banner.setAttribute("role", "alert");
+  banner.setAttribute("aria-live", "assertive");
+  banner.hidden = true;
+  banner.innerHTML = "<strong>数据刷新失败</strong><span></span>";
+  const nav = document.querySelector(".page-nav");
+  if (nav) nav.insertAdjacentElement("afterend", banner);
+  else document.querySelector(".app-shell")?.prepend(banner);
+  return banner;
+}
+
+function refreshErrorText() {
+  const suffix = appState
+    ? "当前页面继续展示最近一次成功内容。"
+    : "页面数据尚未载入，请稍后重试。";
+  return `${[...refreshErrors.values()].join("；")} ${suffix}`;
+}
+
+function showRefreshError(message, key = "state") {
+  refreshErrors.set(key, message);
+  const banner = refreshErrorBanner();
+  const detail = banner.querySelector("span");
+  if (detail) detail.textContent = refreshErrorText();
+  banner.hidden = false;
+}
+
+function clearRefreshError(key = "state") {
+  refreshErrors.delete(key);
+  const banner = document.getElementById("dataRefreshError");
+  if (!banner) return;
+  if (!refreshErrors.size) {
+    banner.hidden = true;
+    return;
+  }
+  const detail = banner.querySelector("span");
+  if (detail) detail.textContent = refreshErrorText();
 }
 
 function fmtTime(value) {
@@ -771,7 +836,6 @@ function severityLabel(value) {
 
 function providerLabel(value) {
   const labels = {
-    local: "本地规则",
     gemini: "Gemini 接口",
     "codex-cli": "Codex CLI",
     "antigravity-cli": "Antigravity CLI",
@@ -779,7 +843,7 @@ function providerLabel(value) {
     openai: "GPT/OpenAI",
     auto: "自动",
   };
-  return labels[value] || value || "本地规则";
+  return labels[value] || value || "未选择";
 }
 
 function sourceLabel(value) {
@@ -839,7 +903,7 @@ function errorLabel(value) {
   const text = String(value || "");
   if (!text) return "";
   if (/IneligibleTierError|UNSUPPORTED_CLIENT|Gemini Code Assist|Antigravity/i.test(text)) {
-    return "Gemini CLI 个人版通道不可用，系统会使用 Gemini API 或本地规则兜底";
+    return "Gemini CLI 个人版通道不可用；请检查账号层级后重试";
   }
   if (/403\s+Blocked/i.test(text)) return "403 被数据源拦截或限流";
   if (/^\d{3}\s+Bad Request/i.test(text) && /<html|<!doctype html/i.test(text)) {
@@ -938,12 +1002,17 @@ async function pollCollectionStatus() {
   stopCollectionPolling();
   try {
     const result = await api("/api/run/status");
+    clearRefreshError("collection-status");
     collectionStatus = result.runStatus || null;
     const running = collectionStatus?.state === "running";
     setBusy(running);
     if (collectionStatus?.state === "completed" && collectionStatus.runId) {
       localStorage.setItem(RUN_SELECTION_STORAGE_KEY, collectionStatus.runId);
-      await loadState();
+      try {
+        await loadState();
+      } catch {
+        setBusy(false);
+      }
       return;
     }
     render();
@@ -951,15 +1020,33 @@ async function pollCollectionStatus() {
       collectionPollTimer = setTimeout(pollCollectionStatus, 4000);
     }
   } catch (error) {
-    setBusy(false);
-    alert(`采集状态读取失败：${error.message}`);
+    showRefreshError(`采集状态读取失败：${error.message}`, "collection-status");
+    if (collectionStatus?.state === "running") {
+      setBusy(true);
+      collectionPollTimer = setTimeout(pollCollectionStatus, 4000);
+    } else {
+      setBusy(false);
+    }
   }
 }
 
 async function loadState() {
-  appState = await api("/api/state");
+  let nextState;
+  try {
+    nextState = await api("/api/state");
+    clearRefreshError("state");
+  } catch (error) {
+    showRefreshError(`状态数据刷新失败：${error.message}`, "state");
+    throw error;
+  }
+  appState = nextState;
   runHistoryPagination = { loaded: false, nextOffset: 0, hasMore: false, total: appState.runs?.length || 0 };
   await loadSupplementalData();
+  if (supplementalDataError) {
+    showRefreshError(`部分补充数据刷新失败：${supplementalDataError}`, "supplemental");
+  } else {
+    clearRefreshError("supplemental");
+  }
   if (!sourceDiagnosticsBusy) sourceDiagnostics = appState.sourceDiagnostics || null;
   collectionStatus = appState.runStatus || collectionStatus;
   if (collectionStatus?.state === "running") {
@@ -1103,13 +1190,13 @@ function preferredLlmProvider() {
   if (configuredDefault === "antigravity-cli" && stored === "gemini-cli") {
     return "antigravity-cli";
   }
-  if (LLM_PROVIDERS.has(stored)) return stored;
+  if (stored !== "local" && LLM_PROVIDERS.has(stored)) return stored;
   const configured =
     appState?.config?.llmRecommendedProvider ||
     appState?.config?.llmProvider ||
     appState?.config?.llmDefaultProvider;
   if (LLM_PROVIDERS.has(configured)) return configured;
-  return "local";
+  return "codex-cli";
 }
 
 function selectedLlmProvider() {
@@ -1130,14 +1217,11 @@ function renderLlmPicker() {
         : input.value === "antigravity-cli"
           ? "antigravityCli"
           : input.value;
-    const enabled = input.value === "local" || Boolean(providers[providerKey]);
+    const enabled = Boolean(providers[providerKey]);
     input.checked = input.value === selected;
+    input.disabled = !enabled;
     label.classList.toggle("is-unconfigured", !enabled);
-    label.title = input.value === "local"
-      ? "无需外部 LLM，使用本地规则快速生成报告和聊天兜底"
-      : enabled
-        ? "已配置"
-        : "未配置或命令不可用";
+    label.title = enabled ? "已配置；仅用于你主动发送的聊天" : "未配置或命令不可用";
   });
 }
 
@@ -1211,6 +1295,37 @@ function normalizeTickerInput(value) {
 
 function normalizeTickerSymbol(value) {
   return normalizeTickerInput(value).replace(/\.(US|HK|SH|SZ|SG|HAS)$/i, "");
+}
+
+function optionalFiniteNumber(value) {
+  if (value === null || value === undefined || value === "") return null;
+  const number = Number(value);
+  return Number.isFinite(number) ? number : null;
+}
+
+function isEtfInstrument(item = {}, ticker = "") {
+  const data = item || {};
+  const symbol = normalizeTickerSymbol(ticker || data.ticker || data.symbol || data.code);
+  if (KNOWN_ETF_TICKERS.has(symbol)) return true;
+  const descriptor = [
+    data.instrumentType,
+    data.assetType,
+    data.assetCategory,
+    data.securityType,
+    data.secType,
+    data.quoteType,
+    data.type,
+    data.name,
+    data.companyName,
+    data.industry,
+    data.mainBusiness,
+  ].filter(Boolean).join(" ");
+  return /\bETF\b|exchange[- ]traded fund|交易型开放式指数基金|交易所交易基金|指数基金/i.test(descriptor);
+}
+
+function fundamentalMarginDisplay(item = {}) {
+  if (isEtfInstrument(item)) return "不适用";
+  return Number.isFinite(item?.netProfitMarginTTM) ? `${fmtNumber(item.netProfitMarginTTM, 1)}%` : "-";
 }
 
 function hasChineseText(value) {
@@ -1295,8 +1410,11 @@ function openStockDetail(ticker, options = {}) {
 }
 
 function closeStockDetail() {
-  history.pushState("", document.title, window.location.pathname + window.location.search);
-  renderStockReport(selectedReportRun());
+  if (window.location.hash === "#/stocks") {
+    render();
+    return;
+  }
+  window.location.hash = "#/stocks";
 }
 
 function replaceByTicker(rows = [], row = null) {
@@ -1413,7 +1531,6 @@ async function requestStockSnapshot(ticker, options = {}) {
       method: "POST",
       body: JSON.stringify({
         ticker: normalized,
-        llmProvider: selectedLlmProvider(),
       }),
     });
     if (result.snapshot?.ticker) {
@@ -1698,11 +1815,45 @@ function marketSummaryForDisplay(overview = {}) {
   return cleaned || "暂无大盘摘要。";
 }
 
+function marketRatesNote(overview = {}) {
+  const latestYield = overview?.macro?.akshare?.yields?.[0];
+  if (!latestYield) return "";
+  const us2y = optionalFiniteNumber(latestYield.us2yYield);
+  const us10y = optionalFiniteNumber(latestYield.us10yYield);
+  const curve = optionalFiniteNumber(latestYield.usYieldCurve10y2y);
+  const curveText = curve === null ? "" : `，10Y-2Y ${fmtNumber(curve, 2)}bp`;
+  return `美债收益率：2Y ${us2y === null ? "暂无" : `${fmtNumber(us2y, 2)}%`}，10Y ${us10y === null ? "暂无" : `${fmtNumber(us10y, 2)}%`}${curveText}。`;
+}
+
 function marketNotesForDisplay(overview = {}) {
-  return (overview.notes || [])
+  const ratesNote = marketRatesNote(overview);
+  const notes = (overview.notes || [])
     .map((note) => String(note || "").trim())
-    .filter((note) => note && !looksLikeRawMarketText(note))
-    .slice(0, 4);
+    .filter((note) => note && !looksLikeRawMarketText(note) && (!ratesNote || !/^美债收益率[：:]/.test(note)));
+  return ratesNote ? [...notes.slice(0, 3), ratesNote] : notes.slice(0, 4);
+}
+
+function marketAssetIsEtfProxy(asset = {}) {
+  if (asset.fallbackUsed) return true;
+  const sourceSymbol = asset.sourceSymbol || asset.symbol || asset.fallbackSymbol || "";
+  return isEtfInstrument({ ...asset, ticker: sourceSymbol }, sourceSymbol);
+}
+
+function marketAssetDisplayLabel(asset = {}) {
+  return asset.fallbackUsed ? `${asset.label || asset.symbol || "市场资产"} · ETF 代理` : asset.label || asset.symbol || "市场资产";
+}
+
+function marketAssetValueLabel(asset = {}) {
+  if (marketAssetIsEtfProxy(asset)) return "ETF 价格";
+  if (String(asset.symbol || "").startsWith("^")) return "指数点位";
+  return "资产价格";
+}
+
+function marketAssetInterpretationForDisplay(asset = {}) {
+  const raw = asset.interpretation || "";
+  if (!asset.fallbackUsed) return raw;
+  const proxy = asset.sourceSymbol || asset.fallbackSymbol || "该 ETF";
+  return `${proxy} 为 ETF 代理，其价格不等同于 ${asset.label || asset.symbol || "对应指数"} 点位。${raw}`;
 }
 
 function marketPortalBriefForDisplay(overview = {}) {
@@ -1842,23 +1993,30 @@ function renderMarketOverview(run) {
     }
     <div class="market-assets">
       ${lead
-        .map(
-          (asset) => `<article class="market-asset">
+        .map((asset) => {
+          const isEtfProxy = marketAssetIsEtfProxy(asset);
+          return `<article class="market-asset">
             <div class="row">
               <div>
-                <h3>${escapeHtml(asset.label)}</h3>
-                <p class="muted">${escapeHtml(asset.symbol)} · ${escapeHtml(asset.group)}</p>
+                <h3>${escapeHtml(marketAssetDisplayLabel(asset))}</h3>
+                <p class="muted">${escapeHtml(asset.sourceSymbol || asset.symbol)} · ${escapeHtml(asset.group)}</p>
               </div>
-              <span class="tag ${toneTagClass(asset.riskTone)}">${escapeHtml(asset.riskTone === "riskOn" ? "偏风险偏好" : asset.riskTone === "riskOff" ? "偏避险" : "中性")}</span>
+              <div class="feed-meta market-asset-tags">
+                ${isEtfProxy ? `<span class="tag amber">ETF 代理</span>` : ""}
+                <span class="tag ${toneTagClass(asset.riskTone)}">${escapeHtml(asset.riskTone === "riskOn" ? "偏风险偏好" : asset.riskTone === "riskOff" ? "偏避险" : "中性")}</span>
+              </div>
             </div>
             <div class="market-price-line">
-              <strong>${escapeHtml(fmtNumber(asset.price, asset.price >= 100 ? 2 : 2))}</strong>
+              <div class="market-price-value">
+                <strong>${escapeHtml(fmtNumber(asset.price, 2))}</strong>
+                <small>${escapeHtml(marketAssetValueLabel(asset))}</small>
+              </div>
               <span class="${changeClass(asset.changePercent, asset.riskTone)}">${escapeHtml(pctLabel(asset.changePercent))}</span>
             </div>
             <p>${escapeHtml(asset.role || "")}</p>
-            <p class="muted">${escapeHtml(asset.interpretation || "")}</p>
-          </article>`,
-        )
+            <p class="muted">${escapeHtml(marketAssetInterpretationForDisplay(asset))}</p>
+          </article>`;
+        })
         .join("")}
     </div>
     ${
@@ -2475,7 +2633,8 @@ function buildStockReport(run, ticker) {
     .filter((item) => itemMatchesTicker(item, ticker))
     .sort((a, b) => (b.comments || 0) + (b.upvotes || 0) - ((a.comments || 0) + (a.upvotes || 0)));
   const alerts = (run.alerts || []).filter((item) => item.ticker === ticker && item.status !== "dismissed");
-  const nextEarnings = stockNextEarnings(run, ticker, fundamental);
+  const isEtf = isEtfInstrument({ ...quote, ...fundamental }, ticker);
+  const nextEarnings = isEtf ? null : stockNextEarnings(run, ticker, fundamental);
   const change =
     quote?.previousClose > 0 ? ((quote.price - quote.previousClose) / quote.previousClose) * 100 : null;
   let score = 50;
@@ -2491,15 +2650,15 @@ function buildStockReport(run, ticker) {
   }
   if (Number.isFinite(technical?.rsi14) && technical.rsi14 >= 75) risks.push("RSI 偏高，短线可能拥挤");
   if (Number.isFinite(technical?.rsi14) && technical.rsi14 <= 35) positives.push("RSI 偏低，存在反弹观察价值");
-  if (Number.isFinite(fundamental?.revenueGrowthTTMYoy) && fundamental.revenueGrowthTTMYoy > 8) {
+  if (!isEtf && Number.isFinite(fundamental?.revenueGrowthTTMYoy) && fundamental.revenueGrowthTTMYoy > 8) {
     score += 8;
     positives.push(`收入同比增长 ${fmtNumber(fundamental.revenueGrowthTTMYoy, 1)}%`);
   }
-  if (Number.isFinite(fundamental?.netProfitMarginTTM) && fundamental.netProfitMarginTTM > 15) {
+  if (!isEtf && Number.isFinite(fundamental?.netProfitMarginTTM) && fundamental.netProfitMarginTTM > 15) {
     score += 6;
     positives.push(`净利率 ${fmtNumber(fundamental.netProfitMarginTTM, 1)}%`);
   }
-  if (Number.isFinite(fundamental?.debtEquityAnnual) && fundamental.debtEquityAnnual > 150) {
+  if (!isEtf && Number.isFinite(fundamental?.debtEquityAnnual) && fundamental.debtEquityAnnual > 150) {
     score -= 8;
     risks.push("负债/权益偏高");
   }
@@ -2537,7 +2696,11 @@ function buildStockReport(run, ticker) {
     news.length ? "打开排名靠前的新闻原文，区分事实、市场解读和旧闻复述。" : null,
     socialHot ? "把社交热议当作线索，核验高热帖子是否有真实催化剂。" : null,
     technical ? "结合 20 日/50 日均线和 RSI，避免只因热度做短线追涨。" : null,
-    fundamental ? "把估值倍数与收入增速、利润率一起看，不单看 P/E 高低。" : null,
+    fundamental
+      ? isEtf
+        ? "ETF 重点核对跟踪标的、持仓集中度、费用、流动性和跟踪误差。"
+        : "把估值倍数与收入增速、利润率一起看，不单看 P/E 高低。"
+      : null,
   ].filter(Boolean);
   return {
     ticker,
@@ -2562,6 +2725,7 @@ function buildStockReport(run, ticker) {
     filings,
     social,
     alerts,
+    isEtf,
     change,
     score,
     positives: positives.slice(0, 5),
@@ -2633,6 +2797,26 @@ function stockReportTickers(run) {
   ].filter(Boolean);
 }
 
+function longListPage(scope, rows = [], pageSize = 8) {
+  const pageCount = Math.max(1, Math.ceil(rows.length / pageSize));
+  const page = Math.min(Math.max(0, Number(longListPages[scope] || 0)), pageCount - 1);
+  longListPages[scope] = page;
+  return {
+    page,
+    pageCount,
+    items: rows.slice(page * pageSize, (page + 1) * pageSize),
+  };
+}
+
+function renderListPagination(scope, total, page, pageCount) {
+  if (pageCount <= 1) return "";
+  return `<nav class="list-pagination" aria-label="长列表分页">
+    <button class="btn compact ghost" type="button" data-list-page-scope="${escapeHtml(scope)}" data-list-page-index="${page - 1}" ${page <= 0 ? "disabled" : ""} aria-label="上一页">&#8592; 上一页</button>
+    <span>第 ${escapeHtml(page + 1)} / ${escapeHtml(pageCount)} 页 · 共 ${escapeHtml(total)} 个</span>
+    <button class="btn compact ghost" type="button" data-list-page-scope="${escapeHtml(scope)}" data-list-page-index="${page + 1}" ${page >= pageCount - 1 ? "disabled" : ""} aria-label="下一页">下一页 &#8594;</button>
+  </nav>`;
+}
+
 function renderStockReportOverview(run, tickers) {
   document.body.classList.remove("stock-detail-mode");
   if (!run || !tickers.length) {
@@ -2642,7 +2826,8 @@ function renderStockReportOverview(run, tickers) {
   }
   const watchSet = new Set(run.watchlist || appState.watchlist || []);
   const risingSet = new Set((run.socialHotStocks?.rising || []).map((item) => item.ticker));
-  const cards = tickers.slice(0, 14).map((ticker) => buildStockReport(run, ticker));
+  const pageData = longListPage("stocks", tickers, 8);
+  const cards = pageData.items.map((ticker) => buildStockReport(run, ticker));
   els.stockReportBox.className = "stock-report-box stock-report-overview";
   els.stockReportBox.innerHTML = `<div class="stock-report-overview-head">
     <div>
@@ -2668,7 +2853,8 @@ function renderStockReportOverview(run, tickers) {
         <button class="btn compact" type="button" data-open-stock-report="${escapeHtml(report.ticker)}">查看日报</button>
       </article>`)
       .join("")}
-  </div>`;
+  </div>
+  ${renderListPagination("stocks", tickers.length, pageData.page, pageData.pageCount)}`;
 }
 
 function renderStockReport(run) {
@@ -2745,7 +2931,7 @@ function renderStockReport(run) {
     ${metric(report.quote ? fmtNumber(report.quote.price) : fmtNumber(report.technical?.latestClose), "最新价")}
     ${metric(pctLabel(report.change), "日内变动")}
     ${metric(trendLabel(report.technical?.trend), "技术趋势")}
-    ${metric(report.nextEarnings?.date || "未知", "下次财报")}
+    ${metric(report.isEtf ? "不适用" : report.nextEarnings?.date || "未知", report.isEtf ? "ETF 财报" : "下次财报")}
     ${metric(report.socialHot ? report.socialHot.mentions : report.social.length, "社交提及")}
   </div>
   <div class="stock-report-grid">
@@ -2804,16 +2990,16 @@ function renderStockReport(run) {
       ${report.risks.length ? `<ul>${report.risks.map((item) => `<li>${escapeHtml(item)}</li>`).join("")}</ul>` : empty("暂无高优先级风险，但仍需核验来源。")}
     </section>
     <section class="report-block">
-      <h3>基本面/估值</h3>
+      <h3>${report.isEtf ? "ETF 结构/估值" : "基本面/估值"}</h3>
       <div class="mini-kv">
         ${indicator("市值", report.fundamental?.marketCapitalization ? `${fmtNumber(report.fundamental.marketCapitalization / 1000, 1)}B` : "-")}
         ${indicator("市盈率", fmtNumber(report.fundamental?.peTTM, 1))}
-        ${indicator("收入同比", Number.isFinite(report.fundamental?.revenueGrowthTTMYoy) ? `${fmtNumber(report.fundamental.revenueGrowthTTMYoy, 1)}%` : "-")}
-        ${indicator("下次财报", report.nextEarnings?.date || "-")}
-        ${indicator("日程来源", report.nextEarnings?.sources?.join(" + ") || "-")}
-        ${indicator("校验", report.nextEarnings?.verified ? "已校验" : report.nextEarnings ? "待复核" : "-")}
+        ${report.isEtf ? indicator("产品类型", "ETF") : indicator("收入同比", Number.isFinite(report.fundamental?.revenueGrowthTTMYoy) ? `${fmtNumber(report.fundamental.revenueGrowthTTMYoy, 1)}%` : "-")}
+        ${indicator(report.isEtf ? "公司财报" : "下次财报", report.isEtf ? "不适用" : report.nextEarnings?.date || "-")}
+        ${indicator("日程来源", report.isEtf ? "不适用" : report.nextEarnings?.sources?.join(" + ") || "-")}
+        ${indicator("校验", report.isEtf ? "不适用" : report.nextEarnings?.verified ? "已校验" : report.nextEarnings ? "待复核" : "-")}
       </div>
-      ${longBridgeFundamentalBlock(report.fundamental)}
+      ${longBridgeFundamentalBlock(report.fundamental, report.ticker)}
       ${valuationHistoryBlock(report.fundamental)}
     </section>
     <section class="report-block wide">
@@ -3400,8 +3586,9 @@ function valuationHistoryBlock(fundamental = {}) {
   </div>`;
 }
 
-function longBridgeFundamentalBlock(fundamental = {}) {
+function longBridgeFundamentalBlock(fundamental = {}, ticker = "") {
   if (!fundamental) return "";
+  const isEtf = isEtfInstrument(fundamental, ticker);
   const rating = fundamental.analystRating || {};
   const financial = fundamental.financialSnapshot || {};
   const latest = fundamental.financialLatest || {};
@@ -3414,7 +3601,7 @@ function longBridgeFundamentalBlock(fundamental = {}) {
       ${indicator("评级", rating.recommendation || "-")}
       ${indicator("目标价", fmtNumber(rating.targetPrice, 2))}
       ${indicator("EPS预测", fmtNumber(fundamental.forecastEps?.mean, 2))}
-      ${indicator("净利率", Number.isFinite(fundamental.netProfitMarginTTM) ? `${fmtNumber(fundamental.netProfitMarginTTM, 1)}%` : "-")}
+      ${isEtf ? indicator("产品类型", "ETF") : indicator("净利率", fundamentalMarginDisplay(fundamental))}
     </div>`,
     financial.report
       ? `<p class="muted">最新财报：${escapeHtml(financial.report)}${Number.isFinite(financial.revenueYoy) ? `；收入同比 ${escapeHtml(fmtNumber(financial.revenueYoy, 1))}%` : ""}${Number.isFinite(financial.epsYoy) ? `；EPS同比 ${escapeHtml(fmtNumber(financial.epsYoy, 1))}%` : ""}</p>`
@@ -3480,7 +3667,7 @@ function industryChainMiniTable(rows = [], relationLabel = "") {
       <span>${escapeHtml(item.role || relationLabel || "-")}</span>
       <span>${escapeHtml(pctLabel(item.changePercent))}</span>
       <span>${escapeHtml(fmtNumber(item.peTTM, 1))}</span>
-      <span>${escapeHtml(Number.isFinite(item.netProfitMarginTTM) ? `${fmtNumber(item.netProfitMarginTTM, 1)}%` : "-")}</span>
+      <span>${escapeHtml(fundamentalMarginDisplay(item))}</span>
     </div>`).join("")}
   </div>`;
 }
@@ -3538,13 +3725,14 @@ function industryChainPackBlock(pack) {
 function peerBenchmarkBlock(peer) {
   if (!peer?.peers?.length) return empty(peer?.summary || "暂无同业对照。");
   const rows = peer.peers.slice(0, 10);
+  const targetIsEtf = rows.some((item) => item.isTarget && isEtfInstrument(item));
   return `<div class="peer-benchmark">
     <p>${escapeHtml(peer.summary || "")}</p>
     <div class="peer-ranks">
       ${indicator("P/E低估值排名", rankLabel(peer.ranks?.valuationPe))}
       ${indicator("P/S低估值排名", rankLabel(peer.ranks?.valuationPs))}
       ${indicator("增速排名", rankLabel(peer.ranks?.growth))}
-      ${indicator("净利率排名", rankLabel(peer.ranks?.margin))}
+      ${indicator("净利率排名", targetIsEtf ? "不适用" : rankLabel(peer.ranks?.margin))}
     </div>
     ${
       peer.notes?.length
@@ -3565,7 +3753,7 @@ function peerBenchmarkBlock(peer) {
             <span>${escapeHtml(fmtNumber(item.peTTM, 1))}</span>
             <span>${escapeHtml(fmtNumber(item.psTTM, 1))}</span>
             <span>${escapeHtml(Number.isFinite(item.revenueGrowthTTMYoy) ? `${fmtNumber(item.revenueGrowthTTMYoy, 1)}%` : "-")}</span>
-            <span>${escapeHtml(Number.isFinite(item.netProfitMarginTTM) ? `${fmtNumber(item.netProfitMarginTTM, 1)}%` : "-")}</span>
+            <span>${escapeHtml(fundamentalMarginDisplay(item))}</span>
           </div>`,
         )
         .join("")}
@@ -3924,14 +4112,14 @@ function optionGexChart(options = {}) {
     .join("");
   return `<article class="option-chart-card">
     <div class="row"><h4>GEX by Strike</h4><span class="tag">${escapeHtml(moneyMillions(options.totals?.netGex))}</span></div>
-    <svg class="option-svg" viewBox="0 0 ${width} ${height}" role="img" aria-label="GEX by strike">
+    <div class="option-chart-scroll"><svg class="option-svg" viewBox="0 0 ${width} ${height}" role="img" aria-label="GEX by strike">
       <line x1="${margin.left}" y1="${zero}" x2="${width - margin.right}" y2="${zero}" stroke="#9aa6b2" />
       ${bars}
       ${optionMarkers(options, xFor, margin.top, height - margin.bottom)}
       ${optionAxisLabels(rows, xFor, height - 10)}
       <text x="${margin.left}" y="16">正 GEX 压波动</text>
       <text x="${margin.left}" y="${height - 18}">负 GEX 放波动</text>
-    </svg>
+    </svg></div>
   </article>`;
 }
 
@@ -3963,13 +4151,13 @@ function optionOiVolumeChart(options = {}) {
     .join("");
   return `<article class="option-chart-card">
     <div class="row"><h4>OI / Volume 堆叠</h4><span class="tag">Call / Put</span></div>
-    <svg class="option-svg" viewBox="0 0 ${width} ${height}" role="img" aria-label="Open interest and volume">
+    <div class="option-chart-scroll"><svg class="option-svg" viewBox="0 0 ${width} ${height}" role="img" aria-label="Open interest and volume">
       <line x1="${margin.left}" y1="${baseline}" x2="${width - margin.right}" y2="${baseline}" stroke="#9aa6b2" />
       ${bars}
       ${optionMarkers(options, xFor, margin.top, height - margin.bottom)}
       ${optionAxisLabels(rows, xFor, height - 10)}
       <text x="${margin.left}" y="16">绿=Call OI，橙=Put OI，蓝=成交量</text>
-    </svg>
+    </svg></div>
   </article>`;
 }
 
@@ -3993,7 +4181,7 @@ function optionIvSmileChart(options = {}) {
       .join(" ");
   return `<article class="option-chart-card">
     <div class="row"><h4>IV Smile</h4><span class="tag">隐含波动率</span></div>
-    <svg class="option-svg" viewBox="0 0 ${width} ${height}" role="img" aria-label="Implied volatility smile">
+    <div class="option-chart-scroll"><svg class="option-svg" viewBox="0 0 ${width} ${height}" role="img" aria-label="Implied volatility smile">
       <line x1="${margin.left}" y1="${height - margin.bottom}" x2="${width - margin.right}" y2="${height - margin.bottom}" stroke="#9aa6b2" />
       <path d="${pathFor("avgIv")}" fill="none" stroke="#475569" stroke-width="2.2" />
       <path d="${pathFor("callIv")}" fill="none" stroke="#0f766e" stroke-width="1.8" />
@@ -4003,12 +4191,12 @@ function optionIvSmileChart(options = {}) {
       <text x="${margin.left}" y="16">灰=平均 IV，绿=Call，橙=Put</text>
       <text x="${width - 96}" y="16">${escapeHtml(`${fmtNumber(maxIv * 100, 0)}%`)}</text>
       <text x="${width - 96}" y="${height - 40}">${escapeHtml(`${fmtNumber(minIv * 100, 0)}%`)}</text>
-    </svg>
+    </svg></div>
   </article>`;
 }
 
 function optionsChartGrid(options = {}) {
-  return `<div class="option-chart-grid">
+  return `<div class="option-chart-grid option-data-chart-grid">
     ${optionGexChart(options)}
     ${optionOiVolumeChart(options)}
     ${optionIvSmileChart(options)}
@@ -4939,29 +5127,29 @@ function renderTrendTopicCard(item = {}) {
 }
 
 function trendTopicSections(run = {}) {
-  const general = (run.generalHotTopics || []).slice(0, 8);
-  const market = (run.marketHotTopics || []).slice(0, 8);
+  const general = run.generalHotTopics || [];
+  const market = run.marketHotTopics || [];
   if (!general.length && !market.length) return "";
-  return `<section class="social-source-board">
-    <div class="social-source-head">
+  return `<details class="social-source-board social-source-fold">
+    <summary class="social-source-head">
       <div>
         <p class="section-label">TrendRadar / NewsNow</p>
         <h3>社交热议（非股票）</h3>
       </div>
       <span class="tag">${escapeHtml(general.length)} 条</span>
-    </div>
+    </summary>
     <div class="social-board-grid">${general.length ? general.map(renderTrendTopicCard).join("") : empty("暂无非股票泛热点。")}</div>
-  </section>
-  <section class="social-source-board">
-    <div class="social-source-head">
+  </details>
+  <details class="social-source-board social-source-fold">
+    <summary class="social-source-head">
       <div>
         <p class="section-label">Market Topics</p>
         <h3>美股/全球市场热议主题</h3>
       </div>
       <span class="tag amber">${escapeHtml(market.length)} 条</span>
-    </div>
+    </summary>
     <div class="social-board-grid">${market.length ? market.map(renderTrendTopicCard).join("") : empty("暂无市场主题热点。")}</div>
-  </section>`;
+  </details>`;
 }
 
 function renderSocial(run) {
@@ -4982,10 +5170,10 @@ function renderSocial(run) {
       <p>${escapeHtml(`当前保留 ${sourceBoards.length} 个来源榜，候选 ${totalCandidates} 个；各榜单单独排序，不再让 Longbridge、ApeWisdom、Stocktwits 等互相挤掉。`)}</p>
       <p class="muted">每个来源内部仍会用新闻正文、关键词、公司画像、行情和技术面解释“为什么热”；综合榜只作为兼容数据保留。</p>
     </article>${sourceBoards
-      .map((board) => {
-        const rows = (board.rising?.length ? board.rising : board.candidates || []).slice(0, 6);
-        return `<section class="social-source-board">
-          <div class="social-source-head">
+      .map((board, boardIndex) => {
+        const rows = board.rising?.length ? board.rising : board.candidates || [];
+        return `<details class="social-source-board social-source-fold" ${boardIndex === 0 ? "open" : ""}>
+          <summary class="social-source-head">
             <div>
               <p class="section-label">${escapeHtml(board.label || board.source || "社交来源")}</p>
               <h3>${escapeHtml(board.label || board.source || "社交来源")}</h3>
@@ -4994,11 +5182,11 @@ function renderSocial(run) {
               <span class="tag">${escapeHtml(board.count || 0)} 条材料</span>
               <span class="tag amber">${escapeHtml(rows.length)} 个候选</span>
             </div>
-          </div>
+          </summary>
           <div class="social-board-grid">
             ${rows.map((item, index) => renderSocialRankCard(item, `#${index + 1}`, run)).join("")}
           </div>
-        </section>`;
+        </details>`;
       })
       .join("")}`;
     return;
@@ -5012,7 +5200,8 @@ function renderSocial(run) {
   }
   const allMarket = ranked.filter((item) => item.discoveryScope === "all-market");
   const watchlist = ranked.filter((item) => item.discoveryScope !== "all-market");
-  const candidates = [...allMarket, ...watchlist].slice(0, 12);
+  const candidates = [...allMarket, ...watchlist];
+  const pageData = longListPage("social", candidates, 8);
   const sourceText = [
     allMarket.length ? `全市场新机会 ${allMarket.length} 个` : "暂无全市场新机会",
     watchlist.length ? `自选池补充 ${watchlist.length} 个` : "",
@@ -5025,11 +5214,11 @@ function renderSocial(run) {
       </div>
       <p>${escapeHtml(sourceText)}</p>
       <p class="muted">排序优先看 24h 提及变化、排名变化、跨社区热度，再用新闻原文、基本面、技术面和行业画像解释“为什么热”。</p>
-    </article>${candidates
+    </article>${pageData.items
     .map(
       (item) => renderSocialRankCard(item, item.discoveryScope === "all-market" ? "全市场" : "自选池", run),
     )
-    .join("")}`;
+    .join("")}${renderListPagination("social", candidates.length, pageData.page, pageData.pageCount)}`;
 }
 
 function actionSuggestionTypeClass(type = "", action = "") {
@@ -5112,6 +5301,38 @@ function renderActionSuggestionSection(title, subtitle, rows = [], run = null, o
   </details>`;
 }
 
+function actionSuggestionGroupKey(item = {}) {
+  if (item.operationType === "候选买入") return "buy";
+  if (item.operationType === "等待触发") return "wait";
+  if (item.operationType === "风险处理" || item.operationType === "回避") return "risk";
+  return "idle";
+}
+
+function actionSuggestionViewModel(suggestions = {}) {
+  const groupedRows = Object.values(suggestions.groups || {}).flat();
+  const sourceRows = suggestions.candidates?.length ? suggestions.candidates : groupedRows;
+  const seen = new Set();
+  const rows = sourceRows.filter(Boolean).filter((item, index) => {
+    const key = normalizeTickerSymbol(item.ticker) || `${item.operationType || "unknown"}:${index}`;
+    if (seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  });
+  const groups = { buy: [], wait: [], risk: [], idle: [] };
+  rows.forEach((item) => groups[actionSuggestionGroupKey(item)].push(item));
+  return {
+    rows,
+    groups,
+    summary: {
+      total: rows.length,
+      buy: groups.buy.length,
+      wait: groups.wait.length,
+      risk: groups.risk.length,
+      idle: groups.idle.length,
+    },
+  };
+}
+
 function renderActionSuggestions(run) {
   if (!els.actionSuggestionsBox) return;
   const suggestions = run?.actionSuggestions;
@@ -5125,13 +5346,13 @@ function renderActionSuggestions(run) {
     els.actionSuggestionsBox.innerHTML = "正在加载历史报告详情，稍后显示操作建议。";
     return;
   }
-  if (!suggestions?.candidates?.length) {
+  const view = actionSuggestionViewModel(suggestions || {});
+  if (!view.rows.length) {
     els.actionSuggestionsBox.className = "action-suggestions-box empty-state";
     els.actionSuggestionsBox.innerHTML = "当前没有可排序的操作建议。请先运行采集，或在自选股里加入标的。";
     return;
   }
-  const groups = suggestions.groups || {};
-  const summary = suggestions.summary || {};
+  const { groups, summary } = view;
   els.actionSuggestionsBox.className = "action-suggestions-box";
   els.actionSuggestionsBox.innerHTML = `<div class="action-suggestion-hero">
       <div>
@@ -5139,11 +5360,12 @@ function renderActionSuggestions(run) {
         <h3>从自选股和重点股票池筛选可操作标的</h3>
         <p class="muted">${escapeHtml(suggestions.universe?.note || "排序优先自选股，并结合重点股票池、因子候选和社交异动。")}</p>
       </div>
-      <div class="action-suggestion-metrics">
+      <div class="action-suggestion-metrics action-suggestion-summary-metrics">
         ${actionSuggestionMetric(summary.total, "总数")}
         ${actionSuggestionMetric(summary.buy, "候选买入")}
         ${actionSuggestionMetric(summary.wait, "等待触发")}
         ${actionSuggestionMetric(summary.risk, "风险处理")}
+        ${actionSuggestionMetric(summary.idle, "观察/暂不操作")}
       </div>
     </div>
     ${renderActionSuggestionSection("优先操作", "候选买入", groups.buy || [], run, { open: Boolean(groups.buy?.length) })}
@@ -6059,6 +6281,7 @@ function renderFundamentals(run) {
   els.fundamentalGrid.innerHTML = fundamentals
     .slice(0, 10)
     .map((item) => {
+      const isEtf = isEtfInstrument(item);
       const earningsDate =
         item.nextEarnings?.date || item.nextEarnings?.date2 || item.nextEarnings?.period || "";
       return `<article class="fundamental-card">
@@ -6074,10 +6297,10 @@ function renderFundamentals(run) {
           ${indicator("市盈率", fmtNumber(item.peTTM, 1))}
           ${indicator("市销率", fmtNumber(item.psTTM, 1))}
           ${indicator("收入同比", Number.isFinite(item.revenueGrowthTTMYoy) ? `${fmtNumber(item.revenueGrowthTTMYoy, 1)}%` : "-")}
-          ${indicator("净利率", Number.isFinite(item.netProfitMarginTTM) ? `${fmtNumber(item.netProfitMarginTTM, 1)}%` : "-")}
+          ${isEtf ? indicator("产品类型", "ETF") : indicator("净利率", fundamentalMarginDisplay(item))}
           ${indicator("负债/权益", fmtNumber(item.debtEquityAnnual, 1))}
         </div>
-        <p class="muted fundamental-foot">下次财报：${escapeHtml(earningsDate || "未知")} · ${escapeHtml(item.provider || "")}</p>
+        <p class="muted fundamental-foot">${isEtf ? "ETF 无公司财报日" : `下次财报：${escapeHtml(earningsDate || "未知")}`} · ${escapeHtml(item.provider || "")}</p>
       </article>`;
     })
     .join("");
@@ -7551,7 +7774,7 @@ function routeLabel(key) {
     light: "轻任务",
     standard: "常规摘要",
     reasoning: "推理复盘",
-    fallback: "降级摘要",
+    fallback: "快速摘要模型",
     heavy: "深度报告",
   };
   return labels[key] || key;
@@ -7577,14 +7800,14 @@ function renderLlmRouting(llmRouting = {}) {
     .map((item) => `<div class="diagnostic-row">
       <div>
         <strong>${escapeHtml(`${providerLabel(item.provider)} · ${routeLabel(item.tier)}`)}</strong>
-        <p class="muted">${escapeHtml(item.error || "外部 LLM 调用失败，暂时降级。")}</p>
+        <p class="muted">${escapeHtml(item.error || "外部 LLM 调用失败，正在等待重试。")}</p>
       </div>
       <span class="tag amber">${escapeHtml(`${Math.ceil(Number(item.remainingMs || 0) / 1000)} 秒`)}</span>
     </div>`)
     .join("");
   return `<div class="quality-section">
     <h3>CLI 模型路由</h3>
-    <p class="muted">当前展示 ${escapeHtml(cliName)}；轻任务优先速度，深度报告优先推理；失败时按降级摘要和本地规则兜底。${cooldown ? `外部 LLM 失败后冷却 ${Math.round(cooldown / 1000)} 秒。` : ""}</p>
+    <p class="muted">当前展示 ${escapeHtml(cliName)}；轻任务优先速度，深度报告优先推理；失败后最多重试三次，仍失败则明确终止对应任务。${cooldown ? `外部 LLM 失败后冷却 ${Math.round(cooldown / 1000)} 秒。` : ""}</p>
     ${rows}
     ${cooldownRows ? `<h3>冷却中的 LLM</h3>${cooldownRows}` : `<p class="muted">当前没有 LLM provider/tier 处于冷却状态。</p>`}
   </div>`;
@@ -7611,7 +7834,7 @@ function renderIntegrationReadiness(config = {}) {
         <div>
           <strong>${escapeHtml(item.title || item.key)}</strong>
           <p class="muted">${escapeHtml(item.evidence || "尚未完成诊断。")}</p>
-          ${item.fallback ? `<p class="muted">当前兜底：${escapeHtml(item.fallback)}</p>` : ""}
+          ${item.fallback ? `<p class="muted">其他独立来源：${escapeHtml(item.fallback)}</p>` : ""}
           ${item.nextAction ? `<p class="muted">下一步：${escapeHtml(item.nextAction)}</p>` : ""}
           ${verify ? `<p class="muted">复检项：${escapeHtml(verify)}</p>` : ""}
         </div>
@@ -7625,7 +7848,7 @@ function renderIntegrationReadiness(config = {}) {
         <h3>外部接入真实状态</h3>
         <p class="muted">${escapeHtml(readiness.summary || "正在汇总外部接入状态。")}</p>
       </div>
-      <span class="tag ${headerClass}">${escapeHtml(counts.ok || 0)} 已接入 / ${escapeHtml(counts.fallback || 0)} 兜底 / ${escapeHtml(counts.manual || 0)} 待处理</span>
+      <span class="tag ${headerClass}">${escapeHtml(counts.ok || 0)} 已接入 / ${escapeHtml((counts.warn || 0) + (counts.fallback || 0))} 部分可用 / ${escapeHtml(counts.manual || 0)} 待处理</span>
     </div>
     ${
       readiness.stale
@@ -8307,8 +8530,9 @@ async function run(session) {
   try {
     const result = await api("/api/run", {
       method: "POST",
-      body: JSON.stringify({ session, llmProvider: selectedLlmProvider(), async: true }),
+      body: JSON.stringify({ session, async: true }),
     });
+    clearRefreshError("run");
     if (result.runStatus) {
       collectionStatus = result.runStatus;
       render();
@@ -8320,6 +8544,7 @@ async function run(session) {
     }
     await loadState();
   } catch (error) {
+    showRefreshError(`采集启动失败：${error.message}`, "run");
     alert(error.message);
   } finally {
     if (collectionStatus?.state !== "running") setBusy(false);
@@ -8525,6 +8750,13 @@ els.runHistoryBox.addEventListener("click", (event) => {
 });
 
 els.stockReportBox.addEventListener("click", async (event) => {
+  const pageButton = event.target.closest('[data-list-page-scope="stocks"]');
+  if (pageButton && !pageButton.disabled) {
+    longListPages.stocks = Number(pageButton.dataset.listPageIndex || 0);
+    renderStockReport(selectedReportRun());
+    els.stockReportBox.scrollIntoView({ behavior: "smooth", block: "start" });
+    return;
+  }
   const openButton = event.target.closest("[data-open-stock-report]");
   if (openButton) {
     openStockDetail(openButton.dataset.openStockReport, { fetch: false });
@@ -8595,6 +8827,14 @@ els.stockReportBox.addEventListener("click", async (event) => {
     button.disabled = false;
     button.textContent = "立即补抓期权链";
   }
+});
+
+els.socialGrid?.addEventListener("click", (event) => {
+  const pageButton = event.target.closest('[data-list-page-scope="social"]');
+  if (!pageButton || pageButton.disabled) return;
+  longListPages.social = Number(pageButton.dataset.listPageIndex || 0);
+  renderSocial(selectedReportRun());
+  els.socialGrid.scrollIntoView({ behavior: "smooth", block: "start" });
 });
 
 els.actionSuggestionsBox?.addEventListener("click", (event) => {
@@ -8974,7 +9214,7 @@ els.tradeReviewButton.addEventListener("click", async () => {
   try {
     await api("/api/trade-review", {
       method: "POST",
-      body: JSON.stringify({ llmProvider: selectedLlmProvider() }),
+      body: JSON.stringify({}),
     });
     await loadState();
   } catch (error) {
@@ -9155,14 +9395,17 @@ els.openbbRouteForm?.addEventListener("submit", async (event) => {
 
 resetTradeForm();
 
-loadState().catch((error) => {
-  document.body.innerHTML = `<pre>${escapeHtml(error.message)}</pre>`;
-});
+loadState()
+  .then(() => pollCollectionStatus())
+  .catch(() => {
+    renderPageShell();
+  });
 
 setInterval(() => {
   if (busy) return;
   api("/api/run/status")
     .then(async (result) => {
+      clearRefreshError("background-status");
       collectionStatus = result.runStatus || null;
       if (collectionStatus?.state === "running") {
         setBusy(true);
@@ -9173,5 +9416,7 @@ setInterval(() => {
         await loadState();
       }
     })
-    .catch(() => {});
+    .catch((error) => {
+      showRefreshError(`后台状态检查失败：${error.message}`, "background-status");
+    });
 }, 30000);
