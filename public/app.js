@@ -22,6 +22,8 @@ const els = {
   stockReportBox: document.getElementById("stockReportBox"),
   stockDeepDiveBox: document.getElementById("stockDeepDiveBox"),
   discoveryGrid: document.getElementById("discoveryGrid"),
+  marketScreenBox: document.getElementById("marketScreenBox"),
+  runMarketScreen: document.getElementById("runMarketScreen"),
   socialGrid: document.getElementById("socialGrid"),
   analysisProvider: document.getElementById("analysisProvider"),
   analysisBody: document.getElementById("analysisBody"),
@@ -170,6 +172,7 @@ let strategyValidationPayload = null;
 let supplementalDataError = "";
 let runDetailWarning = "";
 let runHistoryLoading = false;
+let marketScreenBusy = false;
 let runHistoryPagination = { loaded: false, nextOffset: 0, hasMore: false, total: 0 };
 const longListPages = { social: 0, stocks: 0 };
 const refreshErrors = new Map();
@@ -917,6 +920,8 @@ function sourceLabel(value) {
     Finnhub: "Finnhub 行情",
   };
   if (/^Nasdaq Historical/i.test(value)) return String(value).replace(/^Nasdaq Historical/i, "Nasdaq 历史日线");
+  if (/^longbridge(?::|$)/i.test(value)) return "Longbridge";
+  if (value === "historical_bars") return "历史 K 线库";
   return labels[value] || value || "";
 }
 
@@ -1095,6 +1100,9 @@ function render() {
   if (page === "ops") {
     renderRunHistory(appState.runs || [], selectedRun);
     ensureRunHistoryLoaded();
+  }
+  if (page === "stocks") {
+    renderMarketScreen(appState.marketScreens || [], appState.config?.marketScreen || {});
   }
   if (selectedRun?.summaryOnly) {
     renderRunSummaryLoading(selectedRun);
@@ -5088,6 +5096,82 @@ function secExhibitList(exhibits) {
   </div>`;
 }
 
+function renderMarketScreenFactorTags(row = {}) {
+  const positive = (row.topPositiveFactors || [])
+    .filter((factor) => Number(factor.contribution) > 0.05)
+    .slice(0, 2)
+    .map((factor) => ({ ...factor, tone: "green" }));
+  const risks = (row.topRiskFactors || [])
+    .filter((factor) => Number(factor.contribution) < -0.05)
+    .slice(0, 1)
+    .map((factor) => ({ ...factor, tone: "red" }));
+  const factors = [...positive, ...risks];
+  if (!factors.length) return `<span class="muted">暂无可展示归因</span>`;
+  return factors.map((factor) => {
+    const contribution = Number(factor.contribution);
+    const suffix = Number.isFinite(contribution) ? ` ${contribution > 0 ? "+" : ""}${fmtNumber(contribution, 1)}` : "";
+    return `<span class="tag ${factor.tone}">${escapeHtml(`${factor.label || factor.id || "因子"}${suffix}`)}</span>`;
+  }).join("");
+}
+
+function renderMarketScreen(screens = [], config = {}) {
+  if (!els.marketScreenBox) return;
+  const latest = screens?.[0] || null;
+  if (els.runMarketScreen) {
+    const running = marketScreenBusy || config.running;
+    els.runMarketScreen.disabled = Boolean(running);
+    els.runMarketScreen.textContent = running ? (config.running ? "夜间更新中..." : "评分中...") : "重新评分";
+  }
+  if (!latest?.rows?.length) {
+    els.marketScreenBox.className = "market-screen-box empty-state";
+    els.marketScreenBox.textContent = config.enabled
+      ? "夜间筛选尚未生成结果，可先使用已入库 K 线重新评分。"
+      : "全市场夜间调度未启用；手动评分仍可使用。";
+    return;
+  }
+  const summary = latest.summary || {};
+  const excluded = summary.excluded || {};
+  const refresh = latest.barRefresh || null;
+  els.marketScreenBox.className = "market-screen-box";
+  els.marketScreenBox.innerHTML = `<div class="market-screen-summary">
+      <div>
+        <div class="row market-screen-title-row">
+          <span class="tag green">研究漏斗</span>
+          <span class="tag">${escapeHtml(latest.asOf || "-")}</span>
+          <span class="tag ${latest.status === "ok" ? "green" : "amber"}">${escapeHtml(latest.status === "ok" ? "完整" : "部分可用")}</span>
+        </div>
+        <p class="muted">覆盖 ${escapeHtml(summary.membershipCount || 0)} 只当前标普成分，评估 ${escapeHtml(summary.evaluatedCount || 0)} 只；仅把候选送入 Agent，不代表买入建议。</p>
+      </div>
+      <div class="market-screen-metrics">
+        ${allStockAgentMetric(summary.resultCount, "入漏斗")}
+        <div class="all-stock-agent-metric"><strong>${escapeHtml(summary.latestBarDate || "-")}</strong><span>最新 K 线</span></div>
+        ${allStockAgentMetric(Number(latest.durationMs) / 1000, "耗时/秒", 0)}
+      </div>
+    </div>
+    <div class="market-screen-provenance">
+      <span>${escapeHtml(latest.source || "SQLite historical_bars")}</span>
+      <span>缺 K 线 ${escapeHtml(excluded.missingBars || 0)}</span>
+      <span>样本不足 ${escapeHtml(excluded.insufficientBars || 0)}</span>
+      <span>过期 ${escapeHtml(excluded.staleBars || 0)}</span>
+      ${refresh ? `<span>夜间更新 ${escapeHtml(refresh.tickerRows || 0)}/${escapeHtml(refresh.tickers || 0)}</span>` : ""}
+      <span>${escapeHtml(config.enabled ? `盘后 Agent 前先行；纽约时间 ${config.newYorkTime || "17:30"} 兜底` : "自动调度未启用")}</span>
+    </div>
+    <div class="market-screen-list">
+      ${latest.rows.map((row) => `<article class="market-screen-row">
+        <span class="market-screen-rank">#${escapeHtml(row.rank || "-")}</span>
+        <div class="market-screen-symbol">
+          <button class="link-button" type="button" data-market-screen-ticker="${escapeHtml(row.ticker)}">${escapeHtml(tickerLabel(row.ticker, row))}</button>
+          <small>${escapeHtml(row.latestDate || "-")} · ${escapeHtml(Number(row.freshnessDays) === 0 ? "当日" : `${row.freshnessDays} 天前`)} · ${escapeHtml(row.barCount || 0)} 根 · ${escapeHtml(sourceLabel(row.source || "historical_bars"))}</small>
+        </div>
+        <div class="market-screen-score">
+          <strong>${escapeHtml(fmtNumber(Number(row.score), 1))}</strong>
+          <small>综合分 · Q${escapeHtml(fmtNumber(Number(row.dataQualityScore), 0))}</small>
+        </div>
+        <div class="market-screen-factors">${renderMarketScreenFactorTags(row)}</div>
+      </article>`).join("")}
+    </div>`;
+}
+
 function renderDiscovery(run) {
   const candidates = run?.discovery?.candidates || [];
   if (!candidates.length) {
@@ -5627,6 +5711,14 @@ function renderAllStockAgentTrackRecord(latest = {}) {
     .filter((row) => Number(row.n || row.samples) > 0)
     .sort((a, b) => Math.abs(Number(b.rankIC) || 0) - Math.abs(Number(a.rankIC) || 0) || Number(b.n || b.samples) - Number(a.n || a.samples))
     .slice(0, 6);
+  const funnelRows = factorRows
+    .flatMap((factor) => Object.values(factor.entryFunnelSplit || {}).map((cell) => ({
+      ...cell,
+      factorLabel: factor.label || factor.id,
+    })))
+    .filter((row) => Number(row.n || row.samples) > 0)
+    .sort((a, b) => Number(b.n || b.samples) - Number(a.n || a.samples))
+    .slice(0, 8);
   const correlation = latest.factorCorrelationMatrix || {};
   const highPairs = (correlation.highCorrelationPairs || []).slice(0, 6);
   return `<section class="all-stock-agent-section">
@@ -5702,6 +5794,15 @@ function renderAllStockAgentTrackRecord(latest = {}) {
             <strong>${escapeHtml(item.factorLabel)} / ${escapeHtml(item.label || item.id)}</strong>
             <span>RankIC ${escapeHtml(fmtNumber(Number(item.rankIC), 2))} · n=${escapeHtml(item.n || item.samples || 0)}</span>
           </div>`).join("") : `<p class="muted">暂无子信号追责样本。</p>`}
+        </div>
+      </article>
+      <article class="all-stock-agent-paper-card">
+        <h4>入口漏斗追责</h4>
+        <div class="all-stock-agent-mini-list">
+          ${funnelRows.length ? funnelRows.map((item) => `<div>
+            <strong>${escapeHtml(item.factorLabel)} / ${escapeHtml(item.funnel === "market-screen" ? "全市场筛选" : "注意力或混合入口")}</strong>
+            <span>平均超额 ${escapeHtml(fmtPct(Number(item.avgExcessPct)))} · n=${escapeHtml(item.n || item.samples || 0)}</span>
+          </div>`).join("") : `<p class="muted">暂无带入口标签的到期样本。</p>`}
         </div>
       </article>
       <article class="all-stock-agent-paper-card">
@@ -9149,6 +9250,29 @@ els.runAllStockAgentBacktest?.addEventListener("click", async () => {
   } finally {
     button.disabled = false;
     button.textContent = "规则回测";
+  }
+});
+
+els.marketScreenBox?.addEventListener("click", (event) => {
+  const button = event.target.closest("[data-market-screen-ticker]");
+  if (!button) return;
+  openStockDetail(button.dataset.marketScreenTicker);
+});
+
+els.runMarketScreen?.addEventListener("click", async () => {
+  marketScreenBusy = true;
+  renderMarketScreen(appState?.marketScreens || [], appState?.config?.marketScreen || {});
+  try {
+    await apiWithRetries("/api/market-screen/run", {
+      method: "POST",
+      body: JSON.stringify({ refreshBars: false }),
+    }, 3);
+    await loadState();
+  } catch (error) {
+    alert(`全市场评分失败：${error.message}`);
+  } finally {
+    marketScreenBusy = false;
+    renderMarketScreen(appState?.marketScreens || [], appState?.config?.marketScreen || {});
   }
 });
 

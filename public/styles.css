@@ -1059,6 +1059,106 @@ body.stock-detail-mode .stock-report-panel {
   gap: 10px;
 }
 
+.market-screen-box {
+  display: grid;
+  gap: 10px;
+}
+
+.market-screen-summary {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 16px;
+  padding: 12px;
+  border: 1px solid rgba(59, 130, 246, 0.18);
+  border-radius: 8px;
+  background: rgba(248, 250, 252, 0.72);
+  backdrop-filter: blur(14px);
+}
+
+.market-screen-title-row,
+.market-screen-provenance,
+.market-screen-factors {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.market-screen-summary p {
+  margin: 7px 0 0;
+}
+
+.market-screen-metrics {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(84px, 1fr));
+  gap: 7px;
+  min-width: min(100%, 300px);
+}
+
+.market-screen-provenance {
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.market-screen-provenance span {
+  padding-right: 8px;
+  border-right: 1px solid rgba(148, 163, 184, 0.28);
+}
+
+.market-screen-list {
+  max-height: 920px;
+  overflow: auto;
+  border: 1px solid rgba(148, 163, 184, 0.2);
+  border-radius: 8px;
+  background: rgba(255, 255, 255, 0.54);
+}
+
+.market-screen-row {
+  display: grid;
+  grid-template-columns: 42px minmax(150px, 0.8fr) minmax(92px, 0.45fr) minmax(220px, 1.7fr);
+  align-items: center;
+  gap: 10px;
+  min-height: 64px;
+  padding: 9px 12px;
+  border-bottom: 1px solid rgba(148, 163, 184, 0.16);
+}
+
+.market-screen-row:last-child {
+  border-bottom: 0;
+}
+
+.market-screen-rank {
+  color: var(--muted);
+  font-variant-numeric: tabular-nums;
+  font-size: 12px;
+}
+
+.market-screen-symbol,
+.market-screen-score {
+  display: grid;
+  min-width: 0;
+  gap: 2px;
+}
+
+.market-screen-symbol .link-button {
+  width: fit-content;
+  max-width: 100%;
+  overflow-wrap: anywhere;
+  text-align: left;
+}
+
+.market-screen-symbol small,
+.market-screen-score small {
+  color: var(--muted);
+  font-size: 11px;
+}
+
+.market-screen-score strong {
+  font-size: 18px;
+  font-variant-numeric: tabular-nums;
+}
+
 .openbb-grid {
   display: grid;
   gap: 10px;
@@ -4501,5 +4601,23 @@ body.stock-detail-mode .stock-report-panel {
   .action-required-note {
     align-items: stretch;
     flex-direction: column;
+  }
+
+  .market-screen-summary {
+    flex-direction: column;
+  }
+
+  .market-screen-metrics {
+    width: 100%;
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+  }
+
+  .market-screen-row {
+    grid-template-columns: 32px minmax(0, 1fr) 82px;
+    align-items: start;
+  }
+
+  .market-screen-factors {
+    grid-column: 2 / -1;
   }
 }

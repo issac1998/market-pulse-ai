@@ -57,6 +57,11 @@ import {
   runHistoricalWalkForwardFromRows,
   runHistoricalWalkForwardFromSqlite,
 } from "../server/historical_backtest.mjs";
+import {
+  buildMarketScreenFromRows,
+  loadMarketScreenCorpus,
+  marketScreenEntryFunnel,
+} from "../server/market_screen.mjs";
 import { proxyFetchResponse } from "../server/network_fetch.mjs";
 import {
   gitBlobSha1,
@@ -2011,6 +2016,126 @@ assert.equal(
   historicalWalkForward.run.strategyHash,
   "Historical report should preserve frozen strategy provenance",
 );
+
+const marketScreenAsOf = "2026-06-30";
+const marketScreenDates = Array.from({ length: 90 }, (_, index) => {
+  const date = new Date(Date.UTC(2026, 3, 2 + index));
+  return date.toISOString().slice(0, 10);
+});
+const marketScreenTickers = ["QUIET", ...Array.from({ length: 35 }, (_, index) => `M${String(index + 1).padStart(2, "0")}`)];
+const marketScreenBars = [...marketScreenTickers, "SPY"].flatMap((ticker, tickerIndex) =>
+  marketScreenDates.map((date, index) => {
+    const drift = ticker === "QUIET" ? 0.035 : 0.02 + tickerIndex * 0.0025;
+    const close = 70 + tickerIndex * 1.7 + index * drift + Math.sin(index / 7 + tickerIndex) * 0.6;
+    return {
+      ticker,
+      date,
+      open: close - 0.2,
+      high: close + 0.8,
+      low: close - 0.7,
+      close,
+      volume: 1_000_000 + tickerIndex * 17_000 + index * 1_000,
+      source: "fixture:longbridge",
+    };
+  }),
+);
+const marketScreenWeights = normalizeRecommendationFactorWeights({});
+const marketScreen = buildMarketScreenFromRows({
+  membership: marketScreenTickers.map((ticker) => ({ ticker })),
+  benchmarkTickers: ["SPY"],
+  bars: marketScreenBars,
+  asOf: marketScreenAsOf,
+  weights: marketScreenWeights,
+  strategyVersionId: "fixture-active-v1",
+  funnelLimit: 50,
+  minBars: 60,
+  maxFreshnessDays: 3,
+  generatedAt: "2026-06-30T22:00:00.000Z",
+});
+assert.equal(marketScreen.summary.membershipCount, 36, "Market screen should retain the complete active membership fixture");
+assert.equal(marketScreen.rows.length, 36, "Every fresh membership ticker should be scored");
+assert.ok(!marketScreen.rows.some((row) => row.ticker === "SPY"), "Benchmark ETFs must never become screen candidates");
+assert.ok(marketScreen.rows.some((row) => row.ticker === "QUIET"), "A quiet membership-only ticker should surface in the screen funnel");
+const rawScreenSnapshots = marketScreenTickers.map((ticker) => buildFactorSnapshotAsOf({
+  ticker,
+  asOf: marketScreenAsOf,
+  bars: marketScreenBars.filter((row) => row.ticker === ticker),
+  weights: marketScreenWeights,
+}).factorSnapshot);
+const normalizedScreenSnapshots = applyCrossSectionalNormalization(rawScreenSnapshots, {
+  minCrossSection: 30,
+  lowerPct: 1,
+  upperPct: 99,
+}).snapshots;
+const manualMarketScores = new Map(normalizedScreenSnapshots.map((snapshot) => [
+  snapshot.ticker,
+  scoreRecommendationFromFactorSnapshot(snapshot, { weights: marketScreenWeights }).actionScore,
+]));
+for (const row of marketScreen.rows.slice(0, 3)) {
+  assertApprox(
+    row.score,
+    manualMarketScores.get(row.ticker),
+    1e-9,
+    `${row.ticker} market-screen score should match the shared walk-forward scorer`,
+  );
+}
+assert.equal(marketScreenEntryFunnel(["全市场因子筛选"]), "market-screen", "Screen-only entries should receive the market-screen funnel tag");
+assert.equal(marketScreenEntryFunnel(["全市场因子筛选", "新闻相关"]), "", "Mixed-source entries must remain attention-or-mixed");
+const marketScreenStats = buildFactorStatsFromOutcomes([
+  {
+    id: "screen-outcome",
+    decisionId: "screen-decision",
+    ticker: marketScreen.rows[0].ticker,
+    decisionAt: "2026-06-30",
+    horizonDays: 5,
+    excessPct: 2.4,
+    outcome: "win",
+    entryFunnel: "market-screen",
+    factorSnapshot: marketScreen.rows[0].factorSnapshot,
+  },
+  {
+    id: "attention-outcome",
+    decisionId: "attention-decision",
+    ticker: marketScreen.rows[1].ticker,
+    decisionAt: "2026-06-30",
+    horizonDays: 5,
+    excessPct: -1.1,
+    outcome: "loss",
+    entryFunnel: "",
+    factorSnapshot: marketScreen.rows[1].factorSnapshot,
+  },
+], { source: "fixture", returnField: "excessPct" });
+const marketScreenStatRow = Object.values(marketScreenStats)[0];
+assert.equal(marketScreenStatRow.entryFunnelSplit["market-screen"].n, 1, "Factor stats should retain screen-sourced sample counts");
+assert.equal(marketScreenStatRow.entryFunnelSplit["attention-or-mixed"].n, 1, "Factor stats should retain attention/mixed sample counts");
+const classShareSymbols = execFileSync("python3", [
+  "-c",
+  "from scripts.build_historical_bars import longbridge_symbol; print(longbridge_symbol('BF'), longbridge_symbol('BRK'))",
+], { cwd: path.resolve("."), encoding: "utf8" }).trim();
+assert.equal(classShareSymbols, "BF.B.US BRK.B.US", "Longbridge bar bridge should preserve known class-B symbols");
+const marketScreenCorpusTmp = fs.mkdtempSync(path.join(os.tmpdir(), "market-screen-corpus-"));
+try {
+  const sqlitePath = path.join(marketScreenCorpusTmp, "market.sqlite");
+  execFileSync("sqlite3", [sqlitePath, `
+    CREATE TABLE universe_membership(ticker TEXT, added_at TEXT, removed_at TEXT);
+    CREATE TABLE historical_bars(ticker TEXT, date TEXT, open REAL, high REAL, low REAL, close REAL, volume REAL, source TEXT);
+    INSERT INTO universe_membership VALUES('QUIET','2020-01-01',NULL);
+    INSERT INTO historical_bars VALUES('QUIET','2026-06-30',10,11,9,10,1000,'yahoo');
+    INSERT INTO historical_bars VALUES('QUIET','2026-06-30',20,21,19,20,2000,'longbridge:kline');
+  `]);
+  const corpus = await loadMarketScreenCorpus({
+    sqlitePath,
+    asOf: "2026-06-30",
+    lookbackDays: 5,
+    benchmarkTickers: [],
+  });
+  assert.equal(corpus.membership.length, 1, "Market-screen corpus should use active membership rows");
+  assert.equal(corpus.bars.length, 1, "Market-screen corpus should de-duplicate provider rows by ticker/date");
+  assert.equal(corpus.bars[0].source, "longbridge:kline", "Market-screen corpus should prefer Longbridge for duplicate dates");
+  assert.equal(Number(corpus.bars[0].close), 20, "Market-screen corpus should retain the preferred provider values");
+} finally {
+  fs.rmSync(marketScreenCorpusTmp, { recursive: true, force: true });
+}
 
 const disabledWatcher = await runIntradayWatcherOnce({ db: { watchlist: ["NVDA"] } }, { config: { enabled: false } });
 assert.equal(disabledWatcher.status, "disabled", "Intraday watcher must default to disabled");

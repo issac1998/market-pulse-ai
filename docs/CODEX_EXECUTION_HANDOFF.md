@@ -464,7 +464,9 @@ The engine was built for a 45-ticker corpus; at 641 tickers / 642k bars, four sc
 
 > Written 2026-07-11 (Claude) on owner request ("can we choose a stock from the whole market?"). Today the agent pool is attention-driven (movers/news/social/watchlist funnels, cap 180) — full-market *reach*, but a quiet stock with no event never surfaces. WP35 adds the systematic layer using infrastructure that already exists (WP29 bars + the shared scorer). Universe policy note: this is an owner-approved human-channel expansion; the screen is a **funnel, not a signal** — D17 showed the price sleeve alone carries ≈0 alpha, so screen output feeds the deep-evaluation pipeline and never bypasses gates.
 
-## WP35 — Nightly market screen → agent funnel
+## ☑ WP35 — Nightly market screen → agent funnel
+
+**Status: [x] Completed 2026-07-11.** Current S&P membership screen, isolated Longbridge refresh, shared-scorer parity, Agent funnel tagging, factor-stat split, API/UI, and real 518-symbol verification are recorded in `docs/INVESTMENT_ASSISTANT_ROADMAP_FINAL_EXECUTION.md`.
 
 - **35a — screen universe + incremental bars.** Universe v1 = current S&P membership from `universe_membership` (removed_at null) ∪ current watchlist/positions ∪ sector ETFs (benchmark-excluded from candidates). Nightly job (after post-session collection; NOT concurrent with mirror sync — use the WP33d isolated+merge pattern or busy-timeout writes) updates `historical_bars` incrementally via Longbridge (`--count` small since only recent bars are missing; full 600-name refresh proved ~45 min, incremental should be <10 min).
 - **35b — deterministic screen scoring.** For each universe ticker with fresh bars, build the as-of-today factor snapshot with `buildFactorSnapshotAsOf` and score with the **shared** `scoreRecommendationFromFactorSnapshot` (parity rule: any parallel scoring path = automatic reject). Cross-sectional normalization over the whole screen universe. Output: ranked list with score, factor attributions, `screenSchema` version, provenance (bar freshness per ticker).

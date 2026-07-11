@@ -78,6 +78,12 @@ import {
   runHistoricalWalkForwardFromSqlite,
 } from "./server/historical_backtest.mjs";
 import {
+  DEFAULT_MARKET_SCREEN_BENCHMARKS,
+  marketScreenEntryFunnel,
+  normalizeMarketScreens,
+  runMarketScreenFromSqlite,
+} from "./server/market_screen.mjs";
+import {
   activeStrategyVersion,
   activeStrategyWeights,
   attachValidationRecord,
@@ -198,6 +204,16 @@ const SQLITE_MIRROR_INCREMENTAL_SYNC = parseBoolean(process.env.SQLITE_MIRROR_IN
 const SQLITE_MIRROR_SAVE_DEBOUNCE_MS = Number(process.env.SQLITE_MIRROR_SAVE_DEBOUNCE_MS || 5000);
 const HISTORICAL_BACKTEST_WORKER_SCRIPT = path.join(__dirname, "scripts", "historical_backtest_worker.mjs");
 const HISTORICAL_BACKTEST_WORKER_TIMEOUT_MS = Number(process.env.HISTORICAL_BACKTEST_WORKER_TIMEOUT_MS || 15 * 60 * 1000);
+const MARKET_SCREEN_ENABLED = parseBoolean(process.env.MARKET_SCREEN_ENABLED, false);
+const MARKET_SCREEN_REFRESH_BARS_ENABLED = parseBoolean(process.env.MARKET_SCREEN_REFRESH_BARS_ENABLED, true);
+const MARKET_SCREEN_FUNNEL_LIMIT = Math.max(10, Number(process.env.MARKET_SCREEN_FUNNEL_LIMIT || 50));
+const MARKET_SCREEN_MIN_BARS = Math.max(20, Number(process.env.MARKET_SCREEN_MIN_BARS || 60));
+const MARKET_SCREEN_MAX_FRESHNESS_DAYS = Math.max(1, Number(process.env.MARKET_SCREEN_MAX_FRESHNESS_DAYS || 7));
+const MARKET_SCREEN_REFRESH_CONCURRENCY = Math.max(1, Number(process.env.MARKET_SCREEN_REFRESH_CONCURRENCY || 10));
+const MARKET_SCREEN_TIMEOUT_MS = Math.max(60000, Number(process.env.MARKET_SCREEN_TIMEOUT_MS || 14 * 60 * 1000));
+const MARKET_SCREEN_BUILD_BARS_SCRIPT = path.join(__dirname, "scripts", "build_historical_bars.py");
+const MARKET_SCREEN_NEW_YORK_TIME = process.env.MARKET_SCREEN_NEW_YORK_TIME || "17:30";
+const MARKET_SCREEN_TIME = parseHourMinute(MARKET_SCREEN_NEW_YORK_TIME, { hour: 17, minute: 30 });
 const DEFAULT_COLLECTOR_TIMEOUT_MS = Number(process.env.COLLECTOR_TIMEOUT_MS || 300000);
 const COLLECTOR_TIMEOUTS = parseCollectorTimeouts(
   process.env.COLLECTOR_TIMEOUTS ||
@@ -1176,6 +1192,9 @@ const SCHEDULES = [
     : []),
   { id: "post", label: "盘后", hour: 16, minute: 30 },
   { id: "agent", label: "候选池 Agent", hour: 17, minute: 5 },
+  ...(MARKET_SCREEN_ENABLED
+    ? [{ id: "market-screen", label: "全市场筛选", hour: MARKET_SCREEN_TIME.hour, minute: MARKET_SCREEN_TIME.minute }]
+    : []),
 ];
 const SCHEDULE_CATCH_UP_MINUTES = Math.max(0, Number(process.env.SCHEDULE_CATCH_UP_MINUTES || 75));
 const SCHEDULE_LLM_STAGE_TIMEOUT_MS = Math.max(15000, Number(process.env.SCHEDULE_LLM_STAGE_TIMEOUT_MS || 90000));
@@ -1236,6 +1255,7 @@ const FORCED_BENCHMARK_TICKERS = splitList(process.env.FORCED_BENCHMARK_TICKERS 
 
 let runInProgress = null;
 let allStockAgentRunInProgress = null;
+let marketScreenRunInProgress = null;
 let runStatus = null;
 let saveQueue = Promise.resolve();
 let sqliteMirrorQueue = Promise.resolve();
@@ -3955,6 +3975,7 @@ function compactStoreForSave(db = {}) {
     historicalBacktests: Array.isArray(db.historicalBacktests)
       ? db.historicalBacktests.slice(0, 50).map((run) => compactHistoricalRun(run, { detailLimit: 20 }))
       : [],
+    marketScreens: normalizeMarketScreens(db.marketScreens),
     intradayWatcher: db.intradayWatcher && typeof db.intradayWatcher === "object" ? db.intradayWatcher : {},
     pushDeliveryState: db.pushDeliveryState && typeof db.pushDeliveryState === "object" ? db.pushDeliveryState : {},
     intradayExplain: db.intradayExplain && typeof db.intradayExplain === "object" ? db.intradayExplain : {},
@@ -4244,6 +4265,7 @@ function defaultStorePayload() {
     akshareGlobalNewsLog: [],
     consensusSnapshots: [],
     historicalBacktests: [],
+    marketScreens: [],
     intradayWatcher: {},
     pushDeliveryState: {},
     intradayExplain: {},
@@ -4297,6 +4319,7 @@ function normalizeStorePayload(db = {}) {
     historicalBacktests: Array.isArray(db.historicalBacktests)
       ? db.historicalBacktests.slice(0, 50).map((run) => compactHistoricalRun(run, { detailLimit: 20 }))
       : [],
+    marketScreens: normalizeMarketScreens(db.marketScreens),
     intradayWatcher: db.intradayWatcher && typeof db.intradayWatcher === "object" ? db.intradayWatcher : {},
     pushDeliveryState: db.pushDeliveryState && typeof db.pushDeliveryState === "object" ? db.pushDeliveryState : {},
     intradayExplain: db.intradayExplain && typeof db.intradayExplain === "object" ? db.intradayExplain : {},
@@ -21954,6 +21977,9 @@ function allStockAgentTickerPool(run = {}, db = {}, state = {}, skill = null, se
   for (const item of run.stockNarratives?.items || []) add(item.ticker, "重点股票池");
   for (const item of run.investmentAdvice || []) add(item.ticker, "投资建议池");
   for (const item of (run.factorLayer?.topCandidates || []).slice(0, 80)) add(item.ticker, "因子候选");
+  for (const item of (db.marketScreens?.[0]?.rows || []).slice(0, MARKET_SCREEN_FUNNEL_LIMIT)) {
+    add(item.ticker, "全市场因子筛选");
+  }
   for (const item of (run.socialHotStocks?.rising || []).slice(0, 120)) add(item.ticker, "热度上升");
   for (const item of (run.socialHotStocks?.candidates || []).slice(0, 120)) add(item.ticker, "社交热议");
   for (const item of (run.news || []).slice(0, 200)) {
@@ -24054,6 +24080,7 @@ function allStockAgentDecisionFromEvaluation(evaluation, action, runId, trigger)
     status: action === "买入" ? (isFallbackBuy ? "watch-buy" : "open") : "close-signal",
     thresholdMet: !isFallbackBuy,
     trackingReason: evaluation.trackingReason || "",
+    entryFunnel: marketScreenEntryFunnel(evaluation.pools || []),
     hasPosition: Boolean(evaluation.hasPosition),
     hasAgentPosition: Boolean(evaluation.hasAgentPosition),
     hasRealPosition: Boolean(evaluation.hasRealPosition),
@@ -24615,6 +24642,7 @@ function buildAllStockAgentOutcomeSnapshots(state = {}, run = {}, db = {}, skill
         strategyVersion: decision.strategyVersion || decision.modelVersion || "",
         strategyConfigHash: decision.strategyConfigHash || "",
         trackingReason: decision.trackingReason || "",
+        entryFunnel: decision.entryFunnel || "",
         actionable: decision.actionable !== false,
         decisionStatus: decision.status || "",
         regime: decision.regime || allStockAgentRegimeTagFromSnapshot(decision.factorSnapshot || {}).bucket,
@@ -25761,6 +25789,8 @@ function compactAllStockAgentRunForClient(run = {}) {
     effectiveN: row.effectiveN,
     tStat: row.tStat,
     source: row.source,
+    trackingReasonSplit: row.trackingReasonSplit || {},
+    entryFunnelSplit: row.entryFunnelSplit || {},
     subSignals: Object.fromEntries(
       Object.entries(row.subSignals || {}).map(([id, sub]) => [id, {
         id: sub.id || id,
@@ -25838,6 +25868,109 @@ function allStockAgentForClient(state = {}, options = {}) {
     paperBook: normalized.paperBook,
     latest: normalized.runs[0] || null,
   };
+}
+
+function marketScreenExtraTickers(db = {}) {
+  const state = normalizeAllStockAgentState(db.allStockAgent);
+  return [...new Set([
+    ...(db.watchlist || []),
+    ...sanitizePortfolio(db.portfolio || []).map((item) => item.ticker),
+    ...allStockAgentActivePositions(state).keys(),
+    ...DEFAULT_MARKET_SCREEN_BENCHMARKS,
+  ].map(safeTicker).filter(Boolean))];
+}
+
+function marketScreenForClient(screen = {}, options = {}) {
+  if (!screen || typeof screen !== "object" || !screen.id) return null;
+  const includeRows = options.includeRows !== false;
+  return {
+    schemaVersion: screen.schemaVersion,
+    screenSchema: screen.screenSchema,
+    id: screen.id,
+    generatedAt: screen.generatedAt,
+    asOf: screen.asOf,
+    durationMs: screen.durationMs,
+    trigger: screen.trigger,
+    status: screen.status,
+    source: screen.source,
+    scoringEngine: screen.scoringEngine,
+    strategyVersionId: screen.strategyVersionId,
+    configHash: screen.configHash,
+    config: screen.config,
+    summary: screen.summary,
+    barRefresh: screen.barRefresh,
+    note: screen.note,
+    rows: includeRows
+      ? (screen.rows || []).slice(0, MARKET_SCREEN_FUNNEL_LIMIT).map((row) => ({
+          ticker: row.ticker,
+          rank: row.rank,
+          score: row.score,
+          alphaScore: row.alphaScore,
+          dataQualityScore: row.dataQualityScore,
+          latestClose: row.latestClose,
+          latestDate: row.latestDate,
+          freshnessDays: row.freshnessDays,
+          barCount: row.barCount,
+          source: row.source,
+          researchOnly: row.researchOnly !== false,
+          topPositiveFactors: (row.topPositiveFactors || []).slice(0, 3),
+          topRiskFactors: (row.topRiskFactors || []).slice(0, 3),
+        }))
+      : [],
+  };
+}
+
+async function runMarketScreenForDb(db, options = {}) {
+  if (marketScreenRunInProgress) return marketScreenRunInProgress;
+  marketScreenRunInProgress = (async () => {
+    const state = normalizeAllStockAgentState(db.allStockAgent);
+    const strategyVersion = activeStrategyVersion(state.strategyVersions);
+    const startedAt = Date.now();
+    const screen = await runMarketScreenFromSqlite({
+      sqlitePath: SQLITE_DB_FILE,
+      extraTickers: marketScreenExtraTickers(db),
+      benchmarkTickers: DEFAULT_MARKET_SCREEN_BENCHMARKS,
+      weights: allStockAgentCurrentFactorWeights(state),
+      strategyVersionId: strategyVersion?.id || "",
+      funnelLimit: MARKET_SCREEN_FUNNEL_LIMIT,
+      minBars: MARKET_SCREEN_MIN_BARS,
+      maxFreshnessDays: MARKET_SCREEN_MAX_FRESHNESS_DAYS,
+      asOf: options.asOf || "",
+      trigger: options.trigger || "manual",
+      refreshBars: options.refreshBars === true,
+      refreshOptions: {
+        pythonCommand: SQLITE_SYNC_PYTHON,
+        buildBarsScript: MARKET_SCREEN_BUILD_BARS_SCRIPT,
+        longbridgeCommand: LONG_BRIDGE_COMMAND,
+        days: 45,
+        limitBars: Math.max(90, MARKET_SCREEN_MIN_BARS),
+        concurrency: MARKET_SCREEN_REFRESH_CONCURRENCY,
+        timeoutMs: MARKET_SCREEN_TIMEOUT_MS,
+      },
+    });
+    screen.durationMs = Date.now() - startedAt;
+    db.marketScreens = normalizeMarketScreens([screen, ...(db.marketScreens || [])]);
+    if (options.scheduleKey) {
+      db.scheduleLog = { ...(db.scheduleLog || {}), [options.scheduleKey]: screen.id };
+    }
+    appendAuditEvent(db, "market_screen.run", {
+      id: screen.id,
+      trigger: screen.trigger,
+      status: screen.status,
+      durationMs: screen.durationMs,
+      universeCount: screen.summary?.universeCount || 0,
+      evaluatedCount: screen.summary?.evaluatedCount || 0,
+      resultCount: screen.summary?.resultCount || 0,
+      barRefresh: screen.barRefresh || null,
+    }, screen.status === "empty" ? "warn" : "ok");
+    await saveStore(db);
+    return screen;
+  })();
+  try {
+    return await marketScreenRunInProgress;
+  } finally {
+    marketScreenRunInProgress = null;
+  }
 }
 
 function recommendationStoryRows(run = {}, limit = 8) {
@@ -39488,7 +39621,27 @@ async function maybeRunSchedule() {
     if (!sourceRun || sourceRun.id !== postRunId || sourceRun.session !== "post") {
       throw new Error(`${due.newYorkDate} 盘后报告尚未完整落库，候选池 Agent 不会使用旧报告降级运行；请重试盘后采集。`);
     }
+    if (MARKET_SCREEN_ENABLED) {
+      const marketScreenKey = `${due.newYorkDate}:market-screen`;
+      if (!db.scheduleLog?.[marketScreenKey]) {
+        await runMarketScreenForDb(db, {
+          trigger: "agent-prerequisite",
+          refreshBars: MARKET_SCREEN_REFRESH_BARS_ENABLED,
+          scheduleKey: marketScreenKey,
+        });
+        db = await ensureStore();
+        sourceRun = (db.runs || []).find((item) => item.id === postRunId && item.session === "post") || sourceRun;
+      }
+    }
     await runAllStockAgentForRun(db, sourceRun, trigger, { scheduleKey: due.key });
+    return;
+  }
+  if (due.job.id === "market-screen") {
+    await runMarketScreenForDb(db, {
+      trigger,
+      refreshBars: MARKET_SCREEN_REFRESH_BARS_ENABLED,
+      scheduleKey: due.key,
+    });
     return;
   }
   await runCollection(due.job.id, trigger, { llmProvider: SCHEDULE_LLM_PROVIDER, scheduleKey: due.key });
@@ -40543,6 +40696,20 @@ function configForClient(db) {
     },
     email: publicReportEmailStatus(db),
     schedule: publicScheduleStatus(db),
+    marketScreen: {
+      enabled: MARKET_SCREEN_ENABLED,
+      running: Boolean(marketScreenRunInProgress),
+      refreshBarsEnabled: MARKET_SCREEN_REFRESH_BARS_ENABLED,
+      funnelLimit: MARKET_SCREEN_FUNNEL_LIMIT,
+      minBars: MARKET_SCREEN_MIN_BARS,
+      maxFreshnessDays: MARKET_SCREEN_MAX_FRESHNESS_DAYS,
+      refreshConcurrency: MARKET_SCREEN_REFRESH_CONCURRENCY,
+      timeoutMs: MARKET_SCREEN_TIMEOUT_MS,
+      newYorkTime: MARKET_SCREEN_NEW_YORK_TIME,
+      agentPrerequisite: true,
+      retainedScreens: normalizeMarketScreens(db.marketScreens).length,
+      latestId: normalizeMarketScreens(db.marketScreens)[0]?.id || "",
+    },
     storage: {
       primary: "sectioned-json",
       sectioned: true,
@@ -41278,10 +41445,39 @@ async function handleApi(req, res, url) {
       sourceDiagnostics: normalizeSourceDiagnostics(db.sourceDiagnostics),
       allStockAgent: allStockAgentForClient(db.allStockAgent, { compact: true, includeRunList: false }),
       factorRegistry: normalizeFactorRegistry(db.factorRegistry),
+      marketScreens: normalizeMarketScreens(db.marketScreens).map((screen, index) =>
+        marketScreenForClient(screen, { includeRows: index === 0 }),
+      ),
       latest: runForStateClient(latestRun(db), db.alertState, db.sourceControls),
       runStatus: runStatusForClient(),
       config: configForClient(db),
       serverTime: nowIso(),
+    });
+  }
+
+  if (req.method === "GET" && url.pathname === "/api/market-screen") {
+    const db = await ensureStore();
+    const screens = normalizeMarketScreens(db.marketScreens);
+    const requestedId = String(url.searchParams.get("id") || "").trim();
+    const selected = requestedId ? screens.find((screen) => screen.id === requestedId) || null : screens[0] || null;
+    return sendJson(res, {
+      latest: marketScreenForClient(selected, { includeRows: true }),
+      screens: screens.map((screen) => marketScreenForClient(screen, { includeRows: false })),
+      running: Boolean(marketScreenRunInProgress),
+    });
+  }
+
+  if (req.method === "POST" && url.pathname === "/api/market-screen/run") {
+    const body = await readBody(req);
+    const db = await ensureStore();
+    const screen = await runMarketScreenForDb(db, {
+      trigger: "manual",
+      refreshBars: body?.refreshBars === true,
+      asOf: body?.asOf || "",
+    });
+    return sendJson(res, {
+      status: "ok",
+      screen: marketScreenForClient(screen, { includeRows: true }),
     });
   }
 

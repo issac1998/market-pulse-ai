@@ -395,7 +395,8 @@ def longbridge_symbol(ticker: str) -> str:
     symbol = safe_ticker(ticker)
     if not symbol:
         raise RuntimeError("empty ticker")
-    return symbol if "." in symbol else f"{symbol}.US"
+    symbol = {"BF": "BF.B", "BRK": "BRK.B"}.get(symbol, symbol)
+    return f"{symbol}.US"
 
 
 def parse_longbridge_kline_payload(ticker: str, payload_text: str) -> list[dict[str, Any]]:

@@ -2730,3 +2730,111 @@ Contradictions / deferred checks:
 3. **~1,600 uncommitted lines with no execution-log entries** (violates ground rule: every change logs verification). Includes good work (ambiguous-ticker news disambiguation AI/NOW/CAT..., `/api/health`, `/api/runs` pagination, compact card payloads) and two sensitive items: `outcomeIsUsable` policy change in `lib/recommender_core.mjs` (re-adjudicates stored quality statuses — affects which frozen outcomes feed learning; needs a fixture proving no retroactive flip of existing samples) and a new `drive-archive` maintenance flow (new external data flow — needs the standard provenance/timeout/diagnostics review). Codex: write the missing log entries + fixtures before committing.
 
 **Refinement on concern 1 (same session)**: the production server runs attached to a terminal (`/dev/ttys000`), and the crash-lock handlers cover only SIGINT/SIGTERM — **closing the terminal (SIGHUP) produces a dirty exit indistinguishable from a crash**. The five 2026-07-10 dirty exits fell inside active development hours and may be terminal-closed restarts rather than real crashes; the current instance is stable at 7.8% heap. Two consequences: (a) Codex adds SIGHUP to the clean-shutdown handlers and (optionally) tags lock files with a shutdown-signal hint so restarts vs crashes are distinguishable; (b) the definitive health check is whether tonight's unattended post/agent runs complete — if the instance dies with no one at the keyboard, it is a real crash and the stack must be captured (run via `nohup`/launchd or `node server.mjs 2>&1 | tee data/server.log`).
+
+---
+
+## WP35 — Nightly whole-market screen to Agent funnel — 2026-07-11
+
+What changed:
+
+- Added a deterministic current-S&P screen. The universe is active `universe_membership` as of the latest bar date plus current watchlist/positions and sector benchmarks; benchmark ETFs are excluded from candidate ranks.
+- Added Longbridge-only incremental refresh with 10 isolated worker SQLite databases, failed-ticker-only retries (three attempts), one aggregate temporary database, and one short atomic merge into the live corpus. No alternate provider is used by this job.
+- Fixed the known class-share bridge aliases `BF -> BF.B.US` and `BRK -> BRK.B.US`. SQL corpus reads now de-duplicate `ticker/date` rows and prefer Longbridge, preventing the 18,300 existing multi-provider dates from being double-counted.
+- Screen snapshots use `buildFactorSnapshotAsOf`, whole-cross-section normalization, and `scoreRecommendationFromFactorSnapshot`; there is no screen-specific scorer or scoring privilege.
+- The latest top 50 enters the existing Agent pool as `全市场因子筛选`. Screen-only decisions append `entryFunnel:"market-screen"`; outcomes preserve it and factor statistics expose `entryFunnelSplit` cells with `n`.
+- The screen is a hard same-day prerequisite of the scheduled post-session Agent. The separate 17:30 New York job is a fallback if the Agent did not trigger; screen failure prevents the Agent from silently running on an old screen.
+- Added `GET /api/market-screen`, `POST /api/market-screen/run`, last-10 sectioned-store persistence, config/runtime status, audit events, and a responsive Chinese top-50 panel with rank, score, quality, factor contributions, per-ticker bar date/provider, and direct links to stock detail.
+- The scheduled feature remains disabled by default in `.env.example` (`MARKET_SCREEN_ENABLED=false`). The owner-authorized local `.env` enables it.
+
+Files/functions:
+
+- `server/market_screen.mjs`: active-universe load, Longbridge refresh workers/retries/atomic merge, shared-scorer screen, normalization, retention and funnel tag helper.
+- `server.mjs`: store/config/API/scheduler wiring, Agent pool integration, frozen decision/outcome `entryFunnel` propagation.
+- `lib/recommender_core.mjs`: sample-counted `entryFunnelSplit` alongside the existing tracking-reason split; historical rows without funnel provenance are not mislabeled.
+- `scripts/build_historical_bars.py`: verified Longbridge class-share symbol mapping.
+- `public/index.html`, `public/app.js`, `public/styles.css`: whole-market panel, manual rescore, runtime state, factor attribution, Agent funnel stats, desktop/mobile layout.
+- `scripts/core_regression_tests.mjs`: shared-score parity, benchmark exclusion, quiet-ticker surfacing, funnel split, provider de-duplication/priority, and class-share fixtures.
+- `.env.example`, `docs/CODEBASE_ROUTE_INVENTORY.md`, `docs/CODEX_EXECUTION_HANDOFF.md`: disabled-by-default config, regenerated inventory, completed work order.
+
+Verification output:
+
+```text
+$ node --check server.mjs && node --check server/market_screen.mjs && node --check lib/recommender_core.mjs && node --check public/app.js && node --check scripts/core_regression_tests.mjs
+<no output>
+
+$ python3 -m py_compile scripts/build_historical_bars.py
+<no output>
+
+$ node scripts/core_regression_tests.mjs
+core_regression_tests: ok
+
+$ node scripts/generate_route_inventory.mjs && node scripts/generate_route_inventory.mjs --check
+{"status":"ok","routes":91,"uiFetches":48,"storeKeys":33}
+{"status":"ok","routes":91,"uiFetches":48,"storeKeys":33}
+
+$ git diff --check
+<no output>
+```
+
+Real 518-symbol Longbridge refresh with the live server running:
+
+```json
+{
+  "durationMs": 473191,
+  "barRefresh": {
+    "status": "ok",
+    "tickers": 518,
+    "processed": 518,
+    "errors": [],
+    "attempts": [{ "attempt": 1, "requested": 518, "processed": 518, "failed": 0, "workers": 10 }],
+    "rowsMerged": 15524,
+    "tickerRows": 518,
+    "latestBarDate": "2026-07-10",
+    "mode": "isolated-temp-db-atomic-merge"
+  },
+  "screen": {
+    "membershipCount": 503,
+    "evaluatedCount": 503,
+    "resultCount": 50,
+    "excluded": { "benchmark": 13, "insufficientBars": 1, "staleBars": 1, "missingBars": 0 }
+  }
+}
+```
+
+- Runtime was 7 minutes 53 seconds, below the 15-minute acceptance limit.
+- A live `historical_bars` count completed in 0.28 seconds during refresh and `/api/state` returned HTTP 200 in 0.40 seconds; no `database is locked` error occurred.
+- The two candidate exclusions are honest: newly listed `FDXF` has fewer than 60 bars; `SATS` last traded on 2026-06-23 and fails the freshness gate. They remain visible in exclusion counts rather than being silently imputed.
+
+Real Agent verification:
+
+```json
+{
+  "universe": 180,
+  "evaluated": 180,
+  "screenCandidatesInStoredTop80": 38,
+  "screenOnlyExample": {
+    "ticker": "SCHW",
+    "buyEligible": true,
+    "actionableEligible": false,
+    "dataQualityScore": 50,
+    "gates": ["low_data_quality"]
+  },
+  "screenDecisions": [
+    { "ticker": "SCHW", "entryFunnel": "market-screen", "actionable": false, "status": "open" },
+    { "ticker": "EXPE", "entryFunnel": "market-screen", "actionable": false, "status": "open" }
+  ]
+}
+```
+
+This proves a quiet screen-only name enters the normal Agent gates and can create an outcome-tracked research decision without bypassing actionability or data-quality limits.
+
+Browser verification:
+
+- Desktop 1280 px: top-50 panel rendered with no horizontal overflow (`scrollWidth=clientWidth=1280`) and no console warnings/errors.
+- Mobile 390 px: rows and factor tags wrapped correctly with no horizontal overflow (`scrollWidth=clientWidth=390`).
+- Clicking the first screen ticker changed the route and stock input to that ticker; the final first row showed `SCHW`, `2026-07-10`, and `Longbridge` provenance.
+
+Contradictions / deferred checks:
+
+- None. No Agent skill settings or scoring semantics changed, so no skill-version bump was required.
+- Funnel outcome statistics are wired and visible, but screen-sourced T+1/T+3/T+5/T+10 cells will naturally remain empty until the newly frozen decisions reach their horizons.
