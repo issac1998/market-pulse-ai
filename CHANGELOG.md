@@ -1,5 +1,22 @@
 # Changelog
 
+## 2026-07-12
+
+### Highlights
+
+- Added Google Drive cold-archive support for historical reports, with dedicated archive verification tests and updated operating documentation.
+- Hardened report loading, factor-learning infrastructure, runtime contracts, sectioned-store atomicity/consistency, and the related frontend states.
+- Tightened recommendation governance and simplified the decision UI while extending regression coverage.
+- Completed WP35 whole-market screening: current S&P membership, Longbridge bar refresh, shared deterministic scoring, Agent funnel attribution, and responsive Chinese UI.
+
+### Key Links
+
+- PR links: no PR identifiers are present in local git history for this work.
+- Drive cold archive and recommendation hardening: [e7248d7](https://github.com/issac1998/market-pulse-ai/commit/e7248d7)
+- Report, learning, storage, and UI reliability: [0216c46](https://github.com/issac1998/market-pulse-ai/commit/0216c46)
+- Recommendation governance and decision UI: [6adbf1d](https://github.com/issac1998/market-pulse-ai/commit/6adbf1d)
+- WP35 whole-market systematic screen: [8a7f7c3](https://github.com/issac1998/market-pulse-ai/commit/8a7f7c3)
+
 ## 2026-07-10
 
 ### Highlights
