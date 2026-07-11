@@ -154,35 +154,47 @@
             </div>
           </section>
 
+          <section class="panel action-priority-panel" data-page-panel="actions">
+            <div class="panel-head">
+              <div>
+                <p class="section-label">Today</p>
+                <h2>今日操作台</h2>
+              </div>
+              <button id="todayRunAgent" class="btn secondary compact" type="button">基于最新报告运行 Agent</button>
+            </div>
+            <div id="todayDeskBox" class="daily-loop-box empty-state">
+              正在读取今日推荐、追责记录和健康状态。
+            </div>
+          </section>
+
           <section class="panel action-suggestions-panel" data-page-panel="actions">
             <div class="panel-head">
               <div>
-                <p class="section-label">Action Desk</p>
-                <h2>操作建议</h2>
+                <p class="section-label">Research & Audit</p>
+                <h2>研究候选与决策审计</h2>
               </div>
               <div class="top-actions">
                 <button id="runAllStockAgentBacktest" class="btn ghost" type="button">规则回测</button>
                 <button id="runAllStockAgent" class="btn secondary" type="button">运行候选池 Agent</button>
               </div>
             </div>
-            <div id="actionSuggestionsBox" class="action-suggestions-box empty-state">
-              运行采集后，从自选股和重点股票池筛选值得操作的股票。
-            </div>
-            <div id="allStockAgentBox" class="all-stock-agent-box empty-state">
-              候选池 Skill Agent 尚未运行。
-            </div>
-          </section>
-
-          <section class="panel" data-page-panel="actions">
-            <div class="panel-head">
-              <div>
-                <p class="section-label">Today</p>
-                <h2>今日操作台</h2>
+            <p class="panel-guidance">页首“今日操作台”是唯一正式操作口径；下方只用于查看规则观察结果、Agent 证据和追责明细。</p>
+            <details class="workspace-disclosure agent-disclosure">
+              <summary>
+                <span><strong>规则观察池</strong><small>静态规则排序，不是买卖指令</small></span>
+              </summary>
+              <div id="actionSuggestionsBox" class="action-suggestions-box empty-state">
+                运行采集后，从自选股和重点股票池生成研究观察顺序。
               </div>
-            </div>
-            <div id="todayDeskBox" class="daily-loop-box empty-state">
-              正在读取今日推荐、追责记录和健康状态。
-            </div>
+            </details>
+            <details class="workspace-disclosure agent-disclosure">
+              <summary>
+                <span><strong>Agent 决策明细</strong><small>因子、风控门槛、追责与纸面组合</small></span>
+              </summary>
+              <div id="allStockAgentBox" class="all-stock-agent-box empty-state">
+                候选池 Skill Agent 尚未运行。
+              </div>
+            </details>
           </section>
 
           <section class="panel stock-report-panel" data-page-panel="stocks">

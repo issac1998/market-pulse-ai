@@ -1297,9 +1297,13 @@ const passedValidation = buildPromotionValidationRecord(candidateStrategy, activ
   activeExcessPct: 2,
   candidateMaxDrawdownPct: -5,
   activeMaxDrawdownPct: -7,
-  n: 42,
+  candidateN: 42,
+  activeN: 42,
+  candidateCorpusHash: "same-corpus-hash",
+  activeCorpusHash: "same-corpus-hash",
 });
 assert.equal(passedValidation.status, "passed", "Fixture validation should pass excess and MaxDD gates");
+assert.equal(passedValidation.checks.sameCorpus, true, "Promotion validation must prove same-corpus comparison");
 strategyRows = attachValidationRecord(strategyRows, candidateStrategy.id, passedValidation);
 const beforePromotionSnapshot = JSON.parse(JSON.stringify(strategyRows));
 const promoted = promoteStrategyVersion(strategyRows, candidateStrategy.id);
@@ -1308,6 +1312,18 @@ assert.equal(activeStrategyVersion(promoted.rows).id, candidateStrategy.id, "Pro
 const rolledBack = rollbackStrategyVersions(promoted.rows, [{ id: "rollback-1", snapshot: beforePromotionSnapshot }]);
 assert.equal(rolledBack.ok, true, "Rollback fixture should restore previous snapshot");
 assert.deepEqual(rolledBack.rows, beforePromotionSnapshot, "Rollback must restore strategy versions byte-equivalent after normalization");
+const quarantinedLegacyValidation = buildPromotionValidationRecord(candidateStrategy, activeStrategy, {
+  candidateExcessPct: 3,
+  activeExcessPct: 2,
+  candidateMaxDrawdownPct: -100,
+  activeMaxDrawdownPct: -7,
+  candidateN: 42,
+  activeN: 42,
+  candidateCorpusHash: "same-corpus-hash",
+  activeCorpusHash: "same-corpus-hash",
+});
+assert.equal(quarantinedLegacyValidation.status, "quarantined", "Legacy -100% MaxDD metrics must be quarantined");
+assert.equal(quarantinedLegacyValidation.passed, false, "Quarantined validation must never promote a candidate");
 
 const trustLoopDb = {
   allStockAgent: {
@@ -1734,6 +1750,19 @@ const historicalWalkForward = runHistoricalWalkForwardFromRows({
     ],
   },
 });
+const historicalCustomWeights = runHistoricalWalkForwardFromRows({
+  bars: historicalBacktestBars,
+  regimes: [{ date: "2026-01-01", bucket: "宏观顺风", risk_score: 38 }],
+  config: {
+    minLookback: 20,
+    maxDates: 4,
+    topN: 2,
+    horizons: [1, 3],
+    primaryHorizon: 1,
+    strategyVersionId: "candidate-fixture",
+    weights: { momentum: 0.7, macroRegime: 0.3 },
+  },
+});
 const historicalPitWalkForward = runHistoricalWalkForwardFromRows({
   bars: historicalBacktestBars,
   regimes: [{ date: "2026-01-01", bucket: "宏观顺风", risk_score: 38 }],
@@ -1759,6 +1788,16 @@ assertApprox(
   "Historical MaxDD fixture should match the exact hand-computed 10-day equity path",
 );
 assert.equal(historicalWalkForward.run.status, "ok", "Historical walk-forward fixture should produce a runnable backtest");
+assert.equal(historicalCustomWeights.run.strategyVersionId, "candidate-fixture", "Historical run must preserve the evaluated strategy version id");
+assert.ok(
+  historicalCustomWeights.run.factorWeights.momentum > historicalWalkForward.run.factorWeights.momentum,
+  "Historical scoring must use explicitly injected candidate weights",
+);
+assert.notEqual(
+  historicalCustomWeights.run.strategyHash,
+  historicalWalkForward.run.strategyHash,
+  "Different frozen factor weights must produce a different historical strategy hash",
+);
 assert.ok(historicalWalkForward.run.decisions.length > 0, "Historical walk-forward should freeze pseudo-decisions");
 assert.equal(
   historicalPitWalkForward.run.provenance.universeMode,

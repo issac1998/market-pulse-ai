@@ -229,7 +229,7 @@ const AKSHARE_PYTHON_COMMAND =
 const AKSHARE_BRIDGE_SCRIPT = process.env.AKSHARE_BRIDGE_SCRIPT || path.join("scripts", "akshare_bridge.py");
 const AKSHARE_TIMEOUT_MS = Number(process.env.AKSHARE_TIMEOUT_MS || 60000);
 const AKSHARE_SNAPSHOT_TIMEOUT_MS = Number(
-  process.env.AKSHARE_SNAPSHOT_TIMEOUT_MS || Math.min(AKSHARE_TIMEOUT_MS, 12000),
+  process.env.AKSHARE_SNAPSHOT_TIMEOUT_MS || Math.min(AKSHARE_TIMEOUT_MS, 60000),
 );
 const AKSHARE_VALUATION_ENABLED = parseBoolean(process.env.AKSHARE_VALUATION_ENABLED, true);
 const AKSHARE_HIST_ENABLED = parseBoolean(process.env.AKSHARE_HIST_ENABLED, true);
@@ -1075,7 +1075,7 @@ const RESEARCH_PACK_TIMEOUT_MS = Number(process.env.RESEARCH_PACK_TIMEOUT_MS || 
 const ALL_NEWS_PACK_ENABLED = parseBoolean(process.env.ALL_NEWS_PACK_ENABLED, true);
 const ALL_NEWS_PACK_LIMIT = Number(process.env.ALL_NEWS_PACK_LIMIT || 80);
 const ALL_NEWS_PACK_SUMMARY_LIMIT = Number(process.env.ALL_NEWS_PACK_SUMMARY_LIMIT || 12);
-const STOCK_SNAPSHOT_ALL_NEWS_TIMEOUT_MS = Number(process.env.STOCK_SNAPSHOT_ALL_NEWS_TIMEOUT_MS || 45000);
+const STOCK_SNAPSHOT_ALL_NEWS_TIMEOUT_MS = Number(process.env.STOCK_SNAPSHOT_ALL_NEWS_TIMEOUT_MS || 300000);
 const INVESTMENT_ADVISOR_ENABLED = parseBoolean(process.env.INVESTMENT_ADVISOR_ENABLED, true);
 const INVESTMENT_ADVISOR_LLM_ENABLED = parseBoolean(process.env.INVESTMENT_ADVISOR_LLM_ENABLED, true);
 const INVESTMENT_ADVISOR_LLM_TIMEOUT_MS = Number(process.env.INVESTMENT_ADVISOR_LLM_TIMEOUT_MS || 300000);
@@ -1219,6 +1219,10 @@ const ALL_STOCK_AGENT_TECHNICAL_PREFETCH_LIMIT = Math.max(
   Number(process.env.ALL_STOCK_AGENT_TECHNICAL_PREFETCH_LIMIT ?? 0),
 );
 const ALL_STOCK_AGENT_QUOTE_PREFETCH_LIMIT = Math.max(0, Number(process.env.ALL_STOCK_AGENT_QUOTE_PREFETCH_LIMIT ?? 0));
+const ALL_STOCK_AGENT_FUNDAMENTAL_PREFETCH_LIMIT = Math.max(
+  0,
+  Number(process.env.ALL_STOCK_AGENT_FUNDAMENTAL_PREFETCH_LIMIT ?? 0),
+);
 const AGENT_DEBATE_INGEST_ENABLED = parseBoolean(process.env.AGENT_DEBATE_INGEST_ENABLED, false);
 const AGENT_DEBATE_INGEST_TOKEN = String(process.env.AGENT_DEBATE_INGEST_TOKEN || "").trim();
 const TRADER_MIRROR_LLM_ENABLED = parseBoolean(process.env.TRADER_MIRROR_LLM_ENABLED, false);
@@ -3539,6 +3543,9 @@ function normalizeAllStockAgentState(value = {}) {
     runs: runs.slice(0, ALL_STOCK_AGENT_RUN_LIMIT).map(sanitizeAllStockAgentRun),
     decisions: decisions.slice(0, ALL_STOCK_AGENT_DECISION_LIMIT),
     outcomeSnapshots: outcomeSnapshots.slice(0, ALL_STOCK_AGENT_OUTCOME_LIMIT),
+    outcomeQualityCorrections: Array.isArray(state.outcomeQualityCorrections)
+      ? state.outcomeQualityCorrections.slice(0, ALL_STOCK_AGENT_OUTCOME_LIMIT)
+      : [],
     ruleStats: state.ruleStats && typeof state.ruleStats === "object" ? state.ruleStats : {},
     paperBook: state.paperBook && typeof state.paperBook === "object" ? state.paperBook : null,
     persistentMemory: state.persistentMemory && typeof state.persistentMemory === "object" ? state.persistentMemory : null,
@@ -12241,6 +12248,17 @@ function parseNasdaqSymbolDirectoryText(text = "", source = "") {
         exchange: row.Exchange || row["Market Category"] || source,
         etf: /^Y$/i.test(row.ETF || ""),
         testIssue: /^Y$/i.test(row["Test Issue"] || ""),
+        financialStatus: row["Financial Status"] || "",
+        roundLotSize: numberOrNull(row["Round Lot Size"]),
+        securityType: /\bwarrant\b/i.test(row["Security Name"] || "")
+          ? "warrant"
+          : /\b(right|rights)\b/i.test(row["Security Name"] || "")
+            ? "right"
+            : /\b(unit|units)\b/i.test(row["Security Name"] || "")
+              ? "unit"
+              : /\b(preferred|depositary share|notes? due|bond)\b/i.test(row["Security Name"] || "")
+                ? "non-common-equity"
+                : "equity",
         source,
       };
     })
@@ -14413,7 +14431,7 @@ async function enrichNewsArticles(news, llmProvider, articleCache = null) {
   return { news: enriched, errors: [...extractionErrors, ...llmErrors] };
 }
 
-async function collectYahooNews(tickers, llmProvider, sourceControls = null, articleCache = null) {
+async function collectYahooNews(tickers, llmProvider, sourceControls = null, articleCache = null, options = {}) {
   const all = [];
   const errors = [];
   let companyMap = {};
@@ -14428,7 +14446,12 @@ async function collectYahooNews(tickers, llmProvider, sourceControls = null, art
     .toISOString()
     .slice(0, 10);
   const to = today.toISOString().slice(0, 10);
-  const longBridge = await collectLongBridgeNews(tickers, companyMap, llmProvider, articleCache);
+  const seededLongBridgeNews = Array.isArray(options.seedLongBridgeNews)
+    ? options.seedLongBridgeNews.filter((item) => item?.source === "Longbridge News" || item?.publisher === "Longbridge")
+    : [];
+  const longBridge = seededLongBridgeNews.length
+    ? { news: seededLongBridgeNews, errors: [] }
+    : await collectLongBridgeNews(tickers, companyMap, llmProvider, articleCache);
   all.push(...(longBridge.news || []));
   errors.push(...(longBridge.errors || []));
   const longBridgeCounts = new Map();
@@ -18845,7 +18868,7 @@ async function collectLongBridgeQuotes(tickers) {
     .map((ticker) => ({
       source: "Longbridge Quote",
       ticker,
-      error: "Longbridge 未返回有效价格，将自动降级到下一个行情源。",
+      error: "Longbridge 三次尝试后仍未返回有效价格；该 provider 记为失败，后续只接受已配置且带来源标签的等价行情源。",
     }));
   return { quotes, errors };
 }
@@ -19095,6 +19118,7 @@ async function enrichLongBridgeNewsDetail(
   llmProvider = null,
   articleCache = null,
   llmTimeoutMs = LONG_BRIDGE_NEWS_LLM_TIMEOUT_MS,
+  options = {},
 ) {
   if (!LONG_BRIDGE_NEWS_DETAIL_ENABLED || !item?.longBridgeId) return item;
   try {
@@ -19105,6 +19129,10 @@ async function enrichLongBridgeNewsDetail(
     const article = longBridgeArticleFromMarkdown(markdown, item, "news");
     if (article.status === "ok") {
       const merged = mergeArticleCatalyst({ ...item, article }, article);
+      if (options.summarize === false) {
+        cacheArticleItem(articleCache, merged);
+        return merged;
+      }
       try {
         const summarized = await summarizeArticleWithLlm(merged, llmProvider, llmTimeoutMs);
         cacheArticleItem(articleCache, summarized);
@@ -19123,6 +19151,7 @@ async function enrichLongBridgeNewsDetail(
     }
     const fallback = await extractArticleForNews(item, ARTICLE_EXTRACT_TIMEOUT_MS, articleCache);
     if (fallback.article?.status === "ok") {
+      if (options.summarize === false) return fallback;
       try {
         const summarized = await summarizeArticleWithLlm(fallback, llmProvider, llmTimeoutMs);
         cacheArticleItem(articleCache, summarized);
@@ -19141,6 +19170,7 @@ async function enrichLongBridgeNewsDetail(
   } catch (error) {
     const fallback = await extractArticleForNews(item, ARTICLE_EXTRACT_TIMEOUT_MS, articleCache);
     if (fallback.article?.status === "ok") {
+      if (options.summarize === false) return fallback;
       try {
         return await summarizeArticleWithLlm(fallback, llmProvider, llmTimeoutMs);
       } catch (llmError) {
@@ -19221,7 +19251,7 @@ async function collectLongBridgeNews(tickers, companyMap = {}, llmProvider = nul
   };
 }
 
-async function collectLongBridgeStockNews(ticker, llmProvider = null, articleCache = null) {
+async function collectLongBridgeStockNews(ticker, llmProvider = null, articleCache = null, options = {}) {
   const symbol = longBridgeSymbol(ticker);
   const safe = safeTicker(ticker);
   const news = [];
@@ -19242,24 +19272,33 @@ async function collectLongBridgeStockNews(ticker, llmProvider = null, articleCac
       .filter((row) => row?.title && row?.url)
       .map((item) => normalizeLongBridgeNewsCandidate(item, safe, {}))
       .filter(Boolean);
+    const detailLimit = Number.isFinite(Number(options.detailLimit))
+      ? Math.max(0, Number(options.detailLimit))
+      : candidates.length;
+    const detailCandidates = candidates
+      .slice()
+      .sort((a, b) => longBridgeNewsDetailScore(b) - longBridgeNewsDetailScore(a))
+      .slice(0, detailLimit);
+    const detailIds = new Set(detailCandidates.map((item) => item.id));
     const llmDetailIds = new Set(
-      candidates
+      detailCandidates
         .slice()
-        .sort((a, b) => longBridgeNewsDetailScore(b) - longBridgeNewsDetailScore(a))
         .slice(0, Math.max(0, LONG_BRIDGE_NEWS_LLM_DETAIL_LIMIT))
         .map((item) => item.id),
     );
     const enriched = await mapWithConcurrency(
-      candidates,
+      detailCandidates,
       Math.max(1, Math.min(3, LONG_BRIDGE_NEWS_CONCURRENCY)),
       (candidate) => enrichLongBridgeNewsDetail(
         candidate,
         llmDetailIds.has(candidate.id) ? llmProvider : null,
         articleCache,
         LONG_BRIDGE_NEWS_LLM_TIMEOUT_MS,
+        { summarize: options.summarize !== false },
       ),
     );
-    news.push(...enriched);
+    const enrichedById = new Map(enriched.map((item) => [item.id, item]));
+    news.push(...candidates.map((item) => (detailIds.has(item.id) ? enrichedById.get(item.id) || item : item)));
   } catch (error) {
     errors.push({ source: "Longbridge News", ticker: safe, error: error.message });
   }
@@ -20038,7 +20077,9 @@ async function collectAllNewsPackForTicker(ticker, llmProvider = null, articleCa
     };
   }
   const [companyNews, hotNews, akshareNews, globalNews] = await Promise.all([
-    collectYahooNews([safe], llmProvider, sourceControls, articleCache).catch((error) => ({
+    collectYahooNews([safe], llmProvider, sourceControls, articleCache, {
+      seedLongBridgeNews: options.seedItems || [],
+    }).catch((error) => ({
       news: [],
       errors: [{ source: "Company News Pack", ticker: safe, error: error.message }],
     })),
@@ -21882,6 +21923,7 @@ const ALL_STOCK_AGENT_EXCLUDED_TICKERS = new Set([
   "UUP",
   "GLD",
   "SLV",
+  "MARKET",
 ]);
 
 function isAllStockAgentExcludedTicker(ticker, securityMaster = null) {
@@ -21889,8 +21931,10 @@ function isAllStockAgentExcludedTicker(ticker, securityMaster = null) {
   if (!symbol) return true;
   if (ALL_STOCK_AGENT_EXCLUDED_TICKERS.has(symbol)) return true;
   if (symbol.startsWith("^")) return true;
+  if (symbol.length >= 4 && /(WS|WT)$/.test(symbol)) return true;
   const profile = securityMaster?.byTicker?.[symbol];
-  if (profile?.etf || profile?.testIssue) return true;
+  if (profile?.etf || profile?.testIssue || (profile?.securityType && profile.securityType !== "equity")) return true;
+  if (profile && /\b(warrant|rights?|units?|preferred|depositary share|notes? due|bond)\b/i.test(profile.name || "")) return true;
   return false;
 }
 
@@ -22463,14 +22507,12 @@ function scoreQualityGrowthFactor(ctx = {}) {
   const accrualsRatio = firstFiniteNumber(f.accrualsRatio, f.financialLatest?.accrualsRatio);
   const cashConversion = firstFiniteNumber(f.cashConversion, f.freeCashFlowConversion, f.financialLatest?.cashConversion);
   const business = normalizeDisplayText(f.mainBusiness || known?.mainBusiness || "");
-  const businessBonus = isSpecificBusinessText(business) ? 6 : 0;
   const score = clampScore(
     50 +
       (Number.isFinite(revenueGrowth) ? Math.max(-18, Math.min(22, revenueGrowth * 0.55)) : 0) +
       (Number.isFinite(netMargin) ? Math.max(-12, Math.min(18, netMargin * 0.45)) : 0) +
       (Number.isFinite(roe) ? Math.max(-8, Math.min(12, roe * 0.25)) : 0) -
-      (Number.isFinite(debtToEquity) && debtToEquity > 2 ? 8 : 0) +
-      businessBonus,
+      (Number.isFinite(debtToEquity) && debtToEquity > 2 ? 8 : 0),
   );
   return factorRow(
     "qualityGrowth",
@@ -22513,26 +22555,37 @@ function scoreValuationExpectationFactor(ctx = {}) {
 function scoreEarningsRevisionFactor(ctx = {}) {
   const summary = ctx.researchPack?.summary || {};
   const rating = summary.ratingDistribution || {};
-  const total = Number(rating.total || 0);
-  const buyRatio = total ? Number(rating.buy || 0) / total : null;
-  const sellRatio = total ? Number(rating.sell || 0) / total : null;
-  const epsEstimate = numberOrNull(summary.consensus?.epsEstimate);
-  const revenueEstimate = numberOrNull(summary.consensus?.revenueEstimate);
-  const forecastMean = numberOrNull(summary.forecastEps?.forecast_eps_mean);
+  const ratingCount = [rating.buy, rating.hold, rating.sell].reduce((sum, value) => sum + Math.max(0, Number(value) || 0), 0);
+  const total = Math.max(Number(rating.total || 0), ratingCount);
+  const hasRatingEvidence = total > 0 && ratingCount > 0;
+  const buyRatio = hasRatingEvidence ? Number(rating.buy || 0) / total : null;
+  const sellRatio = hasRatingEvidence ? Number(rating.sell || 0) / total : null;
+  const epsEstimate = firstFiniteNumber(summary.consensus?.epsEstimate, summary.forecastEps?.forecast_eps_mean);
+  const revenueEstimate = firstPositiveFiniteNumber(summary.consensus?.revenueEstimate);
+  const forecastMean = firstFiniteNumber(summary.forecastEps?.forecast_eps_mean);
   const recommendation = normalizeDisplayText(summary.recommendation || "");
+  const hasEstimateEvidence = Number.isFinite(epsEstimate) || Number.isFinite(revenueEstimate) || Number.isFinite(forecastMean);
+  const meaningfulRecommendation = hasRatingEvidence && recommendation;
   const score = clampScore(
     50 +
       (Number.isFinite(buyRatio) ? buyRatio * 22 : 0) -
       (Number.isFinite(sellRatio) ? sellRatio * 26 : 0) +
-      (/buy|strong|增持|买入|跑赢/i.test(recommendation) ? 8 : 0) -
-      (/sell|under|减持|卖出|跑输/i.test(recommendation) ? 10 : 0),
+      (meaningfulRecommendation && /buy|strong|增持|买入|跑赢/i.test(recommendation) ? 8 : 0) -
+      (meaningfulRecommendation && /sell|under|减持|卖出|跑输/i.test(recommendation) ? 10 : 0),
   );
   return factorRow(
     "earningsRevision",
     "财报/分析师修正",
-    { buyRatio, sellRatio, epsEstimate, revenueEstimate, forecastMean, recommendation },
+    {
+      buyRatio,
+      sellRatio,
+      epsEstimate: hasEstimateEvidence ? epsEstimate : null,
+      revenueEstimate: hasEstimateEvidence ? revenueEstimate : null,
+      forecastMean: hasEstimateEvidence ? forecastMean : null,
+      recommendation: meaningfulRecommendation ? recommendation : "",
+    },
     score,
-    [ctx.researchPack?.provider, "Longbridge consensus"].filter(Boolean),
+    (hasRatingEvidence || hasEstimateEvidence) ? [ctx.researchPack?.provider, "Longbridge consensus"].filter(Boolean) : [],
     "缺少一致预期、EPS 预测或机构评级分布。",
   );
 }
@@ -23400,6 +23453,9 @@ function allStockAgentActionability(evaluation = {}, state = {}, run = {}, skill
   const minDq = numberOrNull(skill.settings?.minActionableDataQuality) ?? ALL_STOCK_AGENT_MIN_ACTIONABLE_DQ;
   const dynamic = allStockAgentDynamicBuyThreshold(skill, state, run);
   const gates = [];
+  const decisionFactors = Object.entries(evaluation.factorSnapshot?.factors || {})
+    .filter(([id, factor]) => Object.prototype.hasOwnProperty.call(RECOMMENDER_FACTOR_WEIGHTS, id) && (numberOrNull(factor?.quality) ?? 0) >= 35)
+    .map(([id]) => id);
   if ((evaluation.dataQualityScore || 0) < minDq) {
     gates.push({
       id: "low_data_quality",
@@ -23414,6 +23470,14 @@ function allStockAgentActionability(evaluation = {}, state = {}, run = {}, skill
       label: "组合暴露动态阈值",
       action: "downgrade_research",
       evidence: `买入分 ${formatReportNumber(evaluation.buyScore || 0, 0)}，动态阈值 ${formatReportNumber(dynamic.threshold, 0)}。`,
+    });
+  }
+  if (decisionFactors.length < 4) {
+    gates.push({
+      id: "insufficient_factor_evidence",
+      label: "有效因子证据不足",
+      action: "downgrade_research",
+      evidence: `10 个正式因子中只有 ${decisionFactors.length} 个质量分达到 35（${decisionFactors.join("、") || "无"}），至少需要 4 个才可进入可执行列表。`,
     });
   }
   if (Number.isFinite(evaluation.sourceRunAgeHours) && evaluation.sourceRunAgeHours > AGENT_MAX_SOURCE_AGE_HOURS) {
@@ -23435,6 +23499,8 @@ function allStockAgentActionability(evaluation = {}, state = {}, run = {}, skill
     status: eligible ? "actionable" : "research",
     minDataQuality: minDq,
     dynamicThreshold: dynamic,
+    evidenceFactorCount: decisionFactors.length,
+    evidenceFactors: decisionFactors,
     gates,
   };
 }
@@ -23445,6 +23511,65 @@ function allStockAgentDecisionLogSuppressed(evaluation = {}) {
     ...(Array.isArray(evaluation.gates) ? evaluation.gates : []),
   ];
   return gates.some((gate) => gate?.id === "ticker_cooldown" || gate?.id === "failed_thesis_cooldown");
+}
+
+function allStockAgentQuantitativeFundamentalEvidence(fundamental = {}, researchPack = null) {
+  const latest = fundamental.financialLatest || fundamental.financialSnapshot || {};
+  const consensus = researchPack?.summary?.consensus || {};
+  const fields = {
+    revenueGrowth: firstFiniteNumber(
+      fundamental.revenueGrowthTTMYoy,
+      fundamental.revenueGrowthYoy,
+      fundamental.revenueGrowth,
+      latest.revenueYoy,
+    ),
+    netMargin: firstFiniteNumber(
+      fundamental.netProfitMarginTTM,
+      fundamental.netMargin,
+      fundamental.profitMargin,
+      latest.netMargin,
+    ),
+    grossMargin: firstFiniteNumber(fundamental.grossMarginTTM, fundamental.grossMargin, latest.grossMargin),
+    roe: firstFiniteNumber(fundamental.roeTTM, fundamental.roe, latest.roe, latest.roeTtm),
+    pe: firstPositiveFiniteNumber(fundamental.peTTM, fundamental.peNormalizedAnnual, fundamental.pe),
+    ps: firstPositiveFiniteNumber(fundamental.psTTM, fundamental.ps),
+    revenue: firstPositiveFiniteNumber(latest.revenue, fundamental.revenueTTM),
+    eps: firstFiniteNumber(latest.eps, fundamental.epsTTM),
+    consensusEps: firstFiniteNumber(consensus.epsEstimate, researchPack?.summary?.forecastEps?.forecast_eps_mean),
+    consensusRevenue: firstPositiveFiniteNumber(consensus.revenueEstimate),
+  };
+  const available = Object.entries(fields)
+    .filter(([, value]) => Number.isFinite(value))
+    .map(([key]) => key);
+  return {
+    fields,
+    available,
+    count: available.length,
+    hasGrowthOrProfitability: [fields.revenueGrowth, fields.netMargin, fields.grossMargin, fields.roe]
+      .some((value) => Number.isFinite(value)),
+  };
+}
+
+function allStockAgentVerifiedIndustryRows(pack = {}, ticker = "") {
+  const target = safeTicker(ticker);
+  return [
+    ...(Array.isArray(pack.peers) ? pack.peers : []),
+    ...(Array.isArray(pack.upstream) ? pack.upstream : []),
+    ...(Array.isArray(pack.downstream) ? pack.downstream : []),
+  ].filter((row) => {
+    const symbol = safeTicker(row?.ticker);
+    if (!symbol || symbol === target || ALL_STOCK_AGENT_EXCLUDED_TICKERS.has(symbol) || tradedFundProfile(symbol)) return false;
+    const quality = numberOrNull(row.qualityScore) ?? 0;
+    const hasMarketOrFundamentalEvidence = [
+      row.price,
+      row.changePercent,
+      row.marketCapitalization,
+      row.peTTM,
+      row.revenueGrowthTTMYoy,
+      row.netProfitMarginTTM,
+    ].some((value) => Number.isFinite(numberOrNull(value)));
+    return quality >= 55 && hasMarketOrFundamentalEvidence;
+  });
 }
 
 function evaluateAllStockAgentCondition(condition, ctx = {}, skill = {}) {
@@ -23473,12 +23598,14 @@ function evaluateAllStockAgentCondition(condition, ctx = {}, skill = {}) {
     fundamental.revenueGrowthTTMYoy ?? fundamental.revenueGrowthYoy ?? fundamental.revenueGrowth,
   );
   const netMargin = numberOrNull(fundamental.netProfitMarginTTM ?? fundamental.netMargin ?? fundamental.profitMargin);
+  const fundamentalEvidence = allStockAgentQuantitativeFundamentalEvidence(fundamental, ctx.researchPack);
   const profileName = normalizeDisplayText(fundamental.name || knownProfile?.name);
   const profileIndustry = normalizeDisplayText(fundamental.industry || knownProfile?.industry);
   const profileBusiness = trimDisplayPunctuation(fundamental.mainBusiness || knownProfile?.mainBusiness || "");
   const hasSpecificBusiness = isSpecificBusinessText(profileBusiness);
   const hotReason = normalizeDisplayText(socialHot.hotReason || socialHot.summaryZh || socialHot.summary || "");
   const industrySummary = normalizeDisplayText(ctx.industryChainPack?.summary?.headline || ctx.industryChainPack?.summary?.bullets?.join("；") || "");
+  const verifiedIndustryRows = allStockAgentVerifiedIndustryRows(ctx.industryChainPack || {}, symbol);
   const expectationGap = ctx.expectationGap || {};
   const targetUpside = numberOrNull(expectationGap.targetUpsidePercent);
   const impliedGrowth = numberOrNull(expectationGap.impliedGrowthPct);
@@ -23517,12 +23644,14 @@ function evaluateAllStockAgentCondition(condition, ctx = {}, skill = {}) {
         passed:
           (Number.isFinite(revenueGrowth) && revenueGrowth > 0) ||
           (Number.isFinite(netMargin) && netMargin > 0) ||
-          hasSpecificBusiness,
+          (Number.isFinite(fundamentalEvidence.fields.grossMargin) && fundamentalEvidence.fields.grossMargin > 0) ||
+          (Number.isFinite(fundamentalEvidence.fields.roe) && fundamentalEvidence.fields.roe > 0),
         evidence: [
           Number.isFinite(revenueGrowth) ? `收入增速 ${formatReportNumber(revenueGrowth, 1)}%` : "",
           Number.isFinite(netMargin) ? `净利率 ${formatReportNumber(netMargin, 1)}%` : "",
-          hasSpecificBusiness ? `主业：${profileBusiness.slice(0, 100)}` : "",
-        ].filter(Boolean).join("，") || "基本面字段不足。",
+          Number.isFinite(fundamentalEvidence.fields.grossMargin) ? `毛利率 ${formatReportNumber(fundamentalEvidence.fields.grossMargin, 1)}%` : "",
+          Number.isFinite(fundamentalEvidence.fields.roe) ? `ROE ${formatReportNumber(fundamentalEvidence.fields.roe, 1)}%` : "",
+        ].filter(Boolean).join("，") || "缺少可量化的收入增长、利润率或 ROE；公司介绍不能替代基本面证据。",
       };
     case "social_heat_with_reason":
       return {
@@ -23531,8 +23660,14 @@ function evaluateAllStockAgentCondition(condition, ctx = {}, skill = {}) {
       };
     case "industry_chain_supported":
       return {
-        passed: Boolean(industrySummary) && !riskGateKeys.has("peer_underperformance") && !riskGateKeys.has("downstream_weakness"),
-        evidence: industrySummary || "同业/上下游数据不足。",
+        passed:
+          Boolean(industrySummary) &&
+          verifiedIndustryRows.length > 0 &&
+          !riskGateKeys.has("peer_underperformance") &&
+          !riskGateKeys.has("downstream_weakness"),
+        evidence: verifiedIndustryRows.length
+          ? `${industrySummary}；可核验同业/上下游样本 ${verifiedIndustryRows.slice(0, 5).map((row) => row.ticker).join("、")}。`
+          : "缺少带行情或基本面字段的同业/上下游股票；ETF、指数和纯模板关系不计为证据。",
       };
     case "positive_expectation_gap":
       return {
@@ -23629,20 +23764,10 @@ function evaluateAllStockAgentCondition(condition, ctx = {}, skill = {}) {
       };
     case "missing_buy_fundamental":
       return {
-        passed:
-          !(
-            profileName ||
-            hasSpecificBusiness ||
-            Number.isFinite(revenueGrowth) ||
-            Number.isFinite(netMargin)
-          ),
-        evidence:
-          profileName || hasSpecificBusiness
-            ? `已有基本面/主业字段：${[profileName, profileIndustry, hasSpecificBusiness ? profileBusiness : ""]
-                .filter(Boolean)
-                .join("，")
-                .slice(0, 140)}。`
-            : "缺少公司名称、主业、收入增速或盈利质量字段。",
+        passed: fundamentalEvidence.count === 0,
+        evidence: fundamentalEvidence.count
+          ? `可量化基本面字段 ${fundamentalEvidence.count} 个：${fundamentalEvidence.available.join("、")}。`
+          : `${[profileName, profileIndustry, hasSpecificBusiness ? profileBusiness : ""].filter(Boolean).join("，").slice(0, 120) || "公司画像也缺失"}；但没有收入、利润率、ROE、估值或一致预期数字，不能生成正式买入。`,
       };
     case "hard_technical_breakdown":
       return {
@@ -24331,6 +24456,39 @@ function withAllStockAgentOutcomeQuality(outcome = {}) {
   };
 }
 
+function buildAllStockAgentOutcomeQualityCorrections(outcomes = [], existing = []) {
+  const policyVersion = "outcome-quality-policy-v2";
+  const rows = Array.isArray(existing) ? existing.slice() : [];
+  const keys = new Set(rows.map((item) => item.id).filter(Boolean));
+  for (const outcome of outcomes || []) {
+    const quality = classifyAllStockAgentOutcomeQuality(outcome);
+    const frozenStatus = normalizeDisplayText(outcome.outcomeQualityStatus || outcome.qualityStatus || "unknown");
+    const frozenUsable = outcome.outcomeUsable !== false && frozenStatus === "ok";
+    if (frozenStatus === quality.status && frozenUsable === quality.usable) continue;
+    const outcomeId = normalizeDisplayText(outcome.id || `${outcome.decisionId || "decision"}:${outcome.horizonDays || "h"}`);
+    const id = `${policyVersion}:${outcomeId}`;
+    if (keys.has(id)) continue;
+    rows.unshift({
+      schemaVersion: "outcome-quality-correction-v1",
+      id,
+      policyVersion,
+      outcomeId,
+      decisionId: outcome.decisionId || "",
+      ticker: safeTicker(outcome.ticker),
+      horizonDays: numberOrNull(outcome.horizonDays),
+      frozenStatus,
+      frozenUsable,
+      currentStatus: quality.status,
+      currentUsable: quality.usable,
+      reasons: quality.reasons,
+      appendedAt: nowIso(),
+      mutationPolicy: "append-only; frozen decision/outcome fields remain unchanged",
+    });
+    keys.add(id);
+  }
+  return rows.slice(0, ALL_STOCK_AGENT_OUTCOME_LIMIT);
+}
+
 function stockHistoryPricePath(stockHistory = [], ticker = "", fromAt = "", toAt = "") {
   return recommenderStockHistoryPricePath(stockHistory, ticker, fromAt, toAt);
 }
@@ -24894,9 +25052,9 @@ async function maybeUpdateAllStockAgentSkill(skillBundle, state = {}, ruleStats 
 }
 
 function allStockAgentMissingData(run = {}, universe = [], evaluations = []) {
-  const quoteTickers = new Set((run.quotes || []).map((item) => safeTicker(item.ticker)));
-  const fundamentalTickers = new Set((run.fundamentals || []).map((item) => safeTicker(item.ticker)));
-  const technicalTickers = new Set((run.technicals || []).map((item) => safeTicker(item.ticker)));
+  const quoteTickers = new Set((run.quotes || []).filter((item) => Number.isFinite(numberOrNull(item.price)) && Number(item.price) > 0).map((item) => safeTicker(item.ticker)));
+  const fundamentalTickers = new Set((run.fundamentals || []).filter(allStockAgentUsefulFundamental).map((item) => safeTicker(item.ticker)));
+  const technicalTickers = new Set((run.technicals || []).filter(allStockAgentUsefulTechnical).map((item) => safeTicker(item.ticker)));
   const rows = [];
   rows.push("完整无遗漏的美股 security master 尚未接入；当前候选池来自 Longbridge 榜单、Global Stock Data 扫描、社交热度、新闻、因子池、自选股和持仓，并已过滤常见 ETF/指数代理。");
   const missingQuotes = universe.filter((item) => !quoteTickers.has(item.ticker)).length;
@@ -24904,13 +25062,40 @@ function allStockAgentMissingData(run = {}, universe = [], evaluations = []) {
   const missingTechnicals = universe.filter((item) => !technicalTickers.has(item.ticker)).length;
   if (missingQuotes) rows.push(`${missingQuotes} 个候选缺少实时/延时行情，无法进入买入前十。`);
   if (missingTechnicals) rows.push(`${missingTechnicals} 个候选缺少 K线/均线，技术规则不会命中。`);
-  if (missingFundamentals) rows.push(`${missingFundamentals} 个候选缺少基本面字段，基本面规则不会命中。`);
+  if (missingFundamentals) rows.push(`${missingFundamentals} 个候选缺少可量化基本面字段，公司名称/主业介绍不计为基本面证据。`);
   if (!run.longBridge?.microstructure?.length) rows.push("盘口/盘中数据仍是单股页按需拉取，批量全市场评分暂不等待盘口。");
   if (!run.options?.length) rows.push("期权链和大单异动未纳入全市场批量打分，只在已有期权链或单股页中使用。");
   if (!evaluations.some((item) => item.matchedBuyRules?.some((rule) => rule.id === "material_positive_news"))) {
     rows.push("当前批次缺少可明确量化的正向新闻催化，买入候选会更多依赖技术面、基本面和热度解释。");
   }
   return rows;
+}
+
+function groupAllStockAgentMissingData(items = []) {
+  const plain = [];
+  const grouped = new Map();
+  for (const raw of items || []) {
+    const text = normalizeDisplayText(raw);
+    if (!text) continue;
+    const match = text.match(/^(.+?)\s+([A-Z][A-Z0-9.-]{0,15})：(.+)$/);
+    if (!match) {
+      if (!plain.includes(text)) plain.push(text);
+      continue;
+    }
+    const source = match[1].trim();
+    const ticker = safeTicker(match[2]);
+    const detail = match[3].trim();
+    const key = `${source}:${detail}`;
+    const row = grouped.get(key) || { source, detail, tickers: [] };
+    if (ticker && !row.tickers.includes(ticker)) row.tickers.push(ticker);
+    grouped.set(key, row);
+  }
+  return [
+    ...plain,
+    ...[...grouped.values()].map((row) =>
+      `${row.source}：${row.detail}（${row.tickers.length} 个标的${row.tickers.length ? `，例如 ${row.tickers.slice(0, 5).join("、")}` : ""}）`,
+    ),
+  ];
 }
 
 function mergeTickerRows(existing = [], extra = []) {
@@ -24935,6 +25120,13 @@ function allStockAgentUsefulTechnical(row = {}) {
         (Number.isFinite(row.sma20) && row.sma20 > 0) ||
         (Number.isFinite(row.latestClose) && row.latestClose > 0)
       ),
+  );
+}
+
+function allStockAgentUsefulFundamental(row = {}) {
+  return Boolean(
+    safeTicker(row?.ticker) &&
+      allStockAgentQuantitativeFundamentalEvidence(row).count > 0,
   );
 }
 
@@ -24993,20 +25185,27 @@ async function enrichAllStockAgentSourceData(source = {}, universe = []) {
   }
   const technicalTargets = allStockAgentPrefetchTickers(source, universe, ALL_STOCK_AGENT_TECHNICAL_PREFETCH_LIMIT);
   const quoteTargets = allStockAgentPrefetchTickers(source, universe, ALL_STOCK_AGENT_QUOTE_PREFETCH_LIMIT);
+  const fundamentalTargets = allStockAgentPrefetchTickers(source, universe, ALL_STOCK_AGENT_FUNDAMENTAL_PREFETCH_LIMIT);
   const existingQuoteTickers = new Set((source.quotes || []).map((item) => safeTicker(item.ticker)));
   const existingTechnicalTickers = new Set((source.technicals || []).filter(allStockAgentUsefulTechnical).map((item) => safeTicker(item.ticker)));
+  const existingFundamentalTickers = new Set((source.fundamentals || []).filter(allStockAgentUsefulFundamental).map((item) => safeTicker(item.ticker)));
   const quoteMissing = quoteTargets.filter((ticker) => !existingQuoteTickers.has(ticker));
   const technicalMissing = technicalTargets.filter((ticker) => !existingTechnicalTickers.has(ticker));
-  const [quoteResult, technicalResult] = await Promise.all([
+  const fundamentalMissing = fundamentalTargets.filter((ticker) => !existingFundamentalTickers.has(ticker));
+  const [quoteResult, technicalResult, fundamentalResult] = await Promise.all([
     quoteMissing.length ? collectQuotes(quoteMissing) : Promise.resolve({ quotes: [], errors: [] }),
     technicalMissing.length
       ? collectTechnicalData(technicalMissing, { limit: technicalMissing.length })
       : Promise.resolve({ technicals: [], errors: [] }),
+    fundamentalMissing.length
+      ? collectFundamentals(fundamentalMissing)
+      : Promise.resolve({ fundamentals: [], errors: [] }),
   ]);
   const nextSource = {
     ...source,
     quotes: mergeTickerRows(source.quotes || [], quoteResult.quotes || []),
     technicals: mergeTickerRows(source.technicals || [], technicalResult.technicals || []),
+    fundamentals: mergeFundamentalRecords([...(source.fundamentals || []), ...(fundamentalResult.fundamentals || [])]),
   };
   const diagnostics = {
     enabled: true,
@@ -25018,10 +25217,19 @@ async function enrichAllStockAgentSourceData(source = {}, universe = []) {
     technicalAdded: (technicalResult.technicals || []).length,
     technicalCoverageBefore: existingTechnicalTickers.size,
     technicalCoverageAfter: new Set((nextSource.technicals || []).filter(allStockAgentUsefulTechnical).map((item) => safeTicker(item.ticker))).size,
+    fundamentalTargets: fundamentalTargets.length,
+    fundamentalMissing: fundamentalMissing.length,
+    fundamentalAdded: (fundamentalResult.fundamentals || []).filter(allStockAgentUsefulFundamental).length,
+    fundamentalCoverageBefore: existingFundamentalTickers.size,
+    fundamentalCoverageAfter: new Set((nextSource.fundamentals || []).filter(allStockAgentUsefulFundamental).map((item) => safeTicker(item.ticker))).size,
     quoteScope: ALL_STOCK_AGENT_QUOTE_PREFETCH_LIMIT > 0 ? `top-${ALL_STOCK_AGENT_QUOTE_PREFETCH_LIMIT}` : "all-candidates",
     technicalScope:
       ALL_STOCK_AGENT_TECHNICAL_PREFETCH_LIMIT > 0
         ? `top-${ALL_STOCK_AGENT_TECHNICAL_PREFETCH_LIMIT}`
+        : "all-candidates",
+    fundamentalScope:
+      ALL_STOCK_AGENT_FUNDAMENTAL_PREFETCH_LIMIT > 0
+        ? `top-${ALL_STOCK_AGENT_FUNDAMENTAL_PREFETCH_LIMIT}`
         : "all-candidates",
     targets: technicalTargets.slice(0, 24),
   };
@@ -25031,6 +25239,7 @@ async function enrichAllStockAgentSourceData(source = {}, universe = []) {
     errors: [
       ...(quoteResult.errors || []).map((item) => ({ ...item, source: item.source || "All Stock Agent Quote Prefetch" })),
       ...(technicalResult.errors || []).map((item) => ({ ...item, source: item.source || "All Stock Agent Technical Prefetch" })),
+      ...(fundamentalResult.errors || []).map((item) => ({ ...item, source: item.source || "All Stock Agent Fundamental Prefetch" })),
     ],
   };
 }
@@ -25042,6 +25251,7 @@ function persistAllStockAgentPrefetchToRun(db = {}, sourceRun = {}, enrichedSour
   if (!target) return;
   target.quotes = mergeTickerRows(target.quotes || [], enrichedSource.quotes || []);
   target.technicals = mergeTickerRows(target.technicals || [], enrichedSource.technicals || []);
+  target.fundamentals = mergeFundamentalRecords([...(target.fundamentals || []), ...(enrichedSource.fundamentals || [])]);
   target.allStockAgentPrefetch = {
     ...(target.allStockAgentPrefetch || {}),
     ...prefetch.diagnostics,
@@ -25086,9 +25296,14 @@ async function runAllStockAgentForRunUnlocked(db, sourceRun, trigger = "manual",
   const sourceReadinessBlocked = sourceReadiness?.status === "blocked";
   persistAllStockAgentPrefetchToRun(db, sourceRun, source, prefetch);
   const outcomeUpdate = buildAllStockAgentOutcomeSnapshots(state, source, db, skillBundle.skill);
+  const outcomeQualityCorrections = buildAllStockAgentOutcomeQualityCorrections(
+    outcomeUpdate.snapshots,
+    state.outcomeQualityCorrections || [],
+  );
   const stateWithOutcomes = normalizeAllStockAgentState({
     ...state,
     outcomeSnapshots: outcomeUpdate.snapshots,
+    outcomeQualityCorrections,
   });
   const reviews = buildAllStockAgentReviews(stateWithOutcomes, source);
   const ruleStats = buildAllStockAgentRuleStats(reviews, stateWithOutcomes.outcomeSnapshots);
@@ -25288,6 +25503,7 @@ async function runAllStockAgentForRunUnlocked(db, sourceRun, trigger = "manual",
       reviewed: reviews.length,
       outcomes: stateWithOutcomes.outcomeSnapshots.length,
       newOutcomes: outcomeUpdate.added,
+      outcomeQualityCorrections: outcomeQualityCorrections.length,
       skillChanges: skillUpdate.revision?.changes?.length || 0,
       trackedBuyLimit: buyLimit,
       minTrackedDecisions: MIN_TRACKED_DECISIONS_PER_RUN,
@@ -25348,6 +25564,7 @@ async function runAllStockAgentForRunUnlocked(db, sourceRun, trigger = "manual",
     evaluations: evaluations.slice(0, 80),
     reviews: reviews.slice(0, 80),
     outcomeSnapshots: stateWithOutcomes.outcomeSnapshots.slice(0, 120),
+    outcomeQualityCorrections: outcomeQualityCorrections.slice(0, 120),
     ruleStats,
     factorStats,
     factorCorrelationMatrix,
@@ -25376,14 +25593,14 @@ async function runAllStockAgentForRunUnlocked(db, sourceRun, trigger = "manual",
       skill,
     ),
     skillRevision: skillUpdate.revision,
-    missingData: [
+    missingData: groupAllStockAgentMissingData([
       ...(sourceReadinessBlocked
         ? [`源报告数据质量为 blocked：${sourceReadiness?.summary || "核心数据源未达到可用标准"}；本轮不生成买入决策或样本补位。`]
         : []),
       ...allStockAgentMissingData(source, universe, evaluations),
       ...prefetch.errors.slice(0, 8).map((item) => `${item.source} ${item.ticker || ""}：${item.error}`.trim()),
       ...securityMasterErrors.map((item) => `${item.source} 暂不可用：${item.error}`),
-    ],
+    ]),
     disclaimer: "候选池 Agent 输出为系统化研究和交易计划候选，不是保证收益的自动下单策略；执行前仍需结合仓位、滑点、税费和风险预算。",
   };
   const factorWeightCandidate = candidateStrategyVersionFromLearning(factorWeightLearning, {
@@ -25416,6 +25633,7 @@ async function runAllStockAgentForRunUnlocked(db, sourceRun, trigger = "manual",
     runs: [agentRun, ...(state.runs || [])],
     decisions: [...decisions, ...(stateWithOutcomes.decisions || [])],
     outcomeSnapshots: stateWithOutcomes.outcomeSnapshots,
+    outcomeQualityCorrections,
     ruleStats,
     paperBook: agentRun.paperBook,
     persistentMemory: agentRun.persistentMemory,
@@ -25524,8 +25742,38 @@ function compactAllStockAgentRunForClient(run = {}) {
     performancePct: item.performancePct,
     rawReturnPct: item.rawReturnPct,
     outcomeQualityStatus: item.outcomeQualityStatus,
+    outcomeQualityCurrentStatus: item.outcomeQualityCurrentStatus,
     outcomeUsable: item.outcomeUsable,
+    outcomeUsableCurrent: item.outcomeUsableCurrent,
     evaluatedAt: item.evaluatedAt,
+  });
+  const compactFactorStat = (row = {}) => ({
+    id: row.id,
+    label: row.label,
+    n: row.n,
+    samples: row.samples,
+    wins: row.wins,
+    losses: row.losses,
+    avgExcessPct: row.avgExcessPct,
+    avgScore: row.avgScore,
+    hitRate: row.hitRate,
+    rankIC: row.rankIC,
+    effectiveN: row.effectiveN,
+    tStat: row.tStat,
+    source: row.source,
+    subSignals: Object.fromEntries(
+      Object.entries(row.subSignals || {}).map(([id, sub]) => [id, {
+        id: sub.id || id,
+        label: sub.label || id,
+        n: sub.n,
+        samples: sub.samples,
+        avgExcessPct: sub.avgExcessPct,
+        hitRate: sub.hitRate,
+        rankIC: sub.rankIC,
+        effectiveN: sub.effectiveN,
+        tStat: sub.tStat,
+      }]),
+    ),
   });
   const paperBook = run.paperBook
     ? {
@@ -25542,8 +25790,23 @@ function compactAllStockAgentRunForClient(run = {}) {
     watchBuyCandidates: (run.watchBuyCandidates || []).map(compactAllStockAgentCardForClient),
     sellCandidates: (run.sellCandidates || []).map(compactAllStockAgentCardForClient),
     holdReviews: (run.holdReviews || []).map(compactAllStockAgentCardForClient),
-    reviews: (run.reviews || []).slice(0, 20),
+    reviews: (run.reviews || []).slice(0, 20).map((item) => ({
+      decisionId: item.decisionId,
+      ticker: item.ticker,
+      action: item.action,
+      decisionAt: item.decisionAt,
+      ageDays: item.ageDays,
+      decisionPrice: item.decisionPrice,
+      currentPrice: item.currentPrice,
+      performancePct: item.performancePct,
+      outcome: item.outcome,
+      outcomeQualityStatus: item.outcomeQualityStatus,
+      outcomeQualityReasons: item.outcomeQualityReasons,
+      outcomeUsable: item.outcomeUsable,
+    })),
     outcomeSnapshots: (run.outcomeSnapshots || []).slice(0, 160).map(compactOutcome),
+    outcomeQualityCorrections: (run.outcomeQualityCorrections || []).slice(0, 40),
+    factorStats: Object.fromEntries(Object.entries(run.factorStats || {}).map(([id, row]) => [id, compactFactorStat(row)])),
     paperBook,
     persistentMemory: null,
     shadowPromotionPlan: run.shadowPromotionPlan
@@ -25564,7 +25827,7 @@ function allStockAgentForClient(state = {}, options = {}) {
     return {
       lastRunAt: normalized.lastRunAt,
       latest,
-      runs: latest ? [latest] : [],
+      runs: options.includeRunList === false ? [] : latest ? [latest] : [],
     };
   }
   return {
@@ -25640,6 +25903,11 @@ function buildRecommendationTrackRecordPayload(db = {}, filters = {}) {
     .filter((item) => !regimeFilter || item.regime === regimeFilter || item.regimeTag?.bucket === regimeFilter);
   const excluded = (state.outcomeSnapshots || [])
     .filter((item) => item?.outcome && item.outcome !== "pending" && !allStockAgentOutcomeIsUsable(item));
+  const qualityCorrections = buildAllStockAgentOutcomeQualityCorrections(
+    state.outcomeSnapshots || [],
+    state.outcomeQualityCorrections || [],
+  );
+  const currentFactorStats = allStockAgentBacktestFactorStats(completed);
   const byKey = new Map();
   for (const item of completed) {
     const horizon = Number(item.horizonDays) || 0;
@@ -25688,10 +25956,17 @@ function buildRecommendationTrackRecordPayload(db = {}, filters = {}) {
     sampleCount: completed.length,
     excludedCount: excluded.length,
     quarantinedCount: excluded.length,
+    correctionCount: qualityCorrections.length,
+    corrections: qualityCorrections.slice(0, 20),
     quarantineRule: `outcomeQualityStatus != ok 的样本不进入均值/胜率/学习统计；短周期价格异常阈值为 ${ALL_STOCK_AGENT_SUSPECT_PRICE_RETURN_PCT}%。`,
     buckets,
-    factorStats: state.runs[0]?.factorStats || {},
-    factorWeightLearning: state.factorWeightLearning || null,
+    factorStats: currentFactorStats,
+    factorWeightLearning: qualityCorrections.length > (state.outcomeQualityCorrections || []).length
+      ? null
+      : state.factorWeightLearning || null,
+    learningStatus: qualityCorrections.length > (state.outcomeQualityCorrections || []).length
+      ? "rebuild-required-after-quality-correction"
+      : "current-policy",
     regimeSplit: buildRecommenderRegimeSplitPayload(db),
     liveParity: buildRecommenderLiveParityPayload(db),
     paperBook: state.paperBook || null,
@@ -25716,12 +25991,73 @@ function buildRecommenderLiveParityPayload(db = {}) {
   });
 }
 
+function recommendationFreshnessStatus(run = {}, agentRun = null) {
+  const reportRunId = normalizeDisplayText(run.id || "");
+  const agentRunId = normalizeDisplayText(agentRun?.id || "");
+  const agentSourceRunId = normalizeDisplayText(agentRun?.sourceRunId || "");
+  const reportBlocked = run.dataQuality?.readiness?.status === "blocked";
+  const sameSourceRun = Boolean(reportRunId && agentSourceRunId && reportRunId === agentSourceRunId);
+  const completedMs = new Date(agentRun?.completedAt || agentRun?.generatedAt || 0).getTime();
+  const ageHours = Number.isFinite(completedMs) && completedMs > 0 ? (Date.now() - completedMs) / 3600000 : null;
+  const staleByAge = Number.isFinite(ageHours) && ageHours > AGENT_MAX_SOURCE_AGE_HOURS;
+  const status = !agentRunId
+    ? "agent-missing"
+    : reportBlocked
+      ? "report-blocked"
+      : !sameSourceRun
+        ? "agent-refresh-required"
+        : staleByAge
+          ? "agent-stale"
+          : "current";
+  return {
+    status,
+    usable: status === "current",
+    reportRunId,
+    reportCompletedAt: run.completedAt || run.generatedAt || "",
+    agentRunId,
+    agentCompletedAt: agentRun?.completedAt || agentRun?.generatedAt || "",
+    agentSourceRunId,
+    sameSourceRun,
+    ageHours: Number.isFinite(ageHours) ? Number(ageHours.toFixed(2)) : null,
+    maxAgeHours: AGENT_MAX_SOURCE_AGE_HOURS,
+    message: status === "current"
+      ? "Agent 与当前可用报告同源，建议可展示。"
+      : status === "report-blocked"
+        ? "当前报告被数据质量闸门拦截，不能展示可执行建议。"
+        : status === "agent-refresh-required"
+          ? "当前报告已更新，但 Agent 仍基于旧报告；请重新运行 Agent，旧建议只保留在历史区。"
+          : status === "agent-stale"
+            ? `Agent 已超过 ${AGENT_MAX_SOURCE_AGE_HOURS} 小时有效期；请重新运行。`
+            : "尚无 Agent 运行结果，请先基于最新报告运行 Agent。",
+  };
+}
+
+function compactSourceDiagnosticsForToday(value = null) {
+  const normalized = normalizeSourceDiagnostics(value);
+  const rows = normalized.rows || [];
+  return {
+    generatedAt: normalized.generatedAt || "",
+    stale: Boolean(normalized.stale),
+    summary: {
+      total: rows.length,
+      ok: rows.filter((row) => row.status === "ok").length,
+      warn: rows.filter((row) => row.status === "warn").length,
+      fail: rows.filter((row) => row.status === "fail").length,
+      skipped: rows.filter((row) => row.status === "skipped").length,
+    },
+    issues: rows
+      .filter((row) => row.status === "fail" || row.status === "warn")
+      .map((row) => ({ key: row.key, label: row.label, status: row.status, detail: row.detail, action: row.action }))
+      .slice(0, 16),
+  };
+}
+
 function buildTodayRecommendationsPayload(db = {}) {
   const state = normalizeAllStockAgentState(db.allStockAgent);
   const latestAgent = state.runs[0] || null;
   const run = latestRun(db) || {};
-  const readinessBlocked = run.dataQuality?.readiness?.status === "blocked";
-  const actionable = (readinessBlocked
+  const freshness = recommendationFreshnessStatus(run, latestAgent);
+  const actionable = (!freshness.usable
     ? []
     : (latestAgent?.buyCandidates || [])
         .filter((item) => item.actionable !== false && item.actionability?.status !== "research")
@@ -25737,20 +26073,22 @@ function buildTodayRecommendationsPayload(db = {}) {
       researchSeen.add(ticker);
       return true;
     });
-  const research = [
+  const agentResearch = [
     ...downgradedTracked,
     ...appendResearch(latestAgent?.watchBuyCandidates || []),
     ...appendResearch((latestAgent?.evaluations || []).filter((item) => item.buyEligible && !item.actionableEligible)),
   ].slice(0, 20).map(compactTodayRecommendationCard);
+  const research = freshness.usable ? agentResearch : [];
+  const stale = freshness.usable
+    ? []
+    : [
+        ...((latestAgent?.buyCandidates || []).map(compactTodayRecommendationCard)),
+        ...agentResearch,
+      ].filter((item, index, rows) => rows.findIndex((row) => safeTicker(row.ticker) === safeTicker(item.ticker)) === index).slice(0, 20);
   return {
     schemaVersion: "recommendations-today-v1",
     generatedAt: nowIso(),
-    freshness: {
-      runId: run.id || "",
-      runCompletedAt: run.completedAt || "",
-      agentRunId: latestAgent?.id || "",
-      agentCompletedAt: latestAgent?.completedAt || "",
-    },
+    freshness,
     regime: latestAgent?.roadmap?.regime || allStockAgentRegimeTagFromRun(run),
     editorial: run.marketOverview?.summary || run.analysis?.headline || "",
     stories: recommendationStoryRows(run, 8),
@@ -25759,18 +26097,17 @@ function buildTodayRecommendationsPayload(db = {}) {
     calls: {
       actionable,
       research,
+      stale,
       actionableLimit: latestAgent?.summary?.actionableBuyLimit ?? 3,
       downgraded: latestAgent?.summary?.researchDowngraded ?? research.length,
     },
     trackRecord: buildRecommendationTrackRecordPayload(db),
     health: {
       dataQuality: run.dataQuality || null,
-      sourceDiagnostics: normalizeSourceDiagnostics(db.sourceDiagnostics),
+      sourceDiagnostics: compactSourceDiagnosticsForToday(db.sourceDiagnostics),
       missingData: latestAgent?.missingData || [],
-      actionabilityStatus: readinessBlocked ? "blocked" : "usable",
-      actionabilityMessage: readinessBlocked
-        ? run.dataQuality?.readiness?.summary || "核心数据源未达到可用标准，本轮不提供可执行建议。"
-        : "核心数据通过最低可用门槛。",
+      actionabilityStatus: freshness.status,
+      actionabilityMessage: freshness.message,
     },
   };
 }
@@ -26033,6 +26370,148 @@ function buildTradeRecommendationReconciliation(db = {}) {
   };
 }
 
+function historicalValidationMetric(run = {}, key = "") {
+  const metric = run.metrics?.[key];
+  return numberOrNull(metric && typeof metric === "object" ? metric.value : metric);
+}
+
+function historicalValidationCorpusDescriptor(run = {}) {
+  const config = { ...(run.config || {}) };
+  delete config.factorWeights;
+  delete config.strategyVersionId;
+  return {
+    config,
+    scope: {
+      tickers: run.scope?.tickers ?? 0,
+      pointInTimeMembers: run.scope?.pointInTimeMembers ?? 0,
+      pointInTimeMembersWithBars: run.scope?.pointInTimeMembersWithBars ?? 0,
+      dates: run.scope?.dates ?? 0,
+      barRows: run.scope?.barRows ?? 0,
+      regimeRows: run.scope?.regimeRows ?? 0,
+      pitFundamentalRows: run.scope?.pitFundamentalRows ?? 0,
+      universeMembershipRows: run.scope?.universeMembershipRows ?? 0,
+      horizons: run.scope?.horizons || [],
+      grid: run.scope?.grid || null,
+    },
+  };
+}
+
+function historicalValidationCorpusHash(run = {}) {
+  return crypto.createHash("sha256").update(JSON.stringify(historicalValidationCorpusDescriptor(run))).digest("hex");
+}
+
+function strategyHistoricalValidationConfig(db = {}, candidate = {}, body = {}) {
+  const sourceRun = (db.historicalBacktests || []).find((run) => run.id === candidate.sourceRunId) || db.historicalBacktests?.[0] || {};
+  const sourceConfig = sourceRun.config || {};
+  const allowed = [
+    "startDate",
+    "endDate",
+    "maxTickers",
+    "maxDates",
+    "topN",
+    "minLookback",
+    "horizons",
+    "primaryHorizon",
+    "costBps",
+    "slippageBps",
+    "universeMode",
+    "sqliteTimeoutMs",
+    "bridgeTimeoutMs",
+    "workerTimeoutMs",
+  ];
+  const config = {};
+  for (const key of allowed) {
+    const value = body[key] ?? sourceConfig[key];
+    if (value !== undefined && value !== null && value !== "") config[key] = value;
+  }
+  if (!config.maxDates) config.maxDates = 120;
+  if (!config.horizons?.length) config.horizons = [1, 3, 5, 10, 20, 60];
+  config.compactResponse = true;
+  config.detailLimit = 0;
+  return config;
+}
+
+async function validateStrategyCandidateOnSameHistoricalCorpus(db = {}, state = {}, candidate = {}, active = {}, body = {}) {
+  if (!candidate?.weights || !active?.weights) throw new Error("candidate 或 active 缺少冻结权重，无法做同语料验证。");
+  const baseConfig = strategyHistoricalValidationConfig(db, candidate, body);
+  const activeResult = await runHistoricalBacktestOffThread({
+    ...baseConfig,
+    strategyVersionId: active.id,
+    weights: active.weights,
+  });
+  const candidateResult = await runHistoricalBacktestOffThread({
+    ...baseConfig,
+    strategyVersionId: candidate.id,
+    weights: candidate.weights,
+  });
+  const activeRun = activeResult.run || {};
+  const candidateRun = candidateResult.run || {};
+  const activeCorpusHash = historicalValidationCorpusHash(activeRun);
+  const candidateCorpusHash = historicalValidationCorpusHash(candidateRun);
+  const validationRecord = buildPromotionValidationRecord(candidate, active, {
+    source: "same-corpus-historical-walk-forward",
+    candidateExcessPct: candidateRun.metrics?.excessVsSpy,
+    activeExcessPct: activeRun.metrics?.excessVsSpy,
+    candidateMaxDrawdownPct: candidateRun.metrics?.maxDrawdown,
+    activeMaxDrawdownPct: activeRun.metrics?.maxDrawdown,
+    candidateN: candidateRun.metrics?.sampleCount || candidateRun.metrics?.excessVsSpy?.n || 0,
+    activeN: activeRun.metrics?.sampleCount || activeRun.metrics?.excessVsSpy?.n || 0,
+    candidateRunId: candidateRun.id,
+    activeRunId: activeRun.id,
+    candidateCorpusHash,
+    activeCorpusHash,
+    sameCorpus: candidateCorpusHash === activeCorpusHash,
+    comparisonConfig: baseConfig,
+  });
+  db.historicalBacktests = [
+    compactHistoricalRun(candidateRun, { detailLimit: 0 }),
+    compactHistoricalRun(activeRun, { detailLimit: 0 }),
+    ...(db.historicalBacktests || []).filter((run) => run.id !== candidateRun.id && run.id !== activeRun.id),
+  ].slice(0, 50);
+  const strategyVersions = attachValidationRecord(state.strategyVersions, candidate.id, validationRecord);
+  db.allStockAgent = normalizeAllStockAgentState({ ...state, strategyVersions });
+  return { validationRecord, activeRun, candidateRun };
+}
+
+function strategyCandidatePromotionEligibility(version = {}) {
+  const record = version.validationRecords?.[0] || null;
+  const invalidLegacyMetric = [record?.candidateMaxDrawdownPct, record?.activeMaxDrawdownPct]
+    .some((value) => Number.isFinite(numberOrNull(value)) && Math.abs(Number(value)) >= 99.5);
+  const sameCorpus = record?.checks?.sameCorpus === true || record?.comparison?.sameCorpus === true;
+  const metricIntegrity = record?.checks?.metricIntegrity === true && !invalidLegacyMetric;
+  const canPromote = Boolean(
+    version.status === "candidate" &&
+    record?.status === "passed" &&
+    record?.passed === true &&
+    sameCorpus &&
+    metricIntegrity,
+  );
+  return {
+    schemaVersion: "strategy-promotion-eligibility-v1",
+    canPromote,
+    status: invalidLegacyMetric
+      ? "quarantined-legacy-metric"
+      : canPromote
+        ? "ready"
+        : record
+          ? record.status || "not-passed"
+          : "pending-same-corpus-validation",
+    reason: invalidLegacyMetric
+      ? "旧回测 MaxDD 达到 -100% 异常边界，已隔离；必须用修复后的同语料回测重新验证。"
+      : canPromote
+        ? "candidate 与 active 已在同一语料、窗口和 regime 配置上通过验证，可由人工晋升。"
+        : "需要先运行同语料历史验证，并同时取得 candidate/active 样本、超额收益和 MaxDD。",
+    validationId: record?.id || "",
+  };
+}
+
+function strategyVersionsForClient(rows = []) {
+  return (rows || []).map((version) => ({
+    ...version,
+    promotionEligibility: version.status === "candidate" ? strategyCandidatePromotionEligibility(version) : null,
+  }));
+}
+
 function buildStrategyValidationPayload(db = {}) {
   const state = normalizeAllStockAgentState(db.allStockAgent);
   const latest = state.runs[0] || {};
@@ -26040,7 +26519,7 @@ function buildStrategyValidationPayload(db = {}) {
   const factorStats = latest.factorStats || {};
   const eligibleFactors = Object.values(factorStats).filter((row) => Number(row.samples || 0) >= 50);
   const active = activeStrategyVersion(state.strategyVersions) || latest.skill?.strategyVersion || null;
-  const candidates = (state.strategyVersions || []).filter((row) => row.status === "candidate");
+  const candidates = strategyVersionsForClient((state.strategyVersions || []).filter((row) => row.status === "candidate"));
   return {
     schemaVersion: "strategy-validation-v1",
     generatedAt: nowIso(),
@@ -26801,9 +27280,11 @@ async function collectAdvisorOptionsForSnapshot(ticker, advisorContext = {}, err
   }
 }
 
-async function collectLongBridgeStockSnapshot(ticker, llmProvider = null, articleCache = null, sourceControls = null, advisorContext = {}) {
+async function collectLongBridgeStockSnapshot(ticker, llmProvider = null, articleCache = null, sourceControls = null, advisorContext = {}, options = {}) {
   const safe = safeTicker(ticker);
   if (!safe) throw new Error("请输入有效 ticker。");
+  const snapshotMode = options.mode === "quick" ? "quick" : "full";
+  const quick = snapshotMode === "quick";
   const [quoteResult, technicalResult, newsResult, akshareNewsResult, valuationHistoryResult, fundamentalResult, eastmoneyFundamentalResult, microstructureResult, filingResult] = await Promise.all([
     collectLongBridgeQuotes([safe]).catch((error) => ({
       quotes: [],
@@ -26812,31 +27293,36 @@ async function collectLongBridgeStockSnapshot(ticker, llmProvider = null, articl
     collectLongBridgeTechnical(safe)
       .then((technical) => ({ technical, errors: [] }))
       .catch((error) => ({ technical: null, errors: [{ source: "Longbridge Kline", ticker: safe, error: error.message }] })),
-    collectLongBridgeStockNews(safe, llmProvider, articleCache).catch((error) => ({
+    collectLongBridgeStockNews(
+      safe,
+      quick ? null : llmProvider,
+      articleCache,
+      quick ? { detailLimit: 1, summarize: false } : {},
+    ).catch((error) => ({
       news: [],
       errors: [{ source: "Longbridge News", ticker: safe, error: error.message }],
     })),
-    collectAkshareStockNews([safe], AKSHARE_SNAPSHOT_TIMEOUT_MS).catch((error) => ({
+    (quick ? Promise.resolve({ news: [], errors: [] }) : collectAkshareStockNews([safe], AKSHARE_SNAPSHOT_TIMEOUT_MS)).catch((error) => ({
       news: [],
       errors: [{ source: "AkShare stock_news_em", ticker: safe, error: error.message }],
     })),
-    collectAkshareValuationHistory(safe, AKSHARE_SNAPSHOT_TIMEOUT_MS).catch((error) => ({
+    (quick ? Promise.resolve({ valuationHistory: null, errors: [] }) : collectAkshareValuationHistory(safe, AKSHARE_SNAPSHOT_TIMEOUT_MS)).catch((error) => ({
       valuationHistory: null,
       errors: [{ source: "AkShare Valuation", ticker: safe, error: error.message }],
     })),
-    collectLongBridgeFundamentals([safe]).catch((error) => ({
+    (quick ? collectLongBridgeQuickFundamentals(safe) : collectLongBridgeFundamentals([safe])).catch((error) => ({
       fundamentals: [],
       errors: [{ source: "Longbridge Fundamentals", ticker: safe, error: error.message }],
     })),
-    collectEastmoneyGmainindicatorFundamentals([safe]).catch((error) => ({
+    (quick ? Promise.resolve({ fundamentals: [], errors: [] }) : collectEastmoneyGmainindicatorFundamentals([safe])).catch((error) => ({
       fundamentals: [],
       errors: [{ source: "Eastmoney GMAININDICATOR", ticker: safe, error: error.message }],
     })),
-    collectLongBridgeMicrostructure([safe]).catch((error) => ({
+    (quick ? Promise.resolve({ microstructure: [], errors: [] }) : collectLongBridgeMicrostructure([safe])).catch((error) => ({
       microstructure: [],
       errors: [{ source: "Longbridge Microstructure", ticker: safe, error: error.message }],
     })),
-    collectLongBridgeFilings([safe]).catch((error) => ({
+    (quick ? Promise.resolve({ filings: [], errors: [] }) : collectLongBridgeFilings([safe])).catch((error) => ({
       filings: [],
       errors: [{ source: "Longbridge Filing", ticker: safe, error: error.message }],
     })),
@@ -26850,8 +27336,30 @@ async function collectLongBridgeStockSnapshot(ticker, llmProvider = null, articl
   const baseNews = withNewsRelevanceForItems([...(newsResult.news || []), ...(akshareNewsResult.news || [])].map(newsItemForClient), { fundamentals });
   const microstructure = microstructureResult.microstructure || [];
   const filings = filingResult.filings || [];
-  const [researchPack, allNewsPack] = await Promise.all([
-    collectLongBridgeResearchPack(safe, quote).catch((error) => ({
+  const [researchPack, allNewsPack] = quick
+    ? [
+        {
+          ticker: safe,
+          provider: "Longbridge Research Pack",
+          generatedAt: nowIso(),
+          status: "pending-enrichment",
+          sections: [],
+          summary: { bullets: [] },
+          errors: [],
+        },
+        {
+          ticker: safe,
+          provider: "All News Pack",
+          generatedAt: nowIso(),
+          status: "pending-enrichment",
+          items: baseNews,
+          sourceCoverage: [],
+          summary: { headline: "全源新闻与 LLM 摘要正在后台补充。", bullets: [], risks: [] },
+          errors: [],
+        },
+      ]
+    : await Promise.all([
+      collectLongBridgeResearchPack(safe, quote).catch((error) => ({
       ticker: safe,
       provider: "Longbridge Research Pack",
       generatedAt: nowIso(),
@@ -26864,6 +27372,7 @@ async function collectLongBridgeStockSnapshot(ticker, llmProvider = null, articl
       "All News Pack 快照",
       (signal) => collectAllNewsPackForTicker(safe, llmProvider, articleCache, sourceControls, {
         akshareTimeoutMs: AKSHARE_SNAPSHOT_TIMEOUT_MS,
+        seedItems: baseNews,
         signal,
       }),
       STOCK_SNAPSHOT_ALL_NEWS_TIMEOUT_MS,
@@ -26876,8 +27385,8 @@ async function collectLongBridgeStockSnapshot(ticker, llmProvider = null, articl
       sourceCoverage: [],
       summary: { headline: "多源新闻包采集失败。", bullets: [], risks: [error.message] },
       errors: [{ source: "All News Pack", ticker: safe, error: error.message }],
-    })),
-  ]);
+      })),
+    ]);
   const allNews = withNewsRelevanceForItems(
     uniqBy([...(allNewsPack.items || []), ...baseNews], (item) => item.id || item.url || item.title),
     { fundamentals },
@@ -26887,17 +27396,28 @@ async function collectLongBridgeStockSnapshot(ticker, llmProvider = null, articl
     return hotNewsScore(b) - hotNewsScore(a) || newsPublishedTimeValue(b) - newsPublishedTimeValue(a);
   });
   const advisorOptionErrors = [];
-  const optionsForAdvisor = await collectAdvisorOptionsForSnapshot(safe, advisorContext, advisorOptionErrors);
+  const optionsForAdvisor = quick
+    ? advisorContext.options || cachedOptionChain(advisorContext.optionsCache, safe) || null
+    : await collectAdvisorOptionsForSnapshot(safe, advisorContext, advisorOptionErrors);
   const marketOverview = advisorContext.marketOverview || null;
   const eventCalendar = advisorContext.eventCalendar || null;
   const socialHot = advisorContext.socialHot || null;
   const position = advisorContext.position || null;
-  const industryChainPack = await collectIndustryChainPack(safe, {
-    fundamental: fundamentals[0] || null,
-    fundamentals,
-    quotes: quote ? [quote] : [],
-    industryRank: advisorContext.industryRank || null,
-  }).catch((error) => ({
+  const industryContext = buildIndustryChainContext(safe, fundamentals[0] || {}, fundamentals);
+  const industryChainPack = (quick
+    ? Promise.resolve(buildIndustryChainPackFromContext({
+        ticker: safe,
+        industryContext,
+        fundamental: fundamentals[0] || null,
+        fundamentals,
+        quotes: quote ? [quote] : [],
+      }))
+    : collectIndustryChainPack(safe, {
+        fundamental: fundamentals[0] || null,
+        fundamentals,
+        quotes: quote ? [quote] : [],
+        industryRank: advisorContext.industryRank || null,
+      })).catch((error) => ({
     schemaVersion: "industry-chain-pack-v1",
     ticker: safe,
     provider: "Industry Chain Pack",
@@ -26974,7 +27494,7 @@ async function collectLongBridgeStockSnapshot(ticker, llmProvider = null, articl
     error.providerErrors = errors;
     throw error;
   }
-  const investmentAdvisor = await buildInvestmentAdvisorForTicker({
+  const investmentAdvisor = quick ? null : await buildInvestmentAdvisorForTicker({
     ticker: safe,
     quote,
     technical,
@@ -27007,6 +27527,8 @@ async function collectLongBridgeStockSnapshot(ticker, llmProvider = null, articl
   return {
     ticker: safe,
     generatedAt: miniRun.completedAt,
+    snapshotMode,
+    enrichmentPending: quick,
     quote,
     technical,
     fundamentals,
@@ -28780,7 +29302,7 @@ async function collectIbkrGatewayQuotes(tickers) {
       .map((ticker) => ({
         source: "IBKR Gateway Quote",
         ticker,
-        error: "Socket API 未返回有效价格；通常是缺少实时/延迟行情权限，将自动降级到下一个行情源。",
+        error: "Socket API 三次尝试后仍未返回有效价格；通常是缺少实时/延迟行情权限，该 provider 已明确记为失败。",
       })),
   ];
   return { quotes, errors };
@@ -32019,6 +32541,35 @@ async function collectLongBridgeFundamentals(tickers) {
     }
   });
   return { fundamentals, errors };
+}
+
+async function collectLongBridgeQuickFundamentals(ticker) {
+  const safe = safeTicker(ticker);
+  if (!safe || !LONG_BRIDGE_ENABLED || !LONG_BRIDGE_FUNDAMENTALS_ENABLED || tradedFundProfile(safe)) {
+    return { fundamentals: [], errors: [] };
+  }
+  const symbol = longBridgeSymbol(safe);
+  const [company, valuation, financial] = await Promise.all([
+    runLongBridgeJson(["company", symbol, "--lang", "zh-CN"], Math.max(LONG_BRIDGE_TIMEOUT_MS, 15000)).catch((error) => ({ __error: error.message })),
+    runLongBridgeJson(["valuation", symbol, "--lang", "zh-CN"], Math.max(LONG_BRIDGE_TIMEOUT_MS, 18000)).catch((error) => ({ __error: error.message })),
+    runLongBridgeJson(["financial-report", "snapshot", symbol, "--lang", "zh-CN"], Math.max(LONG_BRIDGE_TIMEOUT_MS, 18000)).catch((error) => ({ __error: error.message })),
+  ]);
+  const errors = Object.entries({ company, valuation, financial })
+    .filter(([, payload]) => payload?.__error)
+    .map(([source, payload]) => ({ source: `Longbridge ${source}`, ticker: safe, error: payload.__error }));
+  return {
+    fundamentals: [normalizeLongBridgeFundamental({
+      ticker: safe,
+      company,
+      valuation,
+      rating: {},
+      forecast: {},
+      financial,
+      financialLatest: {},
+      segments: {},
+    })],
+    errors,
+  };
 }
 
 async function collectFundamentals(tickers) {
@@ -39708,6 +40259,214 @@ function runForClient(run, alertState = {}, sourceControls = null) {
   };
 }
 
+function compactStateArticleItem(item = {}) {
+  const article = item.article && typeof item.article === "object"
+    ? {
+        ...item.article,
+        text: undefined,
+        content: undefined,
+        html: undefined,
+        raw: undefined,
+      }
+    : item.article;
+  const compact = {
+    ...item,
+    article,
+    raw: undefined,
+    payload: undefined,
+    prompt: undefined,
+    llmRaw: undefined,
+    debug: undefined,
+  };
+  return compact;
+}
+
+function compactStateNarrative(item = {}) {
+  return {
+    ticker: item.ticker,
+    name: item.name || item.companyName || "",
+    nameZh: item.nameZh || item.chineseName || "",
+    provider: item.provider || "",
+    generatedAt: item.generatedAt || "",
+    oneLine: item.oneLine || "",
+    newsCatalyst: item.newsCatalyst || "",
+    secSummary: item.secSummary || "",
+    socialReason: item.socialReason || "",
+    investmentAngle: item.investmentAngle || "",
+    validationSteps: (item.validationSteps || []).slice(0, 4),
+    riskNotes: (item.riskNotes || []).slice(0, 4),
+    score: item.score ?? item.totalScore ?? null,
+    action: item.action || item.decisionDashboard?.action || "",
+    stance: item.stance || "",
+    dataCoverage: item.dataCoverage ?? item.analysisContextPack?.qualityScore ?? null,
+    summaryOnly: true,
+  };
+}
+
+function compactStateSocialCandidate(item = {}) {
+  const context = item.socialContext || {};
+  const compactContext = Object.keys(context).length
+    ? {
+        whyHot: context.whyHot || "",
+        heatSource: context.heatSource || "",
+        company: context.company || null,
+        industryContext: context.industryContext || null,
+        catalystSummary: context.catalystSummary || "",
+        fundamentalSnapshot: context.fundamentalSnapshot
+          ? {
+              summary: context.fundamentalSnapshot.summary || "",
+              metrics: (context.fundamentalSnapshot.metrics || []).slice(0, 6),
+            }
+          : null,
+        heatDrivers: (context.heatDrivers || []).slice(0, 5),
+        actionChecks: (context.actionChecks || []).slice(0, 4),
+        evidenceBreakdown: (context.evidenceBreakdown || []).slice(0, 5),
+        socialKeywords: (context.socialKeywords || []).slice(0, 8),
+      }
+    : null;
+  return {
+    ...item,
+    reason: item.twoSentenceReason ? undefined : item.reason,
+    hotReason: item.twoSentenceReason ? undefined : item.hotReason,
+    socialContext: compactContext,
+    keywordWebEvidence: undefined,
+    topPosts: (item.topPosts || []).slice(0, 3).map((post) => ({
+      title: post.title || post.summary || "",
+      url: post.url || post.link || "",
+      source: post.source || "",
+      score: post.score ?? null,
+    })),
+  };
+}
+
+function compactStateIndustryChainPack(pack = {}) {
+  const compactRows = (rows = []) => rows.slice(0, 8).map((row) => ({
+    ticker: row.ticker,
+    name: row.name,
+    nameZh: row.nameZh,
+    relation: row.relation,
+    role: row.role,
+    industry: row.industry,
+    mainBusiness: row.mainBusiness,
+    price: row.price,
+    changePercent: row.changePercent,
+    marketCapitalization: row.marketCapitalization,
+    peTTM: row.peTTM,
+    revenueGrowthTTMYoy: row.revenueGrowthTTMYoy,
+    netProfitMarginTTM: row.netProfitMarginTTM,
+    sourceTags: (row.sourceTags || []).slice(0, 4),
+    qualityScore: row.qualityScore,
+  }));
+  return {
+    ticker: pack.ticker,
+    provider: pack.provider,
+    status: pack.status,
+    industry: pack.industry,
+    segment: pack.segment,
+    products: (pack.products || []).slice(0, 8),
+    demandDrivers: (pack.demandDrivers || []).slice(0, 6),
+    summary: pack.summary || null,
+    relative: pack.relative || null,
+    sourceCoverage: pack.sourceCoverage || [],
+    peers: compactRows(pack.peers || []),
+    upstream: compactRows(pack.upstream || []),
+    downstream: compactRows(pack.downstream || []),
+  };
+}
+
+function compactStateSocialHotStocks(value = {}) {
+  const rising = (value.rising || []).map(compactStateSocialCandidate);
+  return {
+    ...value,
+    candidates: rising.length ? [] : (value.candidates || []).map(compactStateSocialCandidate),
+    rising,
+    sourceBoards: (value.sourceBoards || []).map((board) => {
+      const rows = (board.rising?.length ? board.rising : board.candidates || []).map(compactStateSocialCandidate);
+      return {
+        ...board,
+        candidates: [],
+        rising: rows,
+      };
+    }),
+  };
+}
+
+function compactStateTechnicals(run = {}) {
+  const priorityTickers = new Set(
+    [...(run.watchlist || []), ...(run.deepResearchTickers || []), ...(run.researchTickers || [])]
+      .map(safeTicker)
+      .filter(Boolean)
+      .slice(0, 30),
+  );
+  return (run.technicals || []).map((item) => {
+    const keepChart = priorityTickers.has(safeTicker(item?.ticker));
+    return {
+      ...item,
+      chart: keepChart && Array.isArray(item.chart) ? item.chart.slice(-60) : undefined,
+      bars: keepChart && Array.isArray(item.bars) ? item.bars.slice(-60) : undefined,
+      candles: keepChart && Array.isArray(item.candles) ? item.candles.slice(-60) : undefined,
+      history: keepChart && Array.isArray(item.history) ? item.history.slice(-60) : undefined,
+      clientChartStatus: keepChart ? "included" : "load-on-demand",
+    };
+  });
+}
+
+function runForStateClient(run, alertState = {}, sourceControls = null) {
+  const full = runForClient(run, alertState, sourceControls);
+  if (!full) return null;
+  const hotNews = full.hotNews && typeof full.hotNews === "object"
+    ? {
+        ...full.hotNews,
+        items: (full.hotNews.items || []).map(compactStateArticleItem),
+        ranked: (full.hotNews.ranked || []).map(compactStateArticleItem),
+        stories: (full.hotNews.stories || []).map(compactStateArticleItem),
+      }
+    : full.hotNews;
+  return {
+    ...full,
+    technicals: compactStateTechnicals(full),
+    hotNews,
+    news: (full.news || []).map(compactStateArticleItem),
+    videos: (full.videos || []).map(compactStateArticleItem),
+    socialPosts: (full.socialPosts || []).map((item) => ({
+      id: item.id,
+      postId: item.postId,
+      type: item.type,
+      ticker: item.ticker,
+      relatedTickers: (item.relatedTickers || []).slice(0, 8),
+      title: item.title,
+      titleZh: item.titleZh,
+      summaryZh: item.summaryZh,
+      publisher: item.publisher,
+      subreddit: item.subreddit,
+      channel: item.channel,
+      publishedAt: item.publishedAt,
+      url: item.url,
+      source: item.source,
+      rank: item.rank,
+      rank24hAgo: item.rank24hAgo,
+      mentions: item.mentions,
+      mentions24hAgo: item.mentions24hAgo,
+      mentionMove: item.mentionMove,
+      rankMove: item.rankMove,
+      comments: item.comments,
+      upvotes: item.upvotes,
+      positivePercent: item.positivePercent,
+      negativePercent: item.negativePercent,
+      keywords: (item.keywords || []).slice(0, 10),
+      content: normalizeDisplayText(item.content || item.body || item.text || "").slice(0, 500),
+      sourceRisk: item.sourceRisk,
+    })),
+    socialHotStocks: compactStateSocialHotStocks(full.socialHotStocks || {}),
+    industryChainPacks: (full.industryChainPacks || []).map(compactStateIndustryChainPack),
+    stockNarratives: {
+      ...(full.stockNarratives || {}),
+      items: (full.stockNarratives?.items || []).map(compactStateNarrative),
+      summaryOnly: true,
+    },
+  };
+}
+
 function runSummaryForClient(run, alertState = {}, sourceControls = null) {
   if (!run) return null;
   const alerts = dedupeAlerts(applyAlertState(run.alerts || [], alertState));
@@ -40044,6 +40803,7 @@ function configForClient(db) {
         enabled: ALL_STOCK_AGENT_PREFETCH_ENABLED,
         technicalLimit: ALL_STOCK_AGENT_TECHNICAL_PREFETCH_LIMIT,
         quoteLimit: ALL_STOCK_AGENT_QUOTE_PREFETCH_LIMIT,
+        fundamentalLimit: ALL_STOCK_AGENT_FUNDAMENTAL_PREFETCH_LIMIT,
         technicalScope:
           ALL_STOCK_AGENT_TECHNICAL_PREFETCH_LIMIT > 0
             ? `top-${ALL_STOCK_AGENT_TECHNICAL_PREFETCH_LIMIT}`
@@ -40051,6 +40811,10 @@ function configForClient(db) {
         quoteScope:
           ALL_STOCK_AGENT_QUOTE_PREFETCH_LIMIT > 0
             ? `top-${ALL_STOCK_AGENT_QUOTE_PREFETCH_LIMIT}`
+            : "all-candidates",
+        fundamentalScope:
+          ALL_STOCK_AGENT_FUNDAMENTAL_PREFETCH_LIMIT > 0
+            ? `top-${ALL_STOCK_AGENT_FUNDAMENTAL_PREFETCH_LIMIT}`
             : "all-candidates",
       },
     },
@@ -40496,7 +41260,15 @@ async function handleApi(req, res, url) {
       portfolio: sanitizePortfolio(db.portfolio),
       alerts: sortAlertsForDisplay(applyAlertState(db.alerts || [], db.alertState)).slice(0, 50),
       runs: recentRuns.slice(0, 12).map((run) => runSummaryForClient(run, db.alertState, db.sourceControls)),
-      chat: db.chat.slice(-20),
+      chat: db.chat.slice(-20).map((item) => ({
+        id: item.id,
+        role: item.role,
+        content: item.content,
+        createdAt: item.createdAt,
+        provider: item.provider,
+        model: item.model,
+        error: item.error,
+      })),
       trades: sanitizeTrades(db.trades).slice(0, 200),
       tradeJournal: buildTradeJournalForDb(db),
       traderProfile: db.traderProfile || { current: null, snapshots: [], tradeSync: db.tradeSync || {} },
@@ -40504,9 +41276,9 @@ async function handleApi(req, res, url) {
       tradeReviews: (db.tradeReviews || []).slice(0, 10),
       emailLog: (db.emailLog || []).slice(0, 20),
       sourceDiagnostics: normalizeSourceDiagnostics(db.sourceDiagnostics),
-      allStockAgent: allStockAgentForClient(db.allStockAgent, { compact: true }),
+      allStockAgent: allStockAgentForClient(db.allStockAgent, { compact: true, includeRunList: false }),
       factorRegistry: normalizeFactorRegistry(db.factorRegistry),
-      latest: runForClient(latestRun(db), db.alertState, db.sourceControls),
+      latest: runForStateClient(latestRun(db), db.alertState, db.sourceControls),
       runStatus: runStatusForClient(),
       config: configForClient(db),
       serverTime: nowIso(),
@@ -40873,23 +41645,15 @@ async function handleApi(req, res, url) {
           status: result.run.status,
           sampleCount: result.run.metrics?.sampleCount || 0,
           primaryHorizon: result.run.metrics?.primaryHorizon || null,
-          candidateMetrics: {
+          learningRunMetrics: {
             excessVsSpy: result.run.metrics?.excessVsSpy || null,
             maxDrawdown: result.run.metrics?.maxDrawdown || null,
           },
         },
       });
       if (historicalCandidate) {
-        const validationRecord = buildPromotionValidationRecord(historicalCandidate, activeVersion, {
-          source: "historical-backtest",
-          candidateExcessPct: result.run.metrics?.excessVsSpy,
-          candidateMaxDrawdownPct: result.run.metrics?.maxDrawdown,
-          activeExcessPct: body.activeExcessPct ?? body.activeAvgExcessPct,
-          activeMaxDrawdownPct: body.activeMaxDrawdownPct ?? body.activeMaxDDPct,
-          n: result.run.metrics?.sampleCount || 0,
-        });
-        historicalCandidate.validationRecords = [validationRecord];
-        historicalCandidate.validationStatus = validationRecord.status;
+        historicalCandidate.validationRecords = [];
+        historicalCandidate.validationStatus = "pending_same_corpus_validation";
         strategyVersions = upsertStrategyVersion(strategyVersions, historicalCandidate);
         db.allStockAgent = normalizeAllStockAgentState({
           ...agentState,
@@ -41085,7 +41849,7 @@ async function handleApi(req, res, url) {
     const db = await ensureStore();
     const state = normalizeAllStockAgentState(db.allStockAgent);
     return sendJson(res, {
-      strategyVersions: state.strategyVersions,
+      strategyVersions: strategyVersionsForClient(state.strategyVersions),
       active: activeStrategyVersion(state.strategyVersions) || state.runs?.[0]?.skill?.strategyVersion || null,
       rollbackAvailable: Boolean(state.strategyVersionRollbackStack?.length),
     });
@@ -41106,12 +41870,28 @@ async function handleApi(req, res, url) {
     const candidate = (state.strategyVersions || []).find((row) => row.id === candidateId && row.status === "candidate");
     if (!candidate) return sendJson(res, { error: "未找到 candidate strategy version。" }, 404);
     const active = activeStrategyVersion(state.strategyVersions);
-    const validationRecord = buildPromotionValidationRecord(candidate, active, {
-      ...body,
-      source: body.source || "manual-walk-forward-validation",
-    });
-    const strategyVersions = attachValidationRecord(state.strategyVersions, candidate.id, validationRecord);
-    db.allStockAgent = normalizeAllStockAgentState({ ...state, strategyVersions });
+    if (!active) return sendJson(res, { error: "缺少 active strategy version，无法比较。" }, 409);
+    let validationRecord;
+    let comparisonRuns = null;
+    if (body.mode === "manual-metrics") {
+      validationRecord = buildPromotionValidationRecord(candidate, active, {
+        ...body,
+        source: body.source || "manual-walk-forward-validation",
+      });
+      const strategyVersions = attachValidationRecord(state.strategyVersions, candidate.id, validationRecord);
+      db.allStockAgent = normalizeAllStockAgentState({ ...state, strategyVersions });
+    } else {
+      try {
+        const comparison = await validateStrategyCandidateOnSameHistoricalCorpus(db, state, candidate, active, body);
+        validationRecord = comparison.validationRecord;
+        comparisonRuns = {
+          activeRunId: comparison.activeRun.id,
+          candidateRunId: comparison.candidateRun.id,
+        };
+      } catch (error) {
+        return sendJson(res, { error: `同语料历史验证失败：${errorZh(error.message)}` }, 502);
+      }
+    }
     appendAuditEvent(db, "strategy_version.validate", {
       candidateId: candidate.id,
       activeId: active?.id || "",
@@ -41120,7 +41900,7 @@ async function handleApi(req, res, url) {
       n: validationRecord.n,
     }, validationRecord.passed ? "ok" : "warn");
     await saveStore(db);
-    return sendJson(res, { validation: buildStrategyValidationPayload(db), record: validationRecord });
+    return sendJson(res, { validation: buildStrategyValidationPayload(db), record: validationRecord, comparisonRuns });
   }
 
   if (req.method === "POST" && url.pathname === "/api/strategy-versions/promote") {
@@ -41622,6 +42402,7 @@ async function handleApi(req, res, url) {
         db.articleCache,
         normalizeSourceControls(db.sourceControls),
         investmentAdvisorContextFromRun(latestRun(db), ticker, db),
+        { mode: body.mode === "quick" ? "quick" : "full" },
       );
       pruneArticleCache(db.articleCache);
       await saveStore(db);

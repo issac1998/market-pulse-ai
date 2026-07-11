@@ -1267,6 +1267,51 @@ body.stock-detail-mode .stock-report-panel {
   gap: 14px;
 }
 
+.panel-guidance {
+  margin: 0;
+  border-left: 4px solid var(--teal);
+  padding: 10px 12px;
+  background: rgba(236, 253, 245, 0.68);
+  color: var(--ink);
+  font-size: 13px;
+  line-height: 1.55;
+}
+
+.workspace-disclosure {
+  margin-top: 12px;
+  border: 1px solid rgba(118, 134, 158, 0.26);
+  border-radius: 8px;
+  background: rgba(255, 255, 255, 0.6);
+  backdrop-filter: blur(18px) saturate(1.14);
+  overflow: hidden;
+}
+
+.workspace-disclosure > summary {
+  min-height: 58px;
+  padding: 12px 14px;
+  background: rgba(248, 250, 252, 0.76);
+}
+
+.workspace-disclosure > summary span {
+  display: grid;
+  gap: 3px;
+}
+
+.workspace-disclosure > summary strong {
+  font-size: 14px;
+}
+
+.workspace-disclosure > summary small {
+  color: var(--muted);
+  font-size: 12px;
+  font-weight: 600;
+}
+
+.workspace-disclosure > .action-suggestions-box,
+.workspace-disclosure > .all-stock-agent-box {
+  padding: 14px;
+}
+
 .action-suggestion-hero {
   display: grid;
   grid-template-columns: minmax(0, 1fr) minmax(280px, 0.72fr);
@@ -1441,6 +1486,26 @@ body.stock-detail-mode .stock-report-panel {
 .all-stock-agent-note.success {
   border-color: rgba(20, 184, 166, 0.32);
   background: rgba(240, 253, 250, 0.7);
+}
+
+.all-stock-agent-note.warning {
+  border-color: rgba(217, 119, 6, 0.38);
+  background: rgba(255, 251, 235, 0.84);
+  color: #92400e;
+}
+
+.action-required-note {
+  align-items: center;
+  justify-content: space-between;
+}
+
+.action-required-note > div {
+  display: grid;
+  gap: 3px;
+}
+
+.action-required-note span {
+  line-height: 1.5;
 }
 
 .all-stock-agent-section {
@@ -4029,6 +4094,42 @@ body.stock-detail-mode .stock-report-panel {
   padding: 12px;
 }
 
+.daily-card.actionable {
+  border-left: 3px solid rgba(5, 150, 105, 0.72);
+}
+
+.daily-card.research {
+  border-left: 3px solid rgba(217, 119, 6, 0.48);
+}
+
+.freshness-line {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin: 8px 0 0;
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.health-summary {
+  margin: 0;
+  border-left: 3px solid rgba(5, 150, 105, 0.55);
+  padding: 8px 10px;
+  background: rgba(236, 253, 245, 0.68);
+  font-size: 13px;
+  line-height: 1.5;
+}
+
+.health-summary.warning {
+  border-left-color: rgba(217, 119, 6, 0.62);
+  background: rgba(255, 251, 235, 0.78);
+}
+
+.stale-calls {
+  border: 1px dashed rgba(148, 163, 184, 0.5);
+  padding: 10px;
+}
+
 .daily-card.wide {
   grid-column: span 2;
 }
@@ -4113,6 +4214,55 @@ body.stock-detail-mode .stock-report-panel {
 
 .strategy-version-card .mini-kv {
   grid-template-columns: repeat(2, minmax(0, 1fr));
+}
+
+.strategy-version-card > summary {
+  cursor: pointer;
+  list-style: none;
+  margin: -1px;
+  padding: 11px;
+  border-radius: 8px;
+  background: rgba(248, 250, 252, 0.74);
+}
+
+.strategy-version-card > summary::-webkit-details-marker {
+  display: none;
+}
+
+.strategy-version-card > summary::after {
+  content: "+";
+  margin-left: auto;
+  color: var(--muted);
+  font-size: 17px;
+  font-weight: 900;
+}
+
+.strategy-version-card[open] > summary::after {
+  content: "−";
+}
+
+.strategy-version-card:not([open]) > :not(summary) {
+  display: none !important;
+}
+
+.strategy-version-card[open] > summary {
+  margin-bottom: 8px;
+}
+
+.strategy-version-card.quarantined {
+  border-color: rgba(220, 38, 38, 0.32);
+  background: rgba(254, 242, 242, 0.68);
+}
+
+.strategy-eligibility {
+  margin: 0;
+  border-left: 3px solid rgba(217, 119, 6, 0.5);
+  padding-left: 8px;
+  color: var(--muted);
+}
+
+.strategy-eligibility.ok {
+  border-left-color: rgba(5, 150, 105, 0.62);
 }
 
 @media (max-width: 1120px) {
@@ -4233,6 +4383,10 @@ body.stock-detail-mode .stock-report-panel {
     min-height: 112px;
   }
 
+  .workspace-disclosure > summary {
+    align-items: flex-start;
+  }
+
   .market-hero {
     grid-template-columns: 1fr;
   }
@@ -4338,5 +4492,14 @@ body.stock-detail-mode .stock-report-panel {
 
   .options-unusual-table .peer-row span:nth-child(5) {
     display: none;
+  }
+
+  .all-stock-agent-track {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .action-required-note {
+    align-items: stretch;
+    flex-direction: column;
   }
 }

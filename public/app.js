@@ -12,6 +12,7 @@ const els = {
   actionSuggestionsBox: document.getElementById("actionSuggestionsBox"),
   allStockAgentBox: document.getElementById("allStockAgentBox"),
   todayDeskBox: document.getElementById("todayDeskBox"),
+  todayRunAgent: document.getElementById("todayRunAgent"),
   runAllStockAgent: document.getElementById("runAllStockAgent"),
   runAllStockAgentBacktest: document.getElementById("runAllStockAgentBacktest"),
   stockReportForm: document.getElementById("stockReportForm"),
@@ -177,6 +178,7 @@ const runDetailLoading = new Set();
 const optionFetchInFlight = new Set();
 const stockSnapshotCache = new Map();
 const stockSnapshotLoading = new Set();
+const stockSnapshotEnrichmentLoading = new Set();
 const stockDeepDiveCache = new Map();
 const stockDeepDiveLoading = new Set();
 const uziAnalysisCache = new Map();
@@ -205,6 +207,25 @@ async function api(path, options = {}) {
     throw error;
   }
   return data;
+}
+
+async function apiWithRetries(path, options = {}, attempts = 3) {
+  const errors = [];
+  for (let attempt = 1; attempt <= attempts; attempt += 1) {
+    try {
+      return await api(path, options);
+    } catch (error) {
+      errors.push(error.message);
+      if ((Number(error.status) > 0 && Number(error.status) < 500) || attempt === attempts) {
+        const finalError = new Error(`连续 ${attempt} 次请求失败：${errors.join("；")}`);
+        finalError.status = error.status;
+        finalError.details = error.details;
+        throw finalError;
+      }
+      await new Promise((resolve) => setTimeout(resolve, attempt * 1500));
+    }
+  }
+  throw new Error("请求未完成。");
 }
 
 async function loadSupplementalData() {
@@ -1217,12 +1238,22 @@ function renderLlmPicker() {
         : input.value === "antigravity-cli"
           ? "antigravityCli"
           : input.value;
-    const enabled = Boolean(providers[providerKey]);
-    input.checked = input.value === selected;
+    const diagnosticKey = input.value === "gemini" ? "gemini-api" : input.value;
+    const diagnostic = (sourceDiagnostics?.rows || []).find((row) => row.key === diagnosticKey);
+    const diagnosticBlocked = diagnostic && ["fail", "skipped"].includes(diagnostic.status);
+    const enabled = Boolean(providers[providerKey]) && !diagnosticBlocked;
+    input.checked = input.value === selected && enabled;
     input.disabled = !enabled;
     label.classList.toggle("is-unconfigured", !enabled);
-    label.title = enabled ? "已配置；仅用于你主动发送的聊天" : "未配置或命令不可用";
+    label.title = enabled
+      ? "已配置；仅用于你主动发送的聊天"
+      : diagnostic?.detail || "未配置、命令不可用或账号不支持";
   });
+  if (!els.llmProviderInputs.some((input) => input.checked && !input.disabled)) {
+    const fallback = els.llmProviderInputs.find((input) => input.value === preferredLlmProvider() && !input.disabled)
+      || els.llmProviderInputs.find((input) => !input.disabled);
+    if (fallback) fallback.checked = true;
+  }
 }
 
 function sessionLabel(value) {
@@ -1527,10 +1558,11 @@ async function requestStockSnapshot(ticker, options = {}) {
   stockSnapshotLoading.add(normalized);
   renderStockReport(selectedReportRun());
   try {
-    const result = await api("/api/stocks/snapshot", {
+    const result = await apiWithRetries("/api/stocks/snapshot", {
       method: "POST",
       body: JSON.stringify({
         ticker: normalized,
+        mode: "quick",
       }),
     });
     if (result.snapshot?.ticker) {
@@ -1556,6 +1588,35 @@ async function requestStockSnapshot(ticker, options = {}) {
     });
   } finally {
     stockSnapshotLoading.delete(normalized);
+    renderStockReport(selectedReportRun());
+  }
+  requestStockSnapshotEnrichment(normalized, { force: options.force === true });
+}
+
+async function requestStockSnapshotEnrichment(ticker) {
+  const normalized = normalizeTickerInput(ticker);
+  if (!normalized || stockSnapshotEnrichmentLoading.has(normalized)) return;
+  stockSnapshotEnrichmentLoading.add(normalized);
+  renderStockReport(selectedReportRun());
+  try {
+    const result = await apiWithRetries("/api/stocks/snapshot", {
+      method: "POST",
+      body: JSON.stringify({ ticker: normalized, mode: "full" }),
+    });
+    if (result.snapshot?.ticker) stockSnapshotCache.set(result.snapshot.ticker, result.snapshot);
+  } catch (error) {
+    const current = stockSnapshotCache.get(normalized) || { ticker: normalized, news: [], errors: [] };
+    stockSnapshotCache.set(normalized, {
+      ...current,
+      enrichmentPending: false,
+      enrichmentError: error.message,
+      errors: [
+        ...(current.errors || []),
+        { source: "完整个股分析", ticker: normalized, error: error.message },
+      ],
+    });
+  } finally {
+    stockSnapshotEnrichmentLoading.delete(normalized);
     renderStockReport(selectedReportRun());
   }
 }
@@ -2875,8 +2936,10 @@ function renderStockReport(run) {
     els.stockReportInput.value = selected;
   }
   if (els.stockReportFetch) {
-    els.stockReportFetch.disabled = Boolean(selected && stockSnapshotLoading.has(selected));
-    els.stockReportFetch.textContent = selected && stockSnapshotLoading.has(selected) ? "拉取中..." : "拉取 Longbridge";
+    const quickLoading = Boolean(selected && stockSnapshotLoading.has(selected));
+    const enriching = Boolean(selected && stockSnapshotEnrichmentLoading.has(selected));
+    els.stockReportFetch.disabled = quickLoading || enriching;
+    els.stockReportFetch.textContent = quickLoading ? "拉取行情中..." : enriching ? "AI 深度分析中..." : "拉取 Longbridge";
   }
   if (!enrichedRun || !selected) {
     document.body.classList.remove("stock-detail-mode");
@@ -2888,7 +2951,12 @@ function renderStockReport(run) {
     renderStockReportOverview(enrichedRun, tickers);
     return;
   }
-  if (!runHasTickerData(enrichedRun, selected) && !stockSnapshotLoading.has(selected)) {
+  const selectedNarrative = (enrichedRun.stockNarratives?.items || []).find((item) => item.ticker === selected);
+  const needsFullSnapshot = !stockSnapshotCache.has(selected) && (
+    selectedNarrative?.summaryOnly === true ||
+    !runHasTickerData(enrichedRun, selected)
+  );
+  if (needsFullSnapshot && !stockSnapshotLoading.has(selected)) {
     setTimeout(() => requestStockSnapshot(selected), 0);
   }
   if (!stockDeepDiveCache.has(selected) && !stockDeepDiveLoading.has(selected)) {
@@ -2899,6 +2967,7 @@ function renderStockReport(run) {
   queueOptionsAutofetch(enrichedRun, selected, Boolean(report.options));
   const tone = reportToneLabel(report);
   const loading = stockSnapshotLoading.has(selected);
+  const enriching = stockSnapshotEnrichmentLoading.has(selected);
   const snapshot = stockSnapshotCache.get(selected);
   const snapshotErrors = snapshot?.errors || [];
   const latestNews = report.news.slice(0, 4);
@@ -2906,6 +2975,8 @@ function renderStockReport(run) {
   const hotPosts = (report.socialHot?.topPosts || report.social).slice(0, 4);
   const snapshotStatus = loading
     ? `<div class="stock-fetch-status"><span class="spinner-dot"></span> 正在从 Longbridge 拉取 ${escapeHtml(selected)} 的行情、K线和新闻...</div>`
+    : enriching
+      ? `<div class="stock-fetch-status"><span class="spinner-dot"></span> 行情与 K 线已可查看，正在后台读取多源新闻正文并生成 AI 深度分析...</div>`
     : snapshotErrors.length
       ? `<div class="stock-fetch-status warn">Longbridge 按需拉取有异常：${escapeHtml(snapshotErrors.map((item) => item.error).join("；"))}</div>`
       : snapshot
@@ -5243,6 +5314,18 @@ function actionSuggestionList(title, rows = []) {
 
 function renderActionSuggestionCard(item = {}, run = null) {
   const typeClass = actionSuggestionTypeClass(item.operationType, item.action);
+  const operationLabel = item.operationType === "候选买入"
+    ? "正向研究"
+    : item.operationType === "风险处理" || item.operationType === "回避"
+      ? "风险研究"
+      : item.operationType === "等待触发"
+        ? "等待验证"
+        : item.operationType || "观察";
+  const actionLabel = item.action === "买入"
+    ? "规则偏多"
+    : item.action === "卖出"
+      ? "规则偏空"
+      : item.action || "中性";
   const priceLine = item.quote
     ? `价格 ${fmtNumber(item.quote.price, 2)} · ${pctLabel(item.quote.changePercent)} · ${item.quote.provider || "行情"}`
     : "暂无有效价格";
@@ -5257,8 +5340,8 @@ function renderActionSuggestionCard(item = {}, run = null) {
         <p class="muted">${escapeHtml(tickerNameLine(item.ticker, { ...item, run }))}</p>
       </div>
       <div class="feed-meta">
-        <span class="tag ${typeClass}">${escapeHtml(item.operationType || item.action || "观察")}</span>
-        <span class="tag ${advisorActionClass(item.action)}">${escapeHtml(item.action || "持有")}</span>
+        <span class="tag ${typeClass}">${escapeHtml(operationLabel)}</span>
+        <span class="tag ${advisorActionClass(item.action)}">${escapeHtml(actionLabel)}</span>
         ${item.gateAdjusted ? `<span class="tag red">风控调整</span>` : ""}
       </div>
     </div>
@@ -5356,23 +5439,23 @@ function renderActionSuggestions(run) {
   els.actionSuggestionsBox.className = "action-suggestions-box";
   els.actionSuggestionsBox.innerHTML = `<div class="action-suggestion-hero">
       <div>
-        <p class="section-label">Action Desk</p>
-        <h3>从自选股和重点股票池筛选可操作标的</h3>
-        <p class="muted">${escapeHtml(suggestions.universe?.note || "排序优先自选股，并结合重点股票池、因子候选和社交异动。")}</p>
+        <p class="section-label">Research Queue</p>
+        <h3>规则观察池（非最终操作建议）</h3>
+        <p class="muted">这组结果用于安排研究顺序，不会写入今日正式买卖清单。${escapeHtml(suggestions.universe?.note || "排序优先自选股，并结合重点股票池、因子候选和社交异动。")}</p>
       </div>
       <div class="action-suggestion-metrics action-suggestion-summary-metrics">
         ${actionSuggestionMetric(summary.total, "总数")}
-        ${actionSuggestionMetric(summary.buy, "候选买入")}
-        ${actionSuggestionMetric(summary.wait, "等待触发")}
-        ${actionSuggestionMetric(summary.risk, "风险处理")}
-        ${actionSuggestionMetric(summary.idle, "观察/暂不操作")}
+        ${actionSuggestionMetric(summary.buy, "正向研究")}
+        ${actionSuggestionMetric(summary.wait, "等待验证")}
+        ${actionSuggestionMetric(summary.risk, "风险研究")}
+        ${actionSuggestionMetric(summary.idle, "低优先级")}
       </div>
     </div>
-    ${renderActionSuggestionSection("优先操作", "候选买入", groups.buy || [], run, { open: Boolean(groups.buy?.length) })}
-    ${renderActionSuggestionSection("等待触发", "持有但接近条件", groups.wait || [], run, { open: false })}
-    ${renderActionSuggestionSection("风险处理", "卖出/回避", groups.risk || [], run, { open: Boolean(groups.risk?.length) })}
+    ${renderActionSuggestionSection("正向研究", "规则偏多，仍需通过 Agent 门槛", groups.buy || [], run, { open: false })}
+    ${renderActionSuggestionSection("等待验证", "条件尚未成立", groups.wait || [], run, { open: false })}
+    ${renderActionSuggestionSection("风险研究", "规则偏空或需要回避", groups.risk || [], run, { open: false })}
     ${renderActionSuggestionSection("暂不操作", "低优先级", groups.idle || [], run, { open: false })}
-    <p class="muted">${escapeHtml(suggestions.disclaimer || "")}</p>`;
+    <p class="muted"><strong>口径说明：</strong>正式建议只看页首“今日操作台”。${escapeHtml(suggestions.disclaimer || "")}</p>`;
 }
 
 function allStockAgentMetric(value, label, digits = 0) {
@@ -5747,18 +5830,30 @@ function renderTodayDesk(today = null) {
   const calls = today.calls || {};
   const actionable = calls.actionable || [];
   const research = calls.research || [];
+  const stale = calls.stale || [];
   const track = today.trackRecord || {};
   const regime = today.regime || {};
   const freshness = today.freshness || {};
   const health = today.health || {};
   const missing = (health.missingData || []).slice(0, 6);
   const stories = (today.stories || []).slice(0, 8);
+  const freshnessCurrent = freshness.status === "current";
+  const freshnessLabel = freshnessCurrent
+    ? "同源且有效"
+    : freshness.status === "agent-refresh-required"
+      ? "Agent 待重跑"
+      : freshness.status === "report-blocked"
+        ? "报告已拦截"
+        : freshness.status === "agent-stale"
+          ? "Agent 已过期"
+          : "Agent 未运行";
   els.todayDeskBox.className = "daily-loop-box";
   els.todayDeskBox.innerHTML = `<div class="daily-loop-hero">
     <div>
       <p class="section-label">Daily Loop</p>
       <h3>今日操作台</h3>
-      <p class="muted">Agent ${escapeHtml(freshness.agentRunId || "-")} · ${escapeHtml(fmtTime(freshness.agentCompletedAt || freshness.runCompletedAt))}</p>
+      <p class="muted">报告 ${escapeHtml(freshness.reportRunId || "-")} · Agent ${escapeHtml(freshness.agentRunId || "-")}</p>
+      <p class="freshness-line"><span class="tag ${freshnessCurrent ? "green" : "red"}">${escapeHtml(freshnessLabel)}</span><span>${escapeHtml(freshness.agentCompletedAt ? fmtTime(freshness.agentCompletedAt) : "尚无运行时间")}</span></p>
     </div>
     <div class="all-stock-agent-track">
       ${allStockAgentMetric(actionable.length, `正式建议 / ${calls.actionableLimit ?? 3}`)}
@@ -5767,6 +5862,10 @@ function renderTodayDesk(today = null) {
       ${allStockAgentMetric(track.excludedCount, "剔除异常")}
     </div>
   </div>
+  ${!freshnessCurrent ? `<div class="all-stock-agent-note warning action-required-note">
+    <div><strong>当前建议不可用于操作</strong><span>${escapeHtml(freshness.message || health.actionabilityMessage || "Agent 与当前报告不同步。")}</span></div>
+    <button class="btn compact" type="button" data-rerun-agent>基于最新报告重跑 Agent</button>
+  </div>` : ""}
   <div class="all-stock-agent-note">
     <strong>Regime</strong>
     <span>${escapeHtml(regime.label || regime.bucket || "unknown")} · 风险分 ${escapeHtml(Number.isFinite(Number(regime.riskScore)) ? fmtNumber(Number(regime.riskScore), 0) : "-")}。</span>
@@ -5780,6 +5879,10 @@ function renderTodayDesk(today = null) {
     <summary>研究跟踪 / 降级原因</summary>
     <div class="daily-card-grid">${research.length ? research.slice(0, 12).map((item) => todayCallCard(item, "research")).join("") : empty("暂无研究跟踪。")}</div>
   </details>
+  ${stale.length ? `<details class="daily-subsection agent-disclosure stale-calls">
+    <summary>旧报告建议（仅供历史核对，不可操作） · ${escapeHtml(stale.length)} 条</summary>
+    <div class="daily-card-grid">${stale.slice(0, 12).map((item) => todayCallCard(item, "research")).join("")}</div>
+  </details>` : ""}
   <section class="daily-subsection">
     <div class="social-source-head"><h3>重要新闻</h3><span class="tag">${escapeHtml(stories.length)} 条</span></div>
     <div class="daily-news-list">${stories.length ? stories.map((item) => `<article>
@@ -5790,6 +5893,7 @@ function renderTodayDesk(today = null) {
   </section>
   <section class="daily-subsection">
     <div class="social-source-head"><h3>健康与缺口</h3><span class="tag ${missing.length ? "amber" : "green"}">${escapeHtml(missing.length ? "需补数据" : "正常")}</span></div>
+    <p class="health-summary ${freshnessCurrent ? "ok" : "warning"}">${escapeHtml(health.actionabilityMessage || "")}</p>
     ${missing.length ? `<ul class="compact-list">${missing.map((item) => `<li>${escapeHtml(item)}</li>`).join("")}</ul>` : `<p class="muted">未发现前台可见缺口。</p>`}
   </section>`;
 }
@@ -6035,17 +6139,30 @@ function renderAllStockAgent(agentState) {
   }
   const summary = latest.summary || {};
   const sourceReadinessBlocked = appState?.latest?.dataQuality?.readiness?.status === "blocked";
+  const currentReportId = appState?.latest?.id || "";
+  const agentSourceRunId = latest.sourceRunId || "";
+  const agentAgeHours = latest.completedAt || latest.generatedAt
+    ? (Date.now() - new Date(latest.completedAt || latest.generatedAt).getTime()) / 3600000
+    : Infinity;
+  const agentFreshnessCurrent = Boolean(
+    !sourceReadinessBlocked &&
+    currentReportId &&
+    agentSourceRunId &&
+    currentReportId === agentSourceRunId &&
+    Number.isFinite(agentAgeHours) &&
+    agentAgeHours <= Number(appState?.config?.allStockAgent?.maxSourceAgeHours || 12),
+  );
   const allBuyRows = latest.buyCandidates || [];
-  const buyRows = sourceReadinessBlocked
+  const buyRows = !agentFreshnessCurrent
     ? []
     : allBuyRows.filter((item) => item.actionable !== false && item.actionability?.status !== "research");
-  const downgradedBuyRows = sourceReadinessBlocked
-    ? allBuyRows
+  const downgradedBuyRows = !agentFreshnessCurrent
+    ? []
     : allBuyRows.filter((item) => item.actionable === false || item.actionability?.status === "research");
   const downgradedTickers = new Set(downgradedBuyRows.map((item) => normalizeTickerSymbol(item.ticker)).filter(Boolean));
   const watchBuyRows = [
     ...downgradedBuyRows,
-    ...(latest.watchBuyCandidates || []).filter((item) => {
+    ...(agentFreshnessCurrent ? latest.watchBuyCandidates || [] : []).filter((item) => {
       const ticker = normalizeTickerSymbol(item.ticker);
       if (!ticker || downgradedTickers.has(ticker)) return false;
       downgradedTickers.add(ticker);
@@ -6056,6 +6173,11 @@ function renderAllStockAgent(agentState) {
   const holdRows = latest.holdReviews || [];
   const reviewRows = latest.reviews || [];
   const revision = latest.skillRevision;
+  const staleRows = agentFreshnessCurrent
+    ? []
+    : [...allBuyRows, ...(latest.watchBuyCandidates || [])]
+        .filter((item, index, rows) => rows.findIndex((row) => normalizeTickerSymbol(row.ticker) === normalizeTickerSymbol(item.ticker)) === index)
+        .slice(0, 20);
   const run = latest.sourceRun || appState?.latest || null;
   els.allStockAgentBox.className = "all-stock-agent-box";
   els.allStockAgentBox.innerHTML = `<div class="all-stock-agent-hero">
@@ -6077,7 +6199,7 @@ function renderAllStockAgent(agentState) {
       <strong>覆盖边界</strong>
       <span>${escapeHtml(latest.universeCoverage?.note || "当前扫描可获取候选池。")}</span>
     </div>
-    ${sourceReadinessBlocked ? `<div class="all-stock-agent-note warning"><strong>当前报告不可用于操作</strong><span>${escapeHtml(appState.latest?.dataQuality?.readiness?.summary || "核心数据源未达到可用门槛")}；旧 Agent 买入结果已全部降级到观察区。</span></div>` : ""}
+    ${!agentFreshnessCurrent ? `<div class="all-stock-agent-note warning action-required-note"><div><strong>当前 Agent 结果不可用于操作</strong><span>${escapeHtml(sourceReadinessBlocked ? appState.latest?.dataQuality?.readiness?.summary || "核心数据源未达到可用门槛" : `Agent 基于 ${agentSourceRunId || "未知报告"}，当前报告是 ${currentReportId || "未知"}；请重新运行。`)}</span></div><button class="btn compact" type="button" data-rerun-agent>重跑 Agent</button></div>` : ""}
     ${revision?.changes?.length ? `<div class="all-stock-agent-note success"><strong>Skill 已自更新</strong><span>${escapeHtml(revision.summary || "")}</span></div>` : ""}
     ${renderAllStockAgentRoadmapBlock(latest)}
     ${renderAllStockAgentTrackRecord(latest)}
@@ -6085,6 +6207,7 @@ function renderAllStockAgent(agentState) {
     ${renderAllStockAgentBacktestBlock(allStockAgentBacktest)}
     ${renderAllStockAgentSection("正式买入", "Buy List", buyRows, (item) => renderAllStockAgentDecision(item, "buy", run))}
     ${renderAllStockAgentSection("待触发买入候选", "Watch Buy", watchBuyRows, (item) => renderAllStockAgentDecision(item, "watch", run), { open: false })}
+    ${staleRows.length ? renderAllStockAgentSection("旧报告候选（不可操作）", "Stale History", staleRows, (item) => renderAllStockAgentDecision(item, "watch", run), { open: false }) : ""}
     ${renderAllStockAgentSection("持仓卖出检查", "Sell Check", sellRows, (item) => renderAllStockAgentDecision(item, "sell", run))}
     ${renderAllStockAgentSection("持仓继续观察", "Hold Review", holdRows, (item) => renderAllStockAgentHold(item, run), { open: false })}
     <details class="all-stock-agent-section agent-disclosure">
@@ -6567,16 +6690,19 @@ function renderRecommendationReconciliation(payload = null) {
 function strategyVersionCard(version = {}, activeId = "") {
   const records = version.validationRecords || [];
   const latestRecord = records[0] || null;
+  const eligibility = version.promotionEligibility || {};
   const effectiveActive = version.id === activeId;
   const displayStatus = effectiveActive ? "active" : version.status === "active" ? "legacy-active" : version.status || "-";
-  return `<article class="daily-card strategy-version-card">
-    <div class="daily-card-head">
+  const canPromote = eligibility.canPromote === true;
+  const quarantined = eligibility.status === "quarantined-legacy-metric";
+  return `<details class="daily-card strategy-version-card ${quarantined ? "quarantined" : ""}" ${effectiveActive ? "open" : ""}>
+    <summary class="daily-card-head">
       <strong>${escapeHtml(version.id || "-")}</strong>
       <span class="tag ${effectiveActive ? "green" : version.status === "candidate" ? "amber" : ""}">${escapeHtml(displayStatus)}</span>
-    </div>
+    </summary>
     <div class="feed-meta">
       <span>${escapeHtml(version.source || version.sourceFile || "-")}</span>
-      <span>验证 ${escapeHtml(latestRecord?.status || version.validationStatus || "无")}</span>
+      <span>验证 ${escapeHtml(quarantined ? "旧指标已隔离" : latestRecord?.status || version.validationStatus || "无")}</span>
       <span>n=${escapeHtml(latestRecord?.n ?? 0)}</span>
     </div>
     <p>${escapeHtml(version.changeReason || version.evaluationSummary?.status || "暂无变更说明。")}</p>
@@ -6585,11 +6711,13 @@ function strategyVersionCard(version = {}, activeId = "") {
       ${indicator("Active 超额", metricWithN({ value: latestRecord.activeExcessPct, n: latestRecord.n }, 2, "%"))}
       ${indicator("候选 MaxDD", metricWithN({ value: latestRecord.candidateMaxDrawdownPct, n: latestRecord.n }, 2, "%"))}
       ${indicator("Active MaxDD", metricWithN({ value: latestRecord.activeMaxDrawdownPct, n: latestRecord.n }, 2, "%"))}
-    </div>` : `<p class="muted">暂无 walk-forward validation record，不能 promote。</p>`}
+    </div>` : `<p class="muted">暂无同语料 walk-forward 验证记录，不能晋升。</p>`}
+    ${eligibility.reason ? `<p class="strategy-eligibility ${canPromote ? "ok" : "warning"}">${escapeHtml(eligibility.reason)}</p>` : ""}
     <div class="daily-card-actions">
-      ${version.status === "candidate" ? `<button class="btn compact" type="button" data-promote-strategy="${escapeHtml(version.id)}">Promote</button>` : ""}
+      ${version.status === "candidate" ? `<button class="btn compact ghost" type="button" data-validate-strategy="${escapeHtml(version.id)}">同语料验证</button>` : ""}
+      ${version.status === "candidate" ? `<button class="btn compact" type="button" data-promote-strategy="${escapeHtml(version.id)}" ${canPromote ? "" : "disabled"}>晋升为 Active</button>` : ""}
     </div>
-  </article>`;
+  </details>`;
 }
 
 function renderStrategyGovernance(payload = null, validation = null) {
@@ -6616,7 +6744,7 @@ function renderStrategyGovernance(payload = null, validation = null) {
   </div>
   <div class="strategy-actions">
     <button class="btn compact ghost" type="button" data-refresh-strategy-panel>刷新策略面板</button>
-    <button class="btn compact" type="button" data-rollback-strategy ${payload.rollbackAvailable ? "" : "disabled"}>Rollback</button>
+    <button class="btn compact" type="button" data-rollback-strategy ${payload.rollbackAvailable ? "" : "disabled"}>回滚上一版</button>
   </div>
   <div class="strategy-version-list">${versions.length ? versions.map((item) => strategyVersionCard(item, activeId)).join("") : empty("暂无策略版本。")}</div>
   <p class="muted">${escapeHtml(validation?.validation?.rule || "Promote 是人工动作；系统不会自动把学习权重写成 active。")}</p>`;
@@ -8047,7 +8175,7 @@ function setupLinkCards(config = {}, diagnostics = null) {
             </div>
             <p>${escapeHtml(card.detail)}</p>
             <p class="muted">${escapeHtml(card.action)}</p>
-            <p class="muted"><strong>兜底：</strong>${escapeHtml(card.fallback || "当前会自动降级到已可用源。")}</p>
+            <p class="muted"><strong>替代路径：</strong>${escapeHtml(card.fallback || "三次重试失败后，只使用已配置且明确标注来源的等价数据源。")}</p>
             <p class="muted"><strong>复检：</strong>${escapeHtml(card.verify || "填好配置后运行数据源诊断。")}</p>
             <p class="muted"><strong>需你确认：</strong>${escapeHtml(card.whyManual || "涉及第三方账户或凭证，需在账户侧确认。")}</p>
             <p class="muted">配置项：${escapeHtml(card.env)}</p>
@@ -8844,12 +8972,26 @@ els.actionSuggestionsBox?.addEventListener("click", (event) => {
 });
 
 els.allStockAgentBox?.addEventListener("click", (event) => {
+  const rerunButton = event.target.closest("[data-rerun-agent]");
+  if (rerunButton) {
+    if (!els.runAllStockAgent) return;
+    rerunButton.disabled = true;
+    els.runAllStockAgent.click();
+    return;
+  }
   const openButton = event.target.closest("[data-open-stock-report]");
   if (!openButton) return;
   openStockDetail(openButton.dataset.openStockReport, { fetch: false });
 });
 
 els.todayDeskBox?.addEventListener("click", async (event) => {
+  const rerunButton = event.target.closest("[data-rerun-agent]");
+  if (rerunButton) {
+    if (!els.runAllStockAgent) return;
+    rerunButton.disabled = true;
+    els.runAllStockAgent.click();
+    return;
+  }
   const openButton = event.target.closest("[data-open-stock-report]");
   if (openButton) {
     openStockDetail(openButton.dataset.openStockReport);
@@ -8888,6 +9030,30 @@ els.strategyGovernanceBox?.addEventListener("click", async (event) => {
       alert(`策略面板刷新失败：${error.message}`);
     } finally {
       refreshButton.disabled = false;
+    }
+    return;
+  }
+  const validateButton = event.target.closest("[data-validate-strategy]");
+  if (validateButton) {
+    const id = validateButton.dataset.validateStrategy;
+    validateButton.disabled = true;
+    validateButton.textContent = "验证中...";
+    try {
+      const result = await api("/api/strategy-versions/validate", {
+        method: "POST",
+        body: JSON.stringify({ id }),
+      });
+      await loadSupplementalData();
+      renderStrategyGovernance(strategyVersionsPayload, strategyValidationPayload);
+      const record = result.record || {};
+      alert(record.passed
+        ? `同语料验证通过：candidate n=${record.candidateN || 0}，active n=${record.activeN || 0}。`
+        : `同语料验证未通过：${record.status || "failed"}。候选不会进入 Active。`);
+    } catch (error) {
+      alert(`策略同语料验证失败：${error.message}`);
+    } finally {
+      validateButton.disabled = false;
+      validateButton.textContent = "同语料验证";
     }
     return;
   }
@@ -8940,8 +9106,8 @@ els.moversWithReasonsBox?.addEventListener("keydown", (event) => {
   openStockDetail(card.dataset.ticker);
 });
 
-els.runAllStockAgent?.addEventListener("click", async () => {
-  const button = els.runAllStockAgent;
+async function runAllStockAgentFromButton(button, idleText) {
+  if (!button) return;
   button.disabled = true;
   button.textContent = "运行中...";
   try {
@@ -8955,8 +9121,16 @@ els.runAllStockAgent?.addEventListener("click", async () => {
     alert(`候选池 Agent 运行失败：${error.message}`);
   } finally {
     button.disabled = false;
-    button.textContent = "运行候选池 Agent";
+    button.textContent = idleText;
   }
+}
+
+els.runAllStockAgent?.addEventListener("click", async () => {
+  await runAllStockAgentFromButton(els.runAllStockAgent, "运行候选池 Agent");
+});
+
+els.todayRunAgent?.addEventListener("click", async () => {
+  await runAllStockAgentFromButton(els.todayRunAgent, "基于最新报告运行 Agent");
 });
 
 els.runAllStockAgentBacktest?.addEventListener("click", async () => {

@@ -1724,8 +1724,10 @@ export function runHistoricalWalkForwardFromRows({ bars = [], regimes = [], conf
       ? String(config.universeMode || "watchlist").toLowerCase()
       : "watchlist",
     universeMembershipError: config.universeMembershipError || "",
+    strategyVersionId: String(config.strategyVersionId || "historical-default"),
+    factorWeights: normalizeRecommendationFactorWeights(config.weights || DEFAULT_WEIGHTS, DEFAULT_WEIGHTS),
   };
-  const strategyHash = hashJson({ engine: "historical-walk-forward-v1", config: runConfig, weights: DEFAULT_WEIGHTS });
+  const strategyHash = hashJson({ engine: "historical-walk-forward-v1", config: runConfig, weights: runConfig.factorWeights });
   const byTicker = groupBars(bars);
   const securityMaster = securityMasterMap(config.securityMasterExt || []);
   const pitRows = Array.isArray(config.pitFundamentals) ? config.pitFundamentals : [];
@@ -1777,7 +1779,7 @@ export function runHistoricalWalkForwardFromRows({ bars = [], regimes = [], conf
         bars: eligibleBars,
         historicalRegime,
         pitFundamentals: pitRowsByTicker.get(ticker) || [],
-        weights: DEFAULT_WEIGHTS,
+        weights: runConfig.factorWeights,
       });
       scored.push({ ticker, factorSnapshot, recommendationScore, latestBar: eligibleBars.at(-1) });
     }
@@ -1788,7 +1790,7 @@ export function runHistoricalWalkForwardFromRows({ bars = [], regimes = [], conf
     }).snapshots;
     scored.forEach((item, index) => {
       item.factorSnapshot = normalizedSnapshots[index] || item.factorSnapshot;
-      item.recommendationScore = scoreRecommendationFromFactorSnapshot(item.factorSnapshot, { weights: DEFAULT_WEIGHTS });
+      item.recommendationScore = scoreRecommendationFromFactorSnapshot(item.factorSnapshot, { weights: runConfig.factorWeights });
     });
     scored.sort((a, b) => b.recommendationScore.actionScore - a.recommendationScore.actionScore || b.recommendationScore.alphaScore - a.recommendationScore.alphaScore);
     for (const item of scored.slice(0, runConfig.topN)) {
@@ -1888,7 +1890,7 @@ export function runHistoricalWalkForwardFromRows({ bars = [], regimes = [], conf
   const byHorizon = horizonBreakdown(outcomes);
   const periods = periodTable(outcomes, runConfig.primaryHorizon);
   const factorPack = factorAnalysis(outcomes);
-  const weights = weightOutputs(stats, DEFAULT_WEIGHTS, runConfig, outcomes);
+  const weights = weightOutputs(stats, runConfig.factorWeights, runConfig, outcomes);
   const equityCurve = equityAndDrawdownCurve(daily);
   const implementation = {
     schemaVersion: "historical-backtest-implementation-v1",
@@ -1932,6 +1934,8 @@ export function runHistoricalWalkForwardFromRows({ bars = [], regimes = [], conf
     },
     config: runConfig,
     strategyHash,
+    strategyVersionId: runConfig.strategyVersionId,
+    factorWeights: runConfig.factorWeights,
     decisions,
     outcomes,
     daily,

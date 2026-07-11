@@ -461,22 +461,40 @@ export function buildPromotionValidationRecord(candidate = {}, active = {}, inpu
   const activeExcessPct = metricValue(input.activeExcessPct ?? input.activeAvgExcessPct ?? input.active?.excessVsSpy ?? input.active?.avgExcessPct);
   const candidateMaxDrawdownPct = metricValue(input.candidateMaxDrawdownPct ?? input.candidateMaxDDPct ?? input.candidate?.maxDrawdown ?? input.candidate?.maxDrawdownPct);
   const activeMaxDrawdownPct = metricValue(input.activeMaxDrawdownPct ?? input.activeMaxDDPct ?? input.active?.maxDrawdown ?? input.active?.maxDrawdownPct);
-  const n =
-    Number(input.n ?? input.sampleCount ?? 0) ||
+  const candidateN =
+    Number(input.candidateN ?? input.n ?? input.sampleCount ?? 0) ||
     metricSampleCount(input.candidate?.excessVsSpy) ||
+    0;
+  const activeN =
+    Number(input.activeN ?? input.n ?? input.sampleCount ?? 0) ||
     metricSampleCount(input.active?.excessVsSpy) ||
     0;
+  const n = Math.min(candidateN, activeN);
+  const candidateCorpusHash = String(input.candidateCorpusHash || input.candidate?.corpusHash || "");
+  const activeCorpusHash = String(input.activeCorpusHash || input.active?.corpusHash || "");
+  const sameCorpus = input.sameCorpus === true || Boolean(candidateCorpusHash && activeCorpusHash && candidateCorpusHash === activeCorpusHash);
   const candidateBeatsExcess = Number.isFinite(candidateExcessPct) && Number.isFinite(activeExcessPct) && candidateExcessPct >= activeExcessPct;
   const candidateDrawdown = maxDrawdownMagnitude(candidateMaxDrawdownPct);
   const activeDrawdown = maxDrawdownMagnitude(activeMaxDrawdownPct);
-  const candidateNoWorseDrawdown = Number.isFinite(candidateDrawdown) && Number.isFinite(activeDrawdown) && candidateDrawdown <= activeDrawdown;
-  const status = n > 0 && candidateBeatsExcess && candidateNoWorseDrawdown ? "passed" : "failed";
+  const metricIntegrity =
+    Number.isFinite(candidateDrawdown) &&
+    Number.isFinite(activeDrawdown) &&
+    candidateDrawdown < 99.5 &&
+    activeDrawdown < 99.5;
+  const candidateNoWorseDrawdown = metricIntegrity && candidateDrawdown <= activeDrawdown;
+  const status = n > 0 && sameCorpus && candidateBeatsExcess && candidateNoWorseDrawdown ? "passed" : "failed";
   const missing = [
     Number.isFinite(candidateExcessPct) ? "" : "candidateExcessPct",
     Number.isFinite(activeExcessPct) ? "" : "activeExcessPct",
     Number.isFinite(candidateMaxDrawdownPct) ? "" : "candidateMaxDrawdownPct",
     Number.isFinite(activeMaxDrawdownPct) ? "" : "activeMaxDrawdownPct",
-    n > 0 ? "" : "n",
+    candidateN > 0 ? "" : "candidateN",
+    activeN > 0 ? "" : "activeN",
+    sameCorpus ? "" : "sameCorpusComparison",
+  ].filter(Boolean);
+  const invalid = [
+    Number.isFinite(candidateDrawdown) && candidateDrawdown >= 99.5 ? "candidateMaxDrawdownPct" : "",
+    Number.isFinite(activeDrawdown) && activeDrawdown >= 99.5 ? "activeMaxDrawdownPct" : "",
   ].filter(Boolean);
   return {
     schemaVersion: "strategy-promotion-validation-v1",
@@ -490,14 +508,27 @@ export function buildPromotionValidationRecord(candidate = {}, active = {}, inpu
     candidateMaxDrawdownPct,
     activeMaxDrawdownPct,
     n,
-    status: missing.length ? "missing" : status,
-    passed: !missing.length && status === "passed",
+    candidateN,
+    activeN,
+    status: invalid.length ? "quarantined" : missing.length ? "missing" : status,
+    passed: !invalid.length && !missing.length && status === "passed",
+    comparison: {
+      candidateRunId: String(input.candidateRunId || ""),
+      activeRunId: String(input.activeRunId || ""),
+      candidateCorpusHash,
+      activeCorpusHash,
+      sameCorpus,
+      config: cloneValue(input.comparisonConfig || null),
+    },
     checks: {
       candidateBeatsExcess,
       candidateNoWorseDrawdown,
+      metricIntegrity,
+      sameCorpus,
       missing,
+      invalid,
     },
-    rule: "candidateAvgExcessPct >= activeAvgExcessPct AND abs(candidateMaxDrawdownPct) <= abs(activeMaxDrawdownPct), with n > 0.",
+    rule: "same corpus/window/regime AND candidateAvgExcessPct >= activeAvgExcessPct AND abs(candidateMaxDrawdownPct) <= abs(activeMaxDrawdownPct), with candidateN > 0 and activeN > 0.",
   };
 }
 
@@ -507,7 +538,13 @@ export function promoteStrategyVersion(rows = [], candidateId = "", options = {}
   if (!candidate) return { ok: false, error: "candidate_not_found", rows: normalized };
   const active = activeStrategyVersion(normalized);
   const latestValidation = options.validationRecord || candidate.validationRecords?.[0] || null;
-  if (!latestValidation || latestValidation.status !== "passed" || latestValidation.passed !== true) {
+  if (
+    !latestValidation ||
+    latestValidation.status !== "passed" ||
+    latestValidation.passed !== true ||
+    latestValidation.checks?.sameCorpus !== true ||
+    latestValidation.checks?.metricIntegrity !== true
+  ) {
     return { ok: false, error: "validation_required", rows: normalized, candidate, active };
   }
   const promotedAt = options.promotedAt || nowIso();
